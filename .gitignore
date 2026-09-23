@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Runtime state written by server.ts — never commit user workspaces or history.
+# Anchored to the repo root so they don't swallow nested dirs like
+# server/preflight/vendor/data/.
+/data/
+/uploaded_project/
