@@ -345,7 +345,7 @@ export default function App() {
 
     setSaveStatus("saving");
     try {
-      const response = await fetch("/api/projects", {
+      const response = await apiFetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(projectPayload),
@@ -380,7 +380,7 @@ export default function App() {
     };
 
     try {
-      const response = await fetch("/api/projects", {
+      const response = await apiFetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -403,7 +403,7 @@ export default function App() {
   // Delete project
   const handleDeleteProject = async (id: string) => {
     try {
-      const response = await fetch(`/api/projects/${id}`, {
+      const response = await apiFetch(`/api/projects/${id}`, {
         method: "DELETE",
       });
       if (response.ok) {

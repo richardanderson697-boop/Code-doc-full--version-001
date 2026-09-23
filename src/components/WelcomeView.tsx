@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { apiFetch } from "../utils/apiFetch";
 import { 
   Sparkles, 
   Terminal, 
@@ -134,7 +135,7 @@ export default function WelcomeView({
       reader.onload = async () => {
         const base64String = (reader.result as string).split(",")[1];
         try {
-          const response = await fetch("/api/upload-zip", {
+          const response = await apiFetch("/api/upload-zip", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ zipBase64: base64String })

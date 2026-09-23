@@ -120,7 +120,7 @@ export default function CodeAuditor({
     setBuilderError("");
     setBuilderSuccess("");
     try {
-      const res = await fetch("/api/save-workspace-file", {
+      const res = await apiFetch("/api/save-workspace-file", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filePath: targetPath, content: contentToSave })
@@ -177,7 +177,7 @@ export default function CodeAuditor({
   // 3. Delete file from workspace
   const handleDeleteWorkspaceFile = async (filePathToDelete: string) => {
     try {
-      const res = await fetch("/api/delete-workspace-file", {
+      const res = await apiFetch("/api/delete-workspace-file", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ filePath: filePathToDelete })
@@ -234,7 +234,7 @@ export default function CodeAuditor({
       reader.onload = async () => {
         const base64String = (reader.result as string).split(",")[1];
         try {
-          const response = await fetch("/api/upload-zip", {
+          const response = await apiFetch("/api/upload-zip", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ zipBase64: base64String })
@@ -277,7 +277,7 @@ export default function CodeAuditor({
     setZipLoading(true);
     setZipError("");
     try {
-      const response = await fetch("/api/clear-upload", {
+      const response = await apiFetch("/api/clear-upload", {
         method: "POST"
       });
       if (response.ok) {
@@ -326,7 +326,7 @@ export default function CodeAuditor({
     setDegradedPreflight(null);
 
     try {
-      const res = await fetch(`/api/uploaded-file?path=${encodeURIComponent(filePath)}`);
+      const res = await apiFetch(`/api/uploaded-file?path=${encodeURIComponent(filePath)}`);
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || `Failed to load file "${filePath}" from server.`);

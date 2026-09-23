@@ -20,14 +20,14 @@ export const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
 export const MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
 
 // ZIP Codebase Upload, Status, and Clear Endpoints
-router.post("/api/upload-zip", asyncRoute(async (req, res) => {
+router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const { zipBase64 } = req.body;
   if (!zipBase64) {
     return res.status(400).json({ error: "No ZIP file data provided." });
   }
 
   try {
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
 
     // Validate the archive completely before touching the existing workspace:
     // a malformed upload used to delete the user's files and then fail.
@@ -106,9 +106,9 @@ router.post("/api/upload-zip", asyncRoute(async (req, res) => {
   }
 }));
 
-router.post("/api/clear-upload", (req, res) => {
+router.post("/api/clear-upload", requireAuth, (req: AuthedRequest, res) => {
   try {
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
     if (fs.existsSync(uploadedDir)) {
       fs.rmSync(uploadedDir, { recursive: true, force: true });
     }
@@ -119,9 +119,9 @@ router.post("/api/clear-upload", (req, res) => {
   }
 });
 
-router.get("/api/upload-status", (req, res) => {
+router.get("/api/upload-status", requireAuth, (req: AuthedRequest, res) => {
   try {
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
     if (fs.existsSync(uploadedDir)) {
       const files = getWorkspaceFiles(uploadedDir, uploadedDir);
       return res.json({
@@ -135,13 +135,13 @@ router.get("/api/upload-status", (req, res) => {
   }
 });
 
-router.get("/api/uploaded-file", (req, res) => {
+router.get("/api/uploaded-file", requireAuth, (req: AuthedRequest, res) => {
   try {
     const filePath = req.query.path as string;
     if (!filePath) {
       return res.status(400).json({ error: "Missing path parameter" });
     }
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
     const fullPath = resolveInsideDir(uploadedDir, filePath);
     if (!fullPath) {
       return res.status(403).json({ error: "Access denied" });
@@ -159,13 +159,13 @@ router.get("/api/uploaded-file", (req, res) => {
 });
 
 // Save custom file directly into the uploaded workspace
-router.post("/api/save-workspace-file", (req, res) => {
+router.post("/api/save-workspace-file", requireAuth, (req: AuthedRequest, res) => {
   try {
     const { filePath, content } = req.body;
     if (!filePath || typeof content !== "string") {
       return res.status(400).json({ error: "filePath and content string are required" });
     }
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
     if (!fs.existsSync(uploadedDir)) {
       fs.mkdirSync(uploadedDir, { recursive: true });
     }
@@ -194,13 +194,13 @@ router.post("/api/save-workspace-file", (req, res) => {
 });
 
 // Delete a custom file from the uploaded workspace
-router.post("/api/delete-workspace-file", (req, res) => {
+router.post("/api/delete-workspace-file", requireAuth, (req: AuthedRequest, res) => {
   try {
     const { filePath } = req.body;
     if (!filePath) {
       return res.status(400).json({ error: "filePath is required" });
     }
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
     const fullPath = resolveInsideDir(uploadedDir, filePath);
     if (!fullPath) {
       return res.status(403).json({ error: "Access denied" });
@@ -231,7 +231,7 @@ router.post("/api/generate-workspace-file", requireAuth, requireCredits("workspa
   }
 
   try {
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
     if (!fs.existsSync(uploadedDir)) {
       fs.mkdirSync(uploadedDir, { recursive: true });
     }

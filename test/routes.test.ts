@@ -111,7 +111,9 @@ describe("async handler containment", () => {
       .post("/api/cold-audit")
       .set("Cookie", await authedCookie(app))
       .send({ fileName: ".preflight.json", code: CRASH_PAYLOAD });
-    const after = await request(app).get("/api/upload-status");
+    const after = await request(app)
+      .get("/api/upload-status")
+      .set("Cookie", await authedCookie(app));
     expect(after.status).toBe(200);
   });
 
@@ -142,9 +144,15 @@ describe("auth gate ordering", () => {
   });
 
   it("accepts the correct token", async () => {
-    const res = await request(buildApp(TOKEN))
+    const app = buildApp(TOKEN);
+    // Sessions live in the auth DB, so a cookie minted on an ungated app
+    // instance is valid here; the signup call itself must not go through
+    // the Bearer gate.
+    const cookie = await authedCookie(buildApp());
+    const res = await request(app)
       .get("/api/upload-status")
-      .set("Authorization", `Bearer ${TOKEN}`);
+      .set("Authorization", `Bearer ${TOKEN}`)
+      .set("Cookie", cookie);
     expect(res.status).toBe(200);
   });
 
@@ -189,9 +197,10 @@ describe("auth gate ordering", () => {
     expect(status).not.toBe(413);
   });
 
-  it("is off by default so the unauthenticated flow is unchanged", async () => {
+  it("is off by default, but session auth still applies to data routes", async () => {
     const res = await request(buildApp()).get("/api/upload-status");
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("AUTH_REQUIRED");
   });
 });
 
@@ -217,8 +226,10 @@ describe("ZIP intake", () => {
 
   it("rejects an archive declaring more entries than the limit, quickly", async () => {
     const started = Date.now();
-    const res = await request(buildApp())
+    const app = buildApp();
+    const res = await request(app)
       .post("/api/upload-zip")
+      .set("Cookie", await authedCookie(app))
       .send({ zipBase64: directoryOnlyZip(60000).toString("base64") });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/entries/i);
@@ -226,14 +237,22 @@ describe("ZIP intake", () => {
   });
 
   it("rejects a non-ZIP payload", async () => {
-    const res = await request(buildApp()).post("/api/upload-zip").send({ zipBase64: "AAAA" });
+    const app = buildApp();
+    const res = await request(app)
+      .post("/api/upload-zip")
+      .set("Cookie", await authedCookie(app))
+      .send({ zipBase64: "AAAA" });
     expect(res.status).toBe(400);
   });
 
   it("rejects an archive over the size cap, on the encoded length", async () => {
     // Rejected from the base64 length, before the decode allocates.
     const oversize = "A".repeat(Math.ceil(((MAX_ARCHIVE_BYTES + 1024 * 1024) * 4) / 3));
-    const res = await request(buildApp()).post("/api/upload-zip").send({ zipBase64: oversize });
+    const app = buildApp();
+    const res = await request(app)
+      .post("/api/upload-zip")
+      .set("Cookie", await authedCookie(app))
+      .send({ zipBase64: oversize });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/limit/i);
   });
@@ -258,8 +277,10 @@ describe("ZIP intake", () => {
     const parsed = new AdmZip(buf);
     expect(parsed.getEntries()[0].entryName).toBe(evil);
 
-    const res = await request(buildApp())
+    const app = buildApp();
+    const res = await request(app)
       .post("/api/upload-zip")
+      .set("Cookie", await authedCookie(app))
       .send({ zipBase64: buf.toString("base64") });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/unsafe file paths/i);
@@ -268,8 +289,10 @@ describe("ZIP intake", () => {
   it("accepts a well-formed archive", async () => {
     const zip = new AdmZip();
     zip.addFile("src/index.ts", Buffer.from("export const a = 1;\n"));
-    const res = await request(buildApp())
+    const app = buildApp();
+    const res = await request(app)
       .post("/api/upload-zip")
+      .set("Cookie", await authedCookie(app))
       .send({ zipBase64: zip.toBuffer().toString("base64") });
     expect(res.status).toBe(200);
     expect(res.body.files.some((f: any) => f.path === "src/index.ts")).toBe(true);
@@ -277,13 +300,18 @@ describe("ZIP intake", () => {
 
   it("leaves an existing workspace intact when the upload is rejected", async () => {
     const app = buildApp();
+    const cookie = await authedCookie(app);
     await request(app)
       .post("/api/save-workspace-file")
+      .set("Cookie", cookie)
       .send({ filePath: "keepme.ts", content: "export const keep = 1;\n" });
 
-    await request(app).post("/api/upload-zip").send({ zipBase64: "AAAA" });
+    await request(app)
+      .post("/api/upload-zip")
+      .set("Cookie", cookie)
+      .send({ zipBase64: "AAAA" });
 
-    const status = await request(app).get("/api/upload-status");
+    const status = await request(app).get("/api/upload-status").set("Cookie", cookie);
     expect(status.body.files.some((f: any) => f.path === "keepme.ts")).toBe(true);
   });
 });
@@ -291,25 +319,31 @@ describe("ZIP intake", () => {
 describe("workspace path containment over HTTP", () => {
   it("refuses traversal on write, delete, and read", async () => {
     const app = buildApp();
+    const cookie = await authedCookie(app);
     const write = await request(app)
       .post("/api/save-workspace-file")
+      .set("Cookie", cookie)
       .send({ filePath: "../../escaped.txt", content: "x" });
     expect(write.status).toBe(403);
 
     const del = await request(app)
       .post("/api/delete-workspace-file")
+      .set("Cookie", cookie)
       .send({ filePath: "../../../etc/passwd" });
     expect(del.status).toBe(403);
 
     const read = await request(app)
       .get("/api/uploaded-file")
+      .set("Cookie", cookie)
       .query({ path: "../../package.json" });
     expect(read.status).toBe(403);
   });
 
   it("refuses a prefix-sibling directory, the original bypass", async () => {
-    const res = await request(buildApp())
+    const app = buildApp();
+    const res = await request(app)
       .post("/api/save-workspace-file")
+      .set("Cookie", await authedCookie(app))
       .send({ filePath: "../uploaded_project-evil/steal.txt", content: "x" });
     expect(res.status).toBe(403);
     expect(fs.existsSync(path.join(process.cwd(), "uploaded_project-evil"))).toBe(false);

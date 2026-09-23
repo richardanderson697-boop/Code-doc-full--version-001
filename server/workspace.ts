@@ -7,9 +7,22 @@ import { log } from "./logger";
 export const UPLOADED_DIR_NAME = "uploaded_project";
 
 // Resolved per call and overridable by CODEDOC_UPLOAD_DIR so tests never touch
-// a real workspace. Every route uses this rather than rebuilding the path.
-export function uploadedDir(): string {
-  return process.env.CODEDOC_UPLOAD_DIR || path.join(process.cwd(), UPLOADED_DIR_NAME);
+// a real workspace.
+//
+// Tenant isolation: every user's files live under their own subdirectory of
+// the base dir (uploaded_project/<userId>/). The workspace routes were
+// originally a single global directory, which meant any visitor could read or
+// delete any other user's uploaded codebase. Never serve the base dir itself
+// for a signed-in user: without a userId there is no owner, and ownerless
+// data is exactly the hole being closed here.
+export function uploadedDir(userId?: string): string {
+  const base = process.env.CODEDOC_UPLOAD_DIR || path.join(process.cwd(), UPLOADED_DIR_NAME);
+  if (!userId) return base;
+  // User ids are server-generated hex, but sanitize anyway: a directory name
+  // must never be influenced by unsanitized input.
+  const safe = String(userId).replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!safe) throw new Error("uploadedDir: invalid user id");
+  return path.join(base, safe);
 }
 
 // 3.95. Workspace Project Intelligence Endpoint (Full Workspace Analyzer)

@@ -16,7 +16,7 @@ const router = Router();
 router.post("/api/project-intelligence", requireAuth, requireCredits("intelligence"), asyncRoute(async (req: AuthedRequest, res) => {
   try {
     let files: WorkspaceFile[] = [];
-    const uploadedDir = uploadedDirPath();
+    const uploadedDir = uploadedDirPath(req.user!.id);
     let isUploadedProject = false;
 
     if (fs.existsSync(uploadedDir)) {
