@@ -18,7 +18,7 @@ import { log } from "../logger";
 
 const router = Router();
 
-const WELCOME_CREDITS = Number(process.env.WELCOME_CREDITS ?? 25);
+const WELCOME_CREDITS = Number(process.env.WELCOME_CREDITS ?? 50);
 
 router.post("/api/auth/signup", asyncRoute(async (req, res) => {
   const { email, password } = req.body ?? {};
