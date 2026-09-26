@@ -195,6 +195,10 @@ export default function CodeAuditor({
   };
 
   // Sub tab control
+  // The GitHub tab is a template-generator mockup until the real GitHub App
+  // integration (push webhook -> Code Doc audit -> report committed back)
+  // ships. Keep it hidden so users don't mistake it for a broken feature.
+  const GITHUB_TAB_ENABLED = false;
   const [activeSubTab, setActiveSubTab] = useState<"audit" | "github">("audit");
 
 
@@ -644,6 +648,7 @@ export default function CodeAuditor({
           <span>🔍 Cold Analysis</span>
         </button>
 
+        {GITHUB_TAB_ENABLED && (
         <button
           type="button"
           onClick={() => setActiveSubTab("github")}
@@ -656,6 +661,7 @@ export default function CodeAuditor({
           <Github className="w-3.5 h-3.5" />
           <span>🐙 GitHub Actions CI/CD</span>
         </button>
+        )}
       </div>
 
       {/* Main Layout Workspace - Scrollable */}
@@ -1264,9 +1270,11 @@ export default function CodeAuditor({
             )}
         </div>
 
+        {GITHUB_TAB_ENABLED && (
         <div className={activeSubTab === "github" ? "" : "hidden"}>
           <GithubIntegrationTab result={result} />
         </div>
+        )}
       </div>
     </div>
   );

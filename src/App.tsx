@@ -12,7 +12,7 @@ import AuthModal from "./components/AuthModal";
 import PricingModal from "./components/PricingModal";
 import { parseReactAnatomy } from "./utils/anatomyParser";
 import { logError } from "./utils/logger";
-import { apiFetch, fetchMe, AuthRequiredError, CreditsRequiredError } from "./utils/apiFetch";
+import { apiFetch, fetchMe, notifyBalance, AuthRequiredError, CreditsRequiredError } from "./utils/apiFetch";
 
 export default function App() {
   const [projects, setProjects] = useState<VibeProject[]>([]);
@@ -74,6 +74,10 @@ export default function App() {
     const onAuthRequired = () => setAuthOpen(true);
     const onCreditsRequired = (e: Event) => {
       const { balance, required } = (e as CustomEvent).detail ?? {};
+      // The 402 carries the live balance, so the badge is correct even here.
+      if (typeof balance === "number") {
+        setUser((prev) => (prev ? { ...prev, credits: balance } : prev));
+      }
       setPricingNotice(
         `You're low on credits (balance ${balance ?? 0}, this action needs ~${required ?? "?"}). Top up to continue — the free PreFlight scan always costs 0.`
       );
@@ -81,9 +85,19 @@ export default function App() {
     };
     window.addEventListener("codedoc:auth-required", onAuthRequired);
     window.addEventListener("codedoc:credits-required", onCreditsRequired);
+    // Live balance updates stamped on metered API responses (header or SSE
+    // event) — the badge refreshes without a logout/login cycle.
+    const onBalanceUpdated = (e: Event) => {
+      const { balance } = (e as CustomEvent).detail ?? {};
+      if (typeof balance === "number") {
+        setUser((prev) => (prev ? { ...prev, credits: balance } : prev));
+      }
+    };
+    window.addEventListener("codedoc:balance-updated", onBalanceUpdated);
     return () => {
       window.removeEventListener("codedoc:auth-required", onAuthRequired);
       window.removeEventListener("codedoc:credits-required", onCreditsRequired);
+      window.removeEventListener("codedoc:balance-updated", onBalanceUpdated);
     };
   }, []);
 
@@ -264,6 +278,9 @@ export default function App() {
               }
               try {
                 const parsed = JSON.parse(dataStr);
+                if (typeof parsed.creditsBalance === "number") {
+                  notifyBalance(parsed.creditsBalance);
+                }
                 if (parsed.text) {
                   accumulatedText += parsed.text;
                   const { purpose, code } = splitContent(accumulatedText);

@@ -106,7 +106,8 @@ Keep the assessment highly detailed, precise, professional, and strictly factual
         responseSchema: AUDIT_SCHEMA as any,
       },
     });
-    chargeForCall(req.user!.id, extractUsage(auditResponse), modelName, "cold audit");
+    const coldAuditBalance = chargeForCall(req.user!.id, extractUsage(auditResponse), modelName, "cold audit");
+    if (coldAuditBalance != null) res.set("X-Credits-Balance", String(coldAuditBalance));
 
     const responseText = auditResponse.text || "";
     let cleanText = responseText.trim();

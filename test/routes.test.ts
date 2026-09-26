@@ -380,11 +380,11 @@ describe("cold-audit degraded response", () => {
   it("rejects broke users with 402", async () => {
     const app = buildApp();
     const cookie = await authedCookie(app);
-    // Drain the 25 welcome credits below the 15-credit minimum.
+    // Drain the whole welcome balance below the 15-credit minimum.
     const { spendCredits } = await import("../server/credits");
     const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
     expect(me.status).toBe(200);
-    spendCredits(me.body.user.id, 25, "test drain");
+    spendCredits(me.body.user.id, me.body.user.credits, "test drain");
     const res = await request(app).post("/api/cold-audit").set("Cookie", cookie).send({ code: "const a = 1;\n" });
     expect(res.status).toBe(402);
     expect(res.body.code).toBe("INSUFFICIENT_CREDITS");

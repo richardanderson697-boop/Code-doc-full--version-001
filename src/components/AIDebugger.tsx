@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
-import { apiFetch } from "../utils/apiFetch";
+import { apiFetch, notifyBalance } from "../utils/apiFetch";
 import { Bug, Send, Sparkles, Terminal, ShieldAlert, Cpu, AlertCircle, RefreshCw, CheckCircle2 } from "lucide-react";
 import VoiceReadoutButton from "./VoiceReadoutButton";
 
@@ -128,6 +128,9 @@ If there is a bug or correction, provide the exact corrected code block. If no b
               }
               try {
                 const parsed = JSON.parse(dataStr);
+                if (typeof parsed.creditsBalance === "number") {
+                  notifyBalance(parsed.creditsBalance);
+                }
                 if (parsed.text) {
                   accumulatedText += parsed.text;
                   

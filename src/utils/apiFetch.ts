@@ -15,8 +15,18 @@ export class CreditsRequiredError extends Error {
   }
 }
 
+// Broadcast a new credit balance to the app (the header badge listens).
+export function notifyBalance(balance: number) {
+  if (!Number.isFinite(balance) || balance < 0) return;
+  window.dispatchEvent(new CustomEvent("codedoc:balance-updated", { detail: { balance } }));
+}
+
 export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const res = await fetch(input, { ...init, credentials: "include" });
+  // Metered AI routes stamp the post-charge balance on the response so the
+  // credit badge updates immediately — no re-login needed.
+  const stamped = res.headers.get("x-credits-balance");
+  if (stamped !== null) notifyBalance(Number(stamped));
   if (res.status === 401) {
     const clone = res.clone();
     let code = "";

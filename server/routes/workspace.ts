@@ -269,7 +269,8 @@ You MUST format your response EXACTLY as follows:
         temperature: 0.7
       }
     });
-    chargeForCall(req.user!.id, extractUsage(genResponse), modelName, "workspace file generation");
+    const workspaceFileBalance = chargeForCall(req.user!.id, extractUsage(genResponse), modelName, "workspace file generation");
+    if (workspaceFileBalance != null) res.set("X-Credits-Balance", String(workspaceFileBalance));
 
     const responseText = genResponse.text || "";
     let code = "";

@@ -33,7 +33,7 @@ describe("auth", () => {
       .send({ email: "Ada@Example.com", password: "supersecret1" });
     expect(res.status).toBe(201);
     expect(res.body.user.email).toBe("ada@example.com"); // normalized
-    expect(res.body.user.credits).toBe(25);
+    expect(res.body.user.credits).toBe(Number(process.env.WELCOME_CREDITS ?? 50)); // server default
     expect(cookieOf(res)).toMatch(/^codedoc_session=/);
   });
 

@@ -46,7 +46,8 @@ ${code}`;
         temperature: 0.2, // Low temperature for high precision code healing
       },
     });
-    chargeForCall(req.user!.id, extractUsage(healedResponse), modelName, "ai heal");
+    const healBalance = chargeForCall(req.user!.id, extractUsage(healedResponse), modelName, "ai heal");
+    if (healBalance != null) res.set("X-Credits-Balance", String(healBalance));
 
     let healedCode = healedResponse.text || "";
     
@@ -137,7 +138,7 @@ ${numberedCode}`;
         temperature: 0.1, // Low temperature for maximum precision and zero bias
       },
     });
-    chargeForCall(req.user!.id, extractUsage(auditResponse), modelName, "ai audit pass 1");
+    let auditBalance: number | null = chargeForCall(req.user!.id, extractUsage(auditResponse), modelName, "ai audit pass 1");
 
     const rawAuditText = auditResponse.text || "";
     let validatedAuditText = rawAuditText;
@@ -176,7 +177,8 @@ Identify any contradictions between findings, gaps, and the completeness score i
 
       if (validationResponse && validationResponse.text) {
         validatedAuditText = validationResponse.text.trim();
-        chargeForCall(req.user!.id, extractUsage(validationResponse), modelName, "ai audit validation pass");
+        const validationBalance = chargeForCall(req.user!.id, extractUsage(validationResponse), modelName, "ai audit validation pass");
+        if (validationBalance != null) auditBalance = validationBalance;
       }
     } catch (validationErr) {
       log.warn("Audit Markdown Validation Pass Error (falling back to original):", validationErr);
@@ -221,6 +223,7 @@ Identify any contradictions between findings, gaps, and the completeness score i
       log.error("Markdown Reconciler Error:", markdownReconcileErr);
     }
 
+    if (auditBalance != null) res.set("X-Credits-Balance", String(auditBalance));
     res.json({ audit: validatedAuditText });
   } catch (error: any) {
     log.error("Auditing API Error:", error);
@@ -325,10 +328,16 @@ Do not skip sections, and make sure the code is completely written (no comments 
       streamUsage.outputTokens = Math.max(streamUsage.outputTokens, u.outputTokens);
     }
     // Headers already sent: meter best-effort, never fail the stream for it.
+    // The new balance rides along as a final SSE event so the credit badge
+    // updates without an extra round-trip.
+    let streamBalance: number | null = null;
     try {
-      chargeForCall(req.user!.id, streamUsage, modelName, "ai generate stream");
+      streamBalance = chargeForCall(req.user!.id, streamUsage, modelName, "ai generate stream");
     } catch (meterErr) {
       log.warn("Credit metering failed for generate stream:", meterErr);
+    }
+    if (streamBalance != null) {
+      res.write(`data: ${JSON.stringify({ creditsBalance: streamBalance })}\n\n`);
     }
 
     res.write("data: [DONE]\n\n");
