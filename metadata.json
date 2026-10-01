@@ -1,5 +1,5 @@
 {
-  "name": "Code Doc",
+  "name": "GradeVibes",
   "description": "An AI-powered workspace to generate code, explore dynamic function-by-function purposes side-by-side, and inspect component anatomy in real time.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

@@ -196,7 +196,7 @@ export default function CodeAuditor({
 
   // Sub tab control
   // The GitHub tab is a template-generator mockup until the real GitHub App
-  // integration (push webhook -> Code Doc audit -> report committed back)
+  // integration (push webhook -> GradeVibes audit -> report committed back)
   // ships. Keep it hidden so users don't mistake it for a broken feature.
   const GITHUB_TAB_ENABLED = false;
   const [activeSubTab, setActiveSubTab] = useState<"audit" | "github">("audit");

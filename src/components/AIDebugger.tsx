@@ -21,7 +21,7 @@ export default function AIDebugger({ code, onHighlightLine, selectedLine }: AIDe
     {
       id: "initial",
       sender: "ai",
-      text: "Hey! I am your Code Doc Debugger. Select a line in the editor or select any variable or hook on the Anatomy tab. If there is a bug or behavior you don't understand, describe it here and I will tell you what went wrong and how the state flows!",
+      text: "Hey! I am your GradeVibes Debugger. Select a line in the editor or select any variable or hook on the Anatomy tab. If there is a bug or behavior you don't understand, describe it here and I will tell you what went wrong and how the state flows!",
       timestamp: new Date()
     }
   ]);
@@ -68,7 +68,7 @@ export default function AIDebugger({ code, onHighlightLine, selectedLine }: AIDe
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          systemInstruction: "You are the ultimate friendly React Code Doc Debugger designed for non-technical creators. Explain React rendering, state flow, line-by-line code logic, and syntax issues. Keep your answer clear, encouraging, structured, and easy to read. Use bullet points and bold styling. Avoid complex developer jargon unless you explain it simply.",
+          systemInstruction: "You are the ultimate friendly React GradeVibes Debugger designed for non-technical creators. Explain React rendering, state flow, line-by-line code logic, and syntax issues. Keep your answer clear, encouraging, structured, and easy to read. Use bullet points and bold styling. Avoid complex developer jargon unless you explain it simply.",
           prompt: `Here is the full React TSX component code:
 \`\`\`tsx
 ${code}

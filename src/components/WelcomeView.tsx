@@ -198,7 +198,7 @@ export default function WelcomeView({
           <Terminal className="w-3.5 h-3.5" /> High-Performance Code Documentation
         </div>
         <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight text-slate-100 font-sans">
-          Code Doc <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-teal-300">Workspace</span>
+          GradeVibes <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-teal-300">Workspace</span>
         </h1>
         <p className="text-slate-400 text-xs md:text-sm max-w-xl mx-auto font-light leading-relaxed">
           Create functional web applications from scratch, or analyze your external React/TypeScript code files under a completely objective, zero-memory lens.
@@ -279,7 +279,7 @@ export default function WelcomeView({
                   disabled={!prompt.trim() || isLoading}
                   className="px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 disabled:from-slate-800 disabled:to-slate-800 disabled:text-slate-500 text-slate-950 font-semibold rounded-xl text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/10 transition duration-150"
                 >
-                  {isLoading ? "Writing blueprinters..." : "Build Code Doc"}
+                  {isLoading ? "Writing blueprinters..." : "Build with GradeVibes"}
                   <ArrowRight className="w-3.5 h-3.5" />
                 </button>
               </div>

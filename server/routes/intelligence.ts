@@ -30,7 +30,7 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
     if (!isUploadedProject) {
       const workspaceFiles = getWorkspaceFiles(process.cwd());
 
-      // Files that make up the Code Doc application itself. If only these
+      // Files that make up the GradeVibes application itself. If only these
       // exist, the user has not uploaded or created their own codebase.
       // Directory prefixes cover the app's own source trees so refactors
       // don't silently reclassify app code as a user project.

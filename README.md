@@ -1,6 +1,6 @@
-# ⚡ Code Doc — AI Vibe Studio & Reactive Code Auditor
+# ⚡ GradeVibes — AI Vibe Studio & Reactive Code Auditor
 
-**Code Doc** is an AI-driven, interactive React and TypeScript development workspace. It allows developers to generate web app prototypes from natural language prompts, incrementally evolve existing components, inspect code AST anatomy in real time, run automated cold audits, and debug syntax or state logic line-by-line.
+**GradeVibes** is an AI-driven, interactive React and TypeScript development workspace. It allows developers to generate web app prototypes from natural language prompts, incrementally evolve existing components, inspect code AST anatomy in real time, run automated cold audits, and debug syntax or state logic line-by-line.
 
 ---
 

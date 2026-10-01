@@ -477,7 +477,7 @@ export default function AnatomyInspector({
         {activeSubTab === "sanity" && (
           <div className="space-y-3">
             <div className="p-3 bg-slate-950/40 border border-slate-800/80 rounded-xl mb-4 text-xs font-light leading-relaxed text-slate-400">
-              <span className="font-semibold text-emerald-400">Code Doc Sanity Scanner:</span> Scans raw react component blocks to identify asynchronous pitfalls, variable assignment leaks, and component timing traps before they crash your browser app.
+              <span className="font-semibold text-emerald-400">GradeVibes Sanity Scanner:</span> Scans raw react component blocks to identify asynchronous pitfalls, variable assignment leaks, and component timing traps before they crash your browser app.
             </div>
 
             {sanityChecks.map((check, i) => (

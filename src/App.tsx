@@ -508,7 +508,7 @@ export default function App() {
             </div>
             <div>
               <h2 className="font-bold text-xs text-slate-100 uppercase tracking-wider font-sans select-none">
-                Code Doc
+                GradeVibes
               </h2>
               {hasActiveWorkspace && (
                 <div className="flex items-center gap-2">
