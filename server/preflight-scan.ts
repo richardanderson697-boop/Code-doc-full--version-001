@@ -7,6 +7,7 @@
 // A scan failure degrades to an empty report carrying `failed`, so callers
 // keep serving and the UI can say "not measured" instead of "clean".
 import { scan, engineInfo } from "./preflight/vendor/lib/cockpit-scan.js";
+import { runOpengrepScan } from "./preflight/opengrep/runner";
 import { log } from "./logger";
 import { PreFlightFinding, PreFlightReport, SEVERITY_ORDER } from "../shared/preflight-types";
 
@@ -232,6 +233,19 @@ export function runPreFlightScan(
   // (app-shape) without re-sorting, so the array can arrive out of order.
   // Sort here: the prompt digest caps by this order and must not spend its
   // budget on info findings while dropping criticals.
+  //
+  // Opengrep pass: AST-aware rules from the first-party pack, over the same
+  // selected files. Degrades silently when the binary is absent (local dev
+  // without the install step); a present-but-failing binary is recorded as a
+  // probe failure so the report says "not measured" instead of "clean".
+  // The engine's score is kept as-is: opengrep findings do not move it yet
+  // (follow-up: unified scoring).
+  const og = runOpengrepScan(selected);
+  if (og.failure) {
+    probeFailures.push(og.failure);
+    log.warn(`PreFlight probe "opengrep" failed: ${og.failure.error}`);
+  }
+  findings.push(...og.findings);
   findings.sort(
     (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity)
   );
@@ -243,7 +257,7 @@ export function runPreFlightScan(
 
   return {
     engine: "PreFlight",
-    probeCount: safeProbeCount(),
+    probeCount: safeProbeCount() + og.rulesRun,
     filesScanned: selected.length,
     filesSkipped: skipped,
     score: typeof result?.score === "number" ? result.score : 0,

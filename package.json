@@ -12,7 +12,8 @@
     "lint": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "verify": "npm run lint && npm test && npm run build"
+    "verify": "npm run lint && npm test && npm run build",
+    "postinstall": "sh scripts/install-opengrep.sh"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

@@ -1,0 +1,155 @@
+# GradeVibes/FinalRead first-party Opengrep rule pack (JavaScript/TypeScript).
+#
+# These rules are written by us for our own scanning service. They are NOT
+# taken from Semgrep's official registry (whose Dec-2024 license forbids
+# running them on customers' code as a service). Keep it that way: add new
+# rules here, never `--config p/...` or `--config auto` in the runner.
+#
+# Conventions:
+# - Rule ids are prefixed `gv-` so findings are traceable to this pack.
+# - `metadata.cwe` / `metadata.owasp` feed the finding's CWE/OWASP fields.
+# - `metadata.fix` becomes the finding's remediation text.
+# - `metadata.gradevibes_severity` (optional) overrides the OpenGrep
+#   severity -> PreFlight severity mapping (critical/high/medium/low/info).
+rules:
+  - id: gv-hardcoded-secret
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Hardcoded credential assigned in source. Anyone with read access to
+      this code (or the built bundle) learns the secret.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+      fix: Move the secret to an environment variable or a secrets manager and
+        read it at runtime (e.g. process.env.API_KEY). Rotate the exposed
+        value, since it must now be treated as compromised.
+      gradevibes_severity: critical
+    paths:
+      exclude:
+        - "*test*"
+        - "*spec*"
+        - "*fixture*"
+    pattern-regex: |-
+      (?i)(password|passwd|pwd|secret|api[_-]?key|auth[_-]?token|private[_-]?key)\s*[:=]\s*['"][^'"]{4,}['"]
+
+  - id: gv-eval-call
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: Call to eval() executes a string as code. If any part of that
+      string is attacker-influenced, this is remote code execution.
+    metadata:
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      owasp: "A03:2021 - Injection"
+      fix: Replace eval() with a safe parser for the data format you actually
+        need (JSON.parse, a real expression parser). If dynamic code is truly
+        required, isolate it and never feed it untrusted input.
+      gradevibes_severity: high
+    pattern: eval(...)
+
+  - id: gv-dangerously-set-inner-html
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: dangerouslySetInnerHTML renders raw HTML. Unsanitized content here
+      is a stored/reflected XSS sink.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+      fix: Render data through React's normal escaping. If raw HTML is
+        unavoidable, sanitize it first with a library like DOMPurify.
+      gradevibes_severity: high
+    pattern: <$TAG dangerouslySetInnerHTML={$X} />
+
+  - id: gv-innerhtml-assignment
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: Assignment to innerHTML with a non-literal value can inject
+      attacker-controlled markup (XSS).
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+      fix: Prefer textContent for plain text, or sanitize HTML with DOMPurify
+        before assigning to innerHTML.
+    patterns:
+      - pattern: $EL.innerHTML = $HTML
+      - pattern-not: $EL.innerHTML = "..."
+
+  - id: gv-document-write
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: document.write() with dynamic content is an XSS sink and also
+      blocks page parsing.
+    metadata:
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      owasp: "A03:2021 - Injection"
+      fix: Build DOM nodes with document.createElement/textContent instead of
+        document.write().
+    patterns:
+      - pattern: document.write(...)
+      - pattern-not: document.write("...")
+
+  - id: gv-weak-hash
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: MD5/SHA-1 are broken for security purposes (collisions are
+      practical). They must not protect passwords, tokens, or integrity
+      checks that an attacker can influence.
+    metadata:
+      cwe: "CWE-327: Use of a Broken or Risky Cryptographic Algorithm"
+      owasp: "A02:2021 - Cryptographic Failures"
+      fix: Use SHA-256 or better from the same API. For passwords use a
+        password-hashing function (scrypt, bcrypt, argon2), never a fast hash.
+    pattern-either:
+      - pattern: crypto.createHash("md5", ...)
+      - pattern: crypto.createHash('md5', ...)
+      - pattern: crypto.createHash("sha1", ...)
+      - pattern: crypto.createHash('sha1', ...)
+
+  - id: gv-child-process-exec
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: child_process.exec/spawn with a non-literal command string. If any
+      part of the command comes from outside the code, this is command
+      injection.
+    metadata:
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      owasp: "A03:2021 - Injection"
+      fix: Pass arguments as an array (execFile/spawn with args) so no shell
+        interprets them, and never build the command from untrusted input.
+      gradevibes_severity: high
+    patterns:
+      - pattern-either:
+          - pattern: $CP.exec($CMD, ...)
+          - pattern: $CP.execSync($CMD, ...)
+          - pattern: $CP.spawn($CMD, ...)
+      - pattern-not: $CP.exec("...", ...)
+      - pattern-not: $CP.execSync("...", ...)
+      - pattern-not: $CP.spawn("...", ...)
+
+  - id: gv-sql-string-concat
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: SQL query built by concatenating strings. If any concatenated
+      value is attacker-influenced, this is SQL injection.
+    metadata:
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command"
+      owasp: "A03:2021 - Injection"
+      fix: Use parameterized queries / prepared statements so values are never
+        interpreted as SQL.
+    pattern-regex: |-
+      \.(query|execute)\s*\(\s*[`"'][^`"']*[`"']\s*\+
+
+  - id: gv-jwt-hardcoded-secret
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: JWT signed or verified with a hardcoded secret. Anyone reading the
+      code can forge valid tokens.
+    metadata:
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      owasp: "A07:2021 - Identification and Authentication Failures"
+      fix: Load the signing secret from an environment variable or secrets
+        manager and rotate the exposed value.
+      gradevibes_severity: high
+    patterns:
+      - pattern-either:
+          - pattern: jwt.sign(..., "...")
+          - pattern: jwt.verify(..., "...")

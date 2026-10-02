@@ -12,3 +12,4 @@ coverage/
 # server/preflight/vendor/data/.
 /data/
 /uploaded_project/
+bin/opengrep
