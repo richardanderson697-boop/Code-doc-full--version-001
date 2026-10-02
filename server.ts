@@ -14,6 +14,7 @@ import aiRouter from "./server/routes/ai";
 import coldAuditRouter from "./server/routes/cold-audit";
 import workspaceRouter from "./server/routes/workspace";
 import intelligenceRouter from "./server/routes/intelligence";
+import { ensureOpengrepBinary } from "./server/preflight/opengrep/runner";
 
 dotenv.config();
 
@@ -96,6 +97,12 @@ app.all("/api/*", (req, res) => {
 
 // Vite / static asset serving configuration
 async function startServer() {
+  // The PreFlight AST layer self-installs its engine binary in the background
+  // (the bun-based Railway build does not reliably run the postinstall hook).
+  // Fire-and-forget: never blocks startup, scans degrade gracefully until it
+  // lands, and any failure just logs a warning.
+  ensureOpengrepBinary();
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },

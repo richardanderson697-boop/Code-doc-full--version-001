@@ -18,7 +18,9 @@
 // - Findings come back with project-relative file paths, matching the shape
 //   the adapter and the UI expect.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, createWriteStream, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { get as httpsGet } from "node:https";
+import { get as httpGet } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, normalize, relative, sep } from "node:path";
 import { log } from "../../logger";
@@ -42,7 +44,12 @@ export const OPENGREP_VERSION = "1.30.0";
 
 const TIMEOUT_MS = Number(process.env.OPENGREP_TIMEOUT_MS) || 20000;
 
-let cachedBinary: string | null | undefined;
+// Positive resolutions are cached for the process lifetime. Negative ones get
+// a short TTL so a background self-install that lands mid-process is picked
+// up by later scans instead of being invisible forever.
+let cachedBinary: string | null = null;
+let negativeCachedAt = 0;
+const NEGATIVE_TTL_MS = 60 * 1000;
 let warnedMissing = false;
 
 function binaryIsUsable(p: string): boolean {
@@ -54,11 +61,121 @@ function binaryIsUsable(p: string): boolean {
   }
 }
 
-// Resolve the engine binary: explicit env override, then the install script's
+// ---- Self-install ---------------------------------------------------------
+// The Railway/bun build does not reliably run the postinstall hook, so the
+// server installs the pinned engine binary itself: in the background, in pure
+// Node (no curl dependency), never blocking startup or a scan. Best-effort:
+// any failure just leaves the graceful degradation in place.
+
+const ASSET_BY_PLATFORM: Record<string, string> = {
+  "linux-x64": "opengrep_manylinux_x86",
+  "linux-arm64": "opengrep_manylinux_aarch64",
+  "darwin-arm64": "opengrep_osx_arm64",
+  "darwin-x64": "opengrep_osx_x64",
+};
+
+const DOWNLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+const DOWNLOAD_RETRY_MS = 5 * 60 * 1000;
+let downloadInFlight: Promise<void> | null = null;
+let lastDownloadAttempt = 0;
+
+function downloadDest(): string {
+  return join(process.cwd(), "bin", process.platform === "win32" ? "opengrep.exe" : "opengrep");
+}
+
+function downloadBaseUrl(): string {
+  return (
+    process.env.OPENGREP_DOWNLOAD_BASE_URL ||
+    `https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}`
+  );
+}
+
+function fetchToFile(url: string, destPart: string, redirectsLeft: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // https in production; plain http exists only so tests can serve a fake
+    // binary from a local server via OPENGREP_DOWNLOAD_BASE_URL.
+    const get = url.startsWith("https:") ? httpsGet : httpGet;
+    const req = get(url, { timeout: DOWNLOAD_TIMEOUT_MS }, (res) => {
+      const status = res.statusCode || 0;
+      if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
+        res.resume();
+        fetchToFile(res.headers.location, destPart, redirectsLeft - 1).then(resolve, reject);
+        return;
+      }
+      if (status !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${status}`));
+        return;
+      }
+      const out = createWriteStream(destPart, { mode: 0o755 });
+      res.pipe(out);
+      out.on("finish", () => resolve());
+      out.on("error", (e) => {
+        res.destroy();
+        reject(e);
+      });
+    });
+    req.on("timeout", () => req.destroy(new Error("download timed out")));
+    req.on("error", reject);
+  });
+}
+
+function downloadedVersionOk(p: string): boolean {
+  try {
+    const out = execFileSync(p, ["--version"], { timeout: 5000, encoding: "utf8", stdio: "pipe" });
+    return String(out).trim().startsWith(OPENGREP_VERSION);
+  } catch {
+    return false;
+  }
+}
+
+async function performDownload(): Promise<void> {
+  const asset = ASSET_BY_PLATFORM[`${process.platform}-${process.arch}`];
+  if (!asset) {
+    log.warn(`Opengrep self-install: no binary for ${process.platform}-${process.arch}; AST layer stays off.`);
+    return;
+  }
+  const dest = downloadDest();
+  mkdirSync(dirname(dest), { recursive: true });
+  const part = dest + ".part";
+  const url = `${downloadBaseUrl()}/${asset}`;
+  log.info(`Opengrep self-install: downloading ${OPENGREP_VERSION} in the background...`);
+  await fetchToFile(url, part, 4);
+  chmodSync(part, 0o755);
+  if (!downloadedVersionOk(part)) {
+    rmSync(part, { force: true });
+    throw new Error("downloaded binary failed its version check");
+  }
+  renameSync(part, dest);
+  // Drop the negative resolution cache so the next scan picks the binary up.
+  negativeCachedAt = 0;
+  log.info(`Opengrep self-install: ready at ${dest}`);
+}
+
+// Fire-and-forget entry point. Safe to call any number of times: at most one
+// download runs at a time, failures back off, it never throws, and
+// OPENGREP_NO_AUTOINSTALL=1 disables it entirely.
+export function ensureOpengrepBinary(): void {
+  if (process.env.OPENGREP_DISABLED === "1" || process.env.OPENGREP_NO_AUTOINSTALL === "1") return;
+  if (resolveOpengrepBinary()) return;
+  const now = Date.now();
+  if (downloadInFlight || now - lastDownloadAttempt < DOWNLOAD_RETRY_MS) return;
+  lastDownloadAttempt = now;
+  downloadInFlight = performDownload()
+    .catch((err) => {
+      log.warn(`Opengrep self-install failed (${err?.message || err}); continuing without the AST layer.`);
+    })
+    .finally(() => {
+      downloadInFlight = null;
+    });
+}
+
+// Resolve the engine binary: explicit env override, then the install
 // location (./bin/opengrep, works in dev and in the deployed image), then
-// PATH. Result is cached for the process lifetime.
+// PATH. Positive hits are cached; misses are re-checked after a short TTL.
 export function resolveOpengrepBinary(): string | null {
-  if (cachedBinary !== undefined) return cachedBinary;
+  if (cachedBinary) return cachedBinary;
+  if (Date.now() - negativeCachedAt < NEGATIVE_TTL_MS) return null;
   const candidates: string[] = [];
   if (process.env.OPENGREP_PATH) candidates.push(process.env.OPENGREP_PATH);
   candidates.push(join(process.cwd(), "bin", "opengrep"));
@@ -88,7 +205,7 @@ export function resolveOpengrepBinary(): string | null {
   } catch {
     // no usable binary on PATH
   }
-  cachedBinary = null;
+  negativeCachedAt = Date.now();
   return null;
 }
 
@@ -199,8 +316,10 @@ export function runOpengrepScan(files: OpengrepInputFile[]): OpengrepResult {
   const rulesDir = resolveRulesDir();
   if (!binary || !rulesDir) {
     // The binary is an enhancement layer, not a requirement: without it the
-    // scan behaves exactly as it did before this integration. Warn once for
-    // ops visibility, then stay quiet.
+    // scan behaves exactly as it did before this integration. Kick off the
+    // background self-install (no-op if already running or disabled), warn
+    // once for ops visibility, then stay quiet.
+    if (!binary) ensureOpengrepBinary();
     if (!warnedMissing) {
       warnedMissing = true;
       log.warn(

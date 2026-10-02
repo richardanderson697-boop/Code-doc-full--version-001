@@ -20,13 +20,16 @@ service is prohibited. So: **only our own rules, never registry packs.**
 
 ## Install
 
-`scripts/install-opengrep.sh` (pinned version, idempotent) runs via the
-`postinstall` hook, so Railway/Nixpacks images get the binary at build time.
-Local dev without the binary is fine: the scan degrades to the vendored
-engine only and logs one warning.
+The server installs the pinned binary itself at startup, in the background,
+in pure Node (`ensureOpengrepBinary` in `runner.ts`) — this is the reliable
+path, because Railway's bun-based build does not run the `postinstall` hook.
+`scripts/install-opengrep.sh` (pinned version, idempotent) still runs via
+`postinstall` for npm-based setups and local dev. Either way, running without
+the binary is fine: the scan degrades to the vendored engine only.
 
 Env overrides: `OPENGREP_PATH`, `OPENGREP_RULES_DIR`, `OPENGREP_TIMEOUT_MS`,
-`OPENGREP_DISABLED=1` (tests / emergency kill-switch).
+`OPENGREP_DISABLED=1` (full kill-switch), `OPENGREP_NO_AUTOINSTALL=1`
+(disables the background download; the postinstall script still applies).
 
 ## Adding a rule
 
