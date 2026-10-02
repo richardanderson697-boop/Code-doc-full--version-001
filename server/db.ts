@@ -126,21 +126,28 @@ export function warnIfEphemeralDataDir(): void {
     if (process.platform !== "linux") return;
     const dir = path.resolve(dataDir());
     const mounts = fs.readFileSync("/proc/mounts", "utf8").split("\n");
+    const table: string[] = [];
     let onVolume = false;
     for (const line of mounts) {
       const parts = line.split(" ");
-      if (parts.length < 2) continue;
+      if (parts.length < 3) continue;
       const mountPoint = parts[1].replace(/\\040/g, " ");
+      table.push(`${parts[0]} -> ${mountPoint} [${parts[2]}]`);
       if (mountPoint !== "/" && (dir === mountPoint || dir.startsWith(mountPoint + "/"))) {
         onVolume = true;
-        break;
       }
     }
+    // Always visible at startup: when /data is not persistent we need to see
+    // WHERE the platform actually mounted the volume (if at all), so the
+    // mount can be fixed instead of guessed at.
+    log.info(`Startup mount table: ${table.join(" | ")}`);
     if (!onVolume) {
       log.warn(
         `DATA LOSS RISK: ${dir} is not on a persistent volume. Every redeploy will wipe users, ` +
           `sessions, and credit ledgers. Attach a Railway volume at this path.`
       );
+    } else {
+      log.info(`Data dir ${dir} is on a persistent volume.`);
     }
   } catch {
     // /proc/mounts unreadable (non-Linux, sandboxed): stay quiet.

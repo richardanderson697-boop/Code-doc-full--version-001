@@ -87,6 +87,14 @@ function hasWord(haystack: string, pattern: RegExp): boolean {
 const AUTH_IMPL = /(better-auth|next-auth|@clerk\/|passport|jsonwebtoken|createSession|verifyPassword|signIn\(|signOut\(|getServerSession|oauth)/i;
 const AUTH_REF = /(sign\s?-?in|log\s?-?in|sign\s?-?up|create\s?account|forgot\s?password|reset\s?password)/i;
 const DB_IMPL = /(drizzle|prisma|mongoose|typeorm|sequelize|better-sqlite3|node:sqlite|kysely|supabase|mongodb|createPool|DataSource)/i;
+// Backend-as-a-service persistence: Firebase/Firestore/Realtime DB, Supabase client,
+// Appwrite, Convex, PlanetScale, Neon, Turso/libSQL, Upstash, PocketBase. These are
+// real persistence layers even though they ship no local schema/migration files.
+const BAAS_IMPL = /(firebase\/firestore|firebase\/database|firebase-admin|getFirestore|getDatabase|@supabase\/supabase-js|createClient|appwrite|convex\/|planetscale|@planetscale|neon\(|@neondatabase|turso|@libsql|upstash|pocketbase)/i;
+// BaaS config files (firebase.json, firestore.rules, supabase config, ...) prove the
+// project is wired to a hosted persistence backend even when the client call sites
+// live behind a wrapper the content scan cannot name.
+const BAAS_CONFIG_PATH = /(firebase|firestore|supabase|appwrite)/i;
 const DB_REF = /(database|migration|schema\.prisma|collection|table\s+users|persist)/i;
 const PAYMENT_REF = /(stripe|checkout|payment|billing|subscription)/i;
 const AUTOMATION_IMPL = /(node-cron|cron\.schedule|setInterval\s*\(|bullmq|inngest|trigger\.dev|new\s+Worker|webhook)/i;
@@ -278,20 +286,36 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
 
 function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
-  const implFiles = sig.files.filter((f) => isCodeFile(f.path) && hasWord(f.content, DB_IMPL));
+  const implFiles = sig.files.filter(
+    (f) => isCodeFile(f.path) && (hasWord(f.content, DB_IMPL) || hasWord(f.content, BAAS_IMPL))
+  );
+  const baasCode = implFiles.some((f) => hasWord(f.content, BAAS_IMPL) && !hasWord(f.content, DB_IMPL));
+  // BaaS config present (e.g. firebase-applet-config.json) even if the client call
+  // sites are wrapped opaquely: persistence exists, usage unverified.
+  const baasConfig = sig.files.find((f) => !isCodeFile(f.path) && BAAS_CONFIG_PATH.test(f.path));
   const schemaFiles = sig.files.filter((f) => /(schema|migration|models?)\//i.test(f.path) || /schema\.(ts|js|prisma|sql)$/i.test(f.path));
 
   if (implFiles.length > 0) {
     const names = implFiles.slice(0, 4).map((f) => f.path);
-    evidence.push(`${names.join(", ")} (database client usage)`);
-    if (schemaFiles.length > 0) evidence.push(`${schemaFiles[0].path} (schema/migration present)`);
-    else evidence.push("no schema/migration file detected");
+    evidence.push(`${names.join(", ")} (${baasCode ? "BaaS" : "database"} client usage)`);
+    if (baasCode) {
+      evidence.push("document/BaaS store — schema files not expected");
+    } else if (schemaFiles.length > 0) {
+      evidence.push(`${schemaFiles[0].path} (schema/migration present)`);
+    } else {
+      evidence.push("no schema/migration file detected");
+    }
     const stubbed = implFiles.some((f) => f.analysis.stubCount > 0);
     if (stubbed) {
       evidence.push("database code contains stubs");
       return { score: 5, max: 10, evidence };
     }
-    return { score: schemaFiles.length > 0 ? 10 : 8, max: 10, evidence };
+    return { score: baasCode || schemaFiles.length > 0 ? 10 : 8, max: 10, evidence };
+  }
+
+  if (baasConfig) {
+    evidence.push(`${baasConfig.path} (BaaS persistence configured; client usage not detected in scanned files)`);
+    return { score: 7, max: 10, evidence };
   }
 
   const referenced = anyFile(sig, (f) => hasWord(f.content, DB_REF));
@@ -624,7 +648,13 @@ export function computeDeterministicAssessment(
     const claimsApi = sig.files.some(
       (f) => hasWord(f.content, AUTH_REF) || hasWord(f.content, DB_REF) || hasWord(f.content, PAYMENT_REF)
     );
-    if (claimsApi && sig.files.length > 5) {
+    // A reference is only a hollow claim when the capability is actually
+    // missing: real auth/db/integration implementations (Firebase included)
+    // are evidence of a backend, not of an unfinished one.
+    const hollowClaim = (["authentication", "databaseLayer", "externalIntegrations"] as const).some((k) =>
+      (categories[k].note ?? "").startsWith("dangling")
+    );
+    if (claimsApi && hollowClaim && sig.files.length > 5) {
       scores = scaleToCap(scores, 45);
       capsApplied.push("CAP B (single-endpoint API surface: total capped at 45)");
     }

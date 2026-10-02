@@ -272,4 +272,40 @@ describe("deterministic scoring", () => {
     expect(a.categories.authentication.score).toBe(10);
     expect(a.categories.databaseLayer.score).toBe(10);
   });
+
+  it("recognizes Firebase/Firestore as a real persistence layer", () => {
+    // Mirrors Write-Sound: firebase config references persistence, manuscripts
+    // are saved to Firestore from code. Must not emit "Add database
+    // persistence layer" or score the dangling-db branch.
+    const files = [
+      wf("package.json", JSON.stringify({ dependencies: { react: "18", firebase: "10.0.0" } })),
+      wf("index.html", `<div id="root"></div><script src="/src/main.tsx"></script>`),
+      wf("src/main.tsx", `import { App } from './App';`),
+      wf("firebase-applet-config.json", JSON.stringify({ projectId: "write-sound", persistence: true })),
+      wf("src/lib/manuscripts.ts", `import { getFirestore, doc, setDoc } from 'firebase/firestore';
+export async function saveManuscript(id: string, text: string) {
+  const db = getFirestore();
+  await setDoc(doc(db, 'manuscripts', id), { text, updatedAt: Date.now() });
+}`),
+      wf("src/App.tsx", `export function App() { return <div/>; }`),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.databaseLayer.score).toBeGreaterThanOrEqual(8);
+    expect(a.categories.databaseLayer.note).not.toBe("dangling-db");
+    expect(a.missingFeatures.some((m) => /database persistence layer/i.test(m.feature))).toBe(false);
+  });
+
+  it("treats BaaS config without visible client usage as partial, not dangling", () => {
+    const files = [
+      wf("package.json", JSON.stringify({ dependencies: { react: "18" } })),
+      wf("index.html", `<div id="root"></div><script src="/src/main.tsx"></script>`),
+      wf("src/main.tsx", `import { App } from './App';`),
+      wf("firebase-applet-config.json", JSON.stringify({ projectId: "x", persistence: true })),
+      wf("src/App.tsx", `export function App() { return <div/>; }`),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.databaseLayer.score).toBe(7);
+    expect(a.categories.databaseLayer.note).not.toBe("dangling-db");
+    expect(a.missingFeatures.some((m) => /database persistence layer/i.test(m.feature))).toBe(false);
+  });
 });
