@@ -2,7 +2,7 @@
 // Sessions are random 256-bit tokens; only the SHA-256 hash is stored.
 import crypto from "crypto";
 import type { Request, Response, NextFunction } from "express";
-import { getAuthDb } from "./authdb";
+import { getDb } from "./store";
 
 export interface SessionUser {
   id: string;
@@ -44,21 +44,22 @@ function tokenHash(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-export function createSession(userId: string): { token: string; expiresAt: Date } {
+export async function createSession(userId: string): Promise<{ token: string; expiresAt: Date }> {
   const token = crypto.randomBytes(32).toString("hex");
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
-  const db = getAuthDb();
-  db.prepare(
-    "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)"
-  ).run(tokenHash(token), userId, new Date().toISOString(), expiresAt.toISOString());
+  const db = getDb();
+  await db.run(
+    "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+    [tokenHash(token), userId, new Date().toISOString(), expiresAt.toISOString()]
+  );
   return { token, expiresAt };
 }
 
-export function destroySession(token: string): void {
-  getAuthDb().prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash(token));
+export async function destroySession(token: string): Promise<void> {
+  await getDb().run("DELETE FROM sessions WHERE token_hash = $1", [tokenHash(token)]);
 }
 
-export function getSessionUser(req: Request): SessionUser | null {
+export async function getSessionUser(req: Request): Promise<SessionUser | null> {
   const cookieHeader = req.headers.cookie || "";
   const match = cookieHeader.match(/(?:^|;\s*)codedoc_session=([^;]+)/);
   if (!match) return null;
@@ -68,19 +69,18 @@ export function getSessionUser(req: Request): SessionUser | null {
   } catch {
     return null;
   }
-  const db = getAuthDb();
-  const row = db
-    .prepare(
-      `SELECT s.user_id AS id, s.expires_at AS expiresAt, u.email, u.credits_balance AS credits
+  const db = getDb();
+  const row = await db.get(
+    `SELECT s.user_id AS id, s.expires_at AS "expiresAt", u.email, u.credits_balance AS credits
        FROM sessions s JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = ?`
-    )
-    .get(tokenHash(token)) as
-    | { id: string; email: string; credits: number; expiresAt: string }
+       WHERE s.token_hash = $1`,
+    [tokenHash(token)]
+  ) as
+    | { id: string; email: string; credits: number; expiresAt: string | Date }
     | undefined;
   if (!row) return null;
   if (new Date(row.expiresAt).getTime() < Date.now()) {
-    destroySession(token);
+    await destroySession(token);
     return null;
   }
   return { id: row.id, email: row.email, credits: row.credits };

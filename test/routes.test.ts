@@ -21,7 +21,7 @@ import authRouter from "../server/routes/auth";
 import coldAuditRouter from "../server/routes/cold-audit";
 import workspaceRouter from "../server/routes/workspace";
 import { initProjectsStore } from "../server/db";
-import { initAuthStore } from "../server/authdb";
+import { initStore } from "../server/store";
 import { uploadedDir } from "../server/workspace";
 
 const UPLOADED = uploadedDir();
@@ -67,9 +67,9 @@ const CRASH_PAYLOAD = JSON.stringify({
   suppress: [{ probe: "Secret Scanner", "title-pattern": 1 }],
 });
 
-beforeAll(() => {
-  initProjectsStore();
-  initAuthStore();
+beforeAll(async () => {
+  await initProjectsStore();
+  await initStore();
 });
 
 // /api/cold-audit now requires a signed-in user with enough credits.
@@ -384,7 +384,7 @@ describe("cold-audit degraded response", () => {
     const { spendCredits } = await import("../server/credits");
     const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
     expect(me.status).toBe(200);
-    spendCredits(me.body.user.id, me.body.user.credits, "test drain");
+    await spendCredits(me.body.user.id, me.body.user.credits, "test drain");
     const res = await request(app).post("/api/cold-audit").set("Cookie", cookie).send({ code: "const a = 1;\n" });
     expect(res.status).toBe(402);
     expect(res.body.code).toBe("INSUFFICIENT_CREDITS");

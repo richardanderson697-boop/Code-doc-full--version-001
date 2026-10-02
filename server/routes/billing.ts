@@ -6,7 +6,7 @@ import https from "https";
 import { asyncRoute } from "../async-route";
 import { requireAuth, AuthedRequest } from "../middleware/requireAuth";
 import { addCredits } from "../credits";
-import { getAuthDb } from "../authdb";
+import { getDb } from "../store";
 import { normalizeEmail, validEmail } from "../auth";
 import { log } from "../logger";
 
@@ -198,17 +198,20 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
     }
     // The user can be gone when the event arrives (e.g. the database was
     // replaced between checkout and delivery). Crediting blindly would attach
-    // the purchase to nobody: SQLite does not enforce the declared foreign
-    // keys, so the INSERT would succeed as an orphan. Park the credits against
-    // the customer email instead; the next signup/login for that email claims
-    // them, so the money is never lost.
-    const userRow = getAuthDb().prepare("SELECT id FROM users WHERE id = ?").get(userId);
+    // the purchase to nobody, so park the credits against the customer email
+    // instead; the next signup/login for that email claims them, so the money
+    // is never lost.
+    const db = getDb();
+    const userRow = await db.get("SELECT id FROM users WHERE id = $1", [userId]);
     if (!userRow) {
       const email = normalizeEmail(String(session.customer_email || session.customer_details?.email || ""));
       if (email && validEmail(email)) {
-        getAuthDb().prepare(
-          "INSERT OR IGNORE INTO pending_credits (email, credits, pack_id, stripe_event_id, created_at) VALUES (?, ?, ?, ?, ?)"
-        ).run(email, credits, session.metadata?.packId ?? null, eventId, new Date().toISOString());
+        // SQLite and Postgres spell idempotent inserts differently.
+        const parkSql =
+          db.dialect === "postgres"
+            ? "INSERT INTO pending_credits (email, credits, pack_id, stripe_event_id, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (stripe_event_id) DO NOTHING"
+            : "INSERT OR IGNORE INTO pending_credits (email, credits, pack_id, stripe_event_id, created_at) VALUES ($1, $2, $3, $4, $5)";
+        await db.run(parkSql, [email, credits, session.metadata?.packId ?? null, eventId, new Date().toISOString()]);
         log.error(
           `Stripe webhook: user ${userId} missing; parked ${credits} credits for ${email} (Stripe ${eventId})`
         );
@@ -220,7 +223,7 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
       return res.json({ received: true, skipped: "user_missing_no_email" });
     }
     // addCredits is idempotent on the Stripe event id: safe to retry.
-    const balance = addCredits(userId, credits, `credit pack: ${session.metadata?.packId ?? "pack"}`, `stripe:${eventId}`);
+    const balance = await addCredits(userId, credits, `credit pack: ${session.metadata?.packId ?? "pack"}`, `stripe:${eventId}`);
     log.info(`Credited ${credits} to user ${userId} (Stripe ${eventId}); balance now ${balance}`);
   }
 

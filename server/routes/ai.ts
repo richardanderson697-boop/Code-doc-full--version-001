@@ -46,7 +46,7 @@ ${code}`;
         temperature: 0.2, // Low temperature for high precision code healing
       },
     });
-    const healBalance = chargeForCall(req.user!.id, extractUsage(healedResponse), modelName, "ai heal");
+    const healBalance = await chargeForCall(req.user!.id, extractUsage(healedResponse), modelName, "ai heal");
     if (healBalance != null) res.set("X-Credits-Balance", String(healBalance));
 
     let healedCode = healedResponse.text || "";
@@ -138,7 +138,7 @@ ${numberedCode}`;
         temperature: 0.1, // Low temperature for maximum precision and zero bias
       },
     });
-    let auditBalance: number | null = chargeForCall(req.user!.id, extractUsage(auditResponse), modelName, "ai audit pass 1");
+    let auditBalance: number | null = await chargeForCall(req.user!.id, extractUsage(auditResponse), modelName, "ai audit pass 1");
 
     const rawAuditText = auditResponse.text || "";
     let validatedAuditText = rawAuditText;
@@ -177,7 +177,7 @@ Identify any contradictions between findings, gaps, and the completeness score i
 
       if (validationResponse && validationResponse.text) {
         validatedAuditText = validationResponse.text.trim();
-        const validationBalance = chargeForCall(req.user!.id, extractUsage(validationResponse), modelName, "ai audit validation pass");
+        const validationBalance = await chargeForCall(req.user!.id, extractUsage(validationResponse), modelName, "ai audit validation pass");
         if (validationBalance != null) auditBalance = validationBalance;
       }
     } catch (validationErr) {
@@ -332,7 +332,7 @@ Do not skip sections, and make sure the code is completely written (no comments 
     // updates without an extra round-trip.
     let streamBalance: number | null = null;
     try {
-      streamBalance = chargeForCall(req.user!.id, streamUsage, modelName, "ai generate stream");
+      streamBalance = await chargeForCall(req.user!.id, streamUsage, modelName, "ai generate stream");
     } catch (meterErr) {
       log.warn("Credit metering failed for generate stream:", meterErr);
     }

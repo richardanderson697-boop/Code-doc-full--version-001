@@ -317,7 +317,7 @@ The total completenessScore must be exactly the sum of these 10 category scores.
         responseSchema: INTEL_SCHEMA as any,
       },
     });
-    const intelBalance = chargeForCall(req.user!.id, extractUsage(intelResponse), modelName, "project intelligence");
+    const intelBalance = await chargeForCall(req.user!.id, extractUsage(intelResponse), modelName, "project intelligence");
     if (intelBalance != null) res.set("X-Credits-Balance", String(intelBalance));
 
     const responseText = intelResponse.text || "";

@@ -11,7 +11,7 @@ import authRouter from "../server/routes/auth";
 import projectsRouter from "../server/routes/projects";
 import workspaceRouter from "../server/routes/workspace";
 import { initProjectsStore } from "../server/db";
-import { initAuthStore } from "../server/authdb";
+import { initStore } from "../server/store";
 
 function buildApp() {
   const app = express();
@@ -49,9 +49,9 @@ function tinyZip(): string {
   return zip.toBuffer().toString("base64");
 }
 
-beforeAll(() => {
-  initProjectsStore();
-  initAuthStore();
+beforeAll(async () => {
+  await initProjectsStore();
+  await initStore();
 });
 
 describe("anonymous callers are rejected on data routes", () => {

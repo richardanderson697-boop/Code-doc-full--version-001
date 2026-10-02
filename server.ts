@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 
 import { log } from "./server/logger";
 import { initProjectsStore } from "./server/db";
-import { initAuthStore } from "./server/authdb";
+import { initStore } from "./server/store";
 import authRouter from "./server/routes/auth";
 import billingRouter, { handleStripeWebhook } from "./server/routes/billing";
 import projectsRouter from "./server/routes/projects";
@@ -61,9 +61,6 @@ app.use((req, res, next) =>
   req.path === "/api/upload-zip" ? jsonZipUpload(req, res, next) : jsonDefault(req, res, next)
 );
 
-initProjectsStore();
-initAuthStore();
-
 // API routes
 app.use(authRouter);
 app.use(billingRouter);
@@ -107,6 +104,11 @@ async function startServer() {
   // A missing persistent volume means every redeploy wipes users, sessions,
   // and credit ledgers. Loud at startup so it cannot go unnoticed again.
   warnIfEphemeralDataDir();
+
+  // Stores must be ready before the first request: Postgres schema is
+  // created here (SQLite file store is created lazily per operation).
+  await initProjectsStore();
+  await initStore();
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

@@ -8,25 +8,26 @@ import { Router } from "express";
 import { readProjects, writeProjects } from "../db";
 import { requireAuth, AuthedRequest } from "../middleware/requireAuth";
 import { log } from "../logger";
+import { asyncRoute } from "../async-route";
 
 const router = Router();
 
 // 1. Get the caller's own projects, newest first.
-router.get("/api/projects", requireAuth, (req: AuthedRequest, res) => {
+router.get("/api/projects", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const userId = req.user!.id;
-  const projects = readProjects().filter((p: any) => p.userId === userId);
+  const projects = (await readProjects()).filter((p: any) => p.userId === userId);
   res.json(projects);
-});
+}));
 
 // 2. Save a new project, or update an existing one the caller owns.
-router.post("/api/projects", requireAuth, (req: AuthedRequest, res) => {
+router.post("/api/projects", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const userId = req.user!.id;
   const { id, title, prompt, code, purpose, createdAt } = req.body;
   if (!title || !prompt) {
     return res.status(400).json({ error: "Title and prompt are required" });
   }
 
-  const projects = readProjects();
+  const projects = await readProjects();
   const existingIndex = projects.findIndex((p: any) => p.id === id);
 
   // An id that exists but belongs to someone else is treated as not found:
@@ -52,18 +53,18 @@ router.post("/api/projects", requireAuth, (req: AuthedRequest, res) => {
     projects.unshift(projectData); // Newest first
   }
 
-  if (writeProjects(projects)) {
+  if (await writeProjects(projects)) {
     res.json({ success: true, project: projectData });
   } else {
     res.status(500).json({ error: "Failed to save project" });
   }
-});
+}));
 
 // 3. Delete a project the caller owns.
-router.delete("/api/projects/:id", requireAuth, (req: AuthedRequest, res) => {
+router.delete("/api/projects/:id", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const userId = req.user!.id;
   const { id } = req.params;
-  const projects = readProjects();
+  const projects = await readProjects();
   const target = projects.find((p: any) => p.id === id);
 
   // Not found or not yours: identical response either way.
@@ -72,11 +73,11 @@ router.delete("/api/projects/:id", requireAuth, (req: AuthedRequest, res) => {
   }
 
   const filtered = projects.filter((p: any) => p.id !== id);
-  if (writeProjects(filtered)) {
+  if (await writeProjects(filtered)) {
     res.json({ success: true });
   } else {
     res.status(500).json({ error: "Failed to delete project" });
   }
-});
+}));
 
 export default router;

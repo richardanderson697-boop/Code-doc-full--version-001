@@ -8,7 +8,7 @@ import request from "supertest";
 import crypto from "crypto";
 import { handleStripeWebhook } from "../server/routes/billing";
 import authRouter from "../server/routes/auth";
-import { initAuthStore, getAuthDb } from "../server/authdb";
+import { initStore, getDb } from "../server/store";
 
 const SECRET = "whsec_test_pending_credits";
 
@@ -60,9 +60,9 @@ function fakeReqRes(payload: any) {
 
 const savedSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-beforeAll(() => {
+beforeAll(async () => {
   process.env.STRIPE_WEBHOOK_SECRET = SECRET;
-  initAuthStore();
+  await initStore();
 });
 
 afterAll(() => {
@@ -77,10 +77,8 @@ function buildApp() {
   return app;
 }
 
-function pendingFor(email: string) {
-  return getAuthDb()
-    .prepare("SELECT * FROM pending_credits WHERE email = ?")
-    .all(email) as any[];
+async function pendingFor(email: string) {
+  return getDb().all<any>("SELECT * FROM pending_credits WHERE email = $1", [email]);
 }
 
 describe("stripe webhook: missing user", () => {
@@ -96,21 +94,21 @@ describe("stripe webhook: missing user", () => {
     await handleStripeWebhook(req, res);
     expect(getJson()).toMatchObject({ received: true });
     expect(getJson().skipped).toBeUndefined();
-    const balance = getAuthDb().prepare("SELECT credits_balance FROM users WHERE id = ?").get(userId) as any;
-    expect(balance.credits_balance).toBe(50 + 400);
+    const balance = await getDb().get<any>("SELECT credits_balance FROM users WHERE id = $1", [userId]);
+    expect(balance!.credits_balance).toBe(50 + 400);
   });
 
   it("parks credits by email when the user is gone", async () => {
     const { req, res, getJson } = fakeReqRes(webhookEvent());
     await handleStripeWebhook(req, res);
     expect(getJson()).toMatchObject({ received: true, skipped: "user_missing_parked" });
-    const rows = pendingFor("buyer@example.com");
+    const rows = await pendingFor("buyer@example.com");
     expect(rows).toHaveLength(1);
     expect(rows[0].credits).toBe(400);
     // No orphan transaction attached to the ghost user id.
-    const orphans = getAuthDb()
-      .prepare("SELECT * FROM credit_transactions WHERE user_id = ?")
-      .all("user-ghost-uuid") as any[];
+    const orphans = await getDb().all<any>("SELECT * FROM credit_transactions WHERE user_id = $1", [
+      "user-ghost-uuid",
+    ]);
     expect(orphans).toHaveLength(0);
   });
 
@@ -120,7 +118,7 @@ describe("stripe webhook: missing user", () => {
     await handleStripeWebhook(first.req, first.res);
     const second = fakeReqRes(payload);
     await handleStripeWebhook(second.req, second.res);
-    expect(pendingFor("retry@x.io")).toHaveLength(1);
+    expect(await pendingFor("retry@x.io")).toHaveLength(1);
   });
 
   it("reports when there is no customer email either", async () => {
@@ -143,14 +141,14 @@ describe("stripe webhook: missing user", () => {
       webhookEvent({ customer_email: "claimme@x.io", metadata: { userId: "ghost-2", credits: "400", packId: "builder" } })
     );
     await handleStripeWebhook(park.req, park.res);
-    expect(pendingFor("claimme@x.io")).toHaveLength(1);
+    expect(await pendingFor("claimme@x.io")).toHaveLength(1);
 
     const signup = await request(app)
       .post("/api/auth/signup")
       .send({ email: "claimme@x.io", password: "supersecret1" });
     expect(signup.status).toBe(201);
     expect(signup.body.user.credits).toBe(50 + 400);
-    expect(pendingFor("claimme@x.io")).toHaveLength(0);
+    expect(await pendingFor("claimme@x.io")).toHaveLength(0);
   });
 
   it("login claims parked credits too", async () => {
@@ -166,6 +164,6 @@ describe("stripe webhook: missing user", () => {
       .send({ email: "loginclaim@x.io", password: "supersecret1" });
     expect(login.status).toBe(200);
     expect(login.body.user.credits).toBe(50 + 1100);
-    expect(pendingFor("loginclaim@x.io")).toHaveLength(0);
+    expect(await pendingFor("loginclaim@x.io")).toHaveLength(0);
   });
 });

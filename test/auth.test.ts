@@ -3,7 +3,7 @@ import { describe, it, expect, beforeAll } from "vitest";
 import express from "express";
 import request from "supertest";
 import authRouter from "../server/routes/auth";
-import { initAuthStore } from "../server/authdb";
+import { initStore } from "../server/store";
 
 function buildApp() {
   const app = express();
@@ -14,8 +14,8 @@ function buildApp() {
 
 let app: ReturnType<typeof buildApp>;
 
-beforeAll(() => {
-  initAuthStore();
+beforeAll(async () => {
+  await initStore();
   app = buildApp();
 });
 

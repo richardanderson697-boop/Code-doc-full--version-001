@@ -21,7 +21,7 @@ vi.mock("../server/gemini", async (importOriginal) => {
 
 import authRouter from "../server/routes/auth";
 import coldAuditRouter from "../server/routes/cold-audit";
-import { initAuthStore } from "../server/authdb";
+import { initStore } from "../server/store";
 
 function buildApp() {
   const app = express();
@@ -31,8 +31,8 @@ function buildApp() {
   return app;
 }
 
-beforeAll(() => {
-  initAuthStore();
+beforeAll(async () => {
+  await initStore();
 });
 
 describe("live credit balance", () => {
@@ -71,7 +71,7 @@ describe("live credit balance", () => {
 
     const { spendCredits } = await import("../server/credits");
     const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
-    spendCredits(me.body.user.id, me.body.user.credits, "test drain");
+    await spendCredits(me.body.user.id, me.body.user.credits, "test drain");
 
     const res = await request(app)
       .post("/api/cold-audit")

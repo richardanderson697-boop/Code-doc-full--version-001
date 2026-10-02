@@ -28,10 +28,17 @@ export function initDatabase() {
 
 
 // Project schema helper functions.
-// Both call initDatabase() per operation on purpose: the store recreates
-// itself if data/ is removed while the server is running (ephemeral disks,
-// manual cleanup) instead of failing every write until a restart.
-export function readProjects() {
+// SQLite backend: the JSON file store from the original build (tests and
+// local dev exercise this path).
+// Postgres backend: a projects table; the whole ledger is replaced in one
+// transaction, mirroring the read-modify-write cycle the routes perform.
+export async function readProjects(): Promise<any[]> {
+  const { getDb } = await import("./store");
+  const db = getDb();
+  if (db.dialect === "postgres") {
+    const rows = await db.all<{ data: any }>("SELECT data FROM projects");
+    return rows.map((r) => (typeof r.data === "string" ? JSON.parse(r.data) : r.data));
+  }
   try {
     initDatabase();
     const data = fs.readFileSync(projectsFile(), "utf8");
@@ -42,7 +49,28 @@ export function readProjects() {
   }
 }
 
-export function writeProjects(projects: any[]) {
+export async function writeProjects(projects: any[]): Promise<boolean> {
+  const { getDb } = await import("./store");
+  const db = getDb();
+  if (db.dialect === "postgres") {
+    try {
+      await db.transaction(async (tx) => {
+        await tx.run("DELETE FROM projects");
+        for (const p of projects) {
+          await tx.run("INSERT INTO projects (id, user_id, data, updated_at) VALUES ($1, $2, $3, $4)", [
+            String(p.id ?? `project_${Date.now()}_${Math.random().toString(36).slice(2)}`),
+            p.userId ?? null,
+            JSON.stringify(p),
+            new Date().toISOString(),
+          ]);
+        }
+      });
+      return true;
+    } catch (error) {
+      log.error("Failed to write projects:", error);
+      return false;
+    }
+  }
   try {
     initDatabase();
     fs.writeFileSync(projectsFile(), JSON.stringify(projects, null, 2), "utf8");
@@ -53,9 +81,9 @@ export function writeProjects(projects: any[]) {
   }
 }
 
-export function migrateProjects() {
+export async function migrateProjects(): Promise<void> {
   try {
-    const projects = readProjects();
+    const projects = await readProjects();
     let migrated = false;
     
     const purposeRegex = /====\s*PURPOSE\s*====|====\s*PURPOSE\s*|===\s*PURPOSE\s*===|##\s*PURPOSE|#\s*PURPOSE/i;
@@ -100,7 +128,7 @@ export function migrateProjects() {
 
     if (migrated) {
       log.info("Migrating database projects to split purpose and code...");
-      writeProjects(migratedProjects);
+      await writeProjects(migratedProjects);
     }
   } catch (e) {
     log.error("Migration failed:", e);
@@ -112,17 +140,20 @@ export function migrateProjects() {
 
 
 // Boot-time bootstrap: ensure the store exists, then run one-off migrations.
-export function initProjectsStore(): void {
+export async function initProjectsStore(): Promise<void> {
   initDatabase();
-  migrateProjects();
+  await migrateProjects();
 }
 
 // Warn loudly when the data directory is not on a persistent volume. On
 // Railway the container filesystem is ephemeral: without a volume mounted at
 // CODEDOC_DATA_DIR, every redeploy wipes users, sessions, and credit ledgers.
+// Moot when Postgres is the store (DATABASE_URL set): nothing persistent
+// lives on disk then.
 // Linux-only check; any failure just skips the warning.
 export function warnIfEphemeralDataDir(): void {
   try {
+    if (process.env.DATABASE_URL) return;
     if (process.platform !== "linux") return;
     const dir = path.resolve(dataDir());
     const mounts = fs.readFileSync("/proc/mounts", "utf8").split("\n");

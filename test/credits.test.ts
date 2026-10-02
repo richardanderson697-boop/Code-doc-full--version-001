@@ -1,7 +1,7 @@
 // Credit metering math and ledger behavior.
 import { describe, it, expect, beforeAll } from "vitest";
 import crypto from "crypto";
-import { getAuthDb, initAuthStore } from "../server/authdb";
+import { getDb, initStore } from "../server/store";
 import {
   creditsForUsage,
   extractUsage,
@@ -11,16 +11,17 @@ import {
 } from "../server/credits";
 import { PRIMARY_MODEL, FALLBACK_MODEL } from "../server/gemini";
 
-function makeUser(credits: number): string {
+async function makeUser(credits: number): Promise<string> {
   const id = crypto.randomUUID();
-  getAuthDb()
-    .prepare("INSERT INTO users (id, email, password_hash, password_salt, credits_balance, created_at) VALUES (?, ?, ?, ?, ?, ?)")
-    .run(id, `${id}@x.io`, "h", "s", credits, new Date().toISOString());
+  await getDb().run(
+    "INSERT INTO users (id, email, password_hash, password_salt, credits_balance, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+    [id, `${id}@x.io`, "h", "s", credits, new Date().toISOString()]
+  );
   return id;
 }
 
-beforeAll(() => {
-  initAuthStore();
+beforeAll(async () => {
+  await initStore();
 });
 
 describe("creditsForUsage", () => {
@@ -51,32 +52,33 @@ describe("creditsForUsage", () => {
 });
 
 describe("ledger", () => {
-  it("spends and reports the new balance", () => {
-    const id = makeUser(100);
-    expect(spendCredits(id, 30, "test")).toBe(70);
-    expect(getBalance(id)).toBe(70);
+  it("spends and reports the new balance", async () => {
+    const id = await makeUser(100);
+    expect(await spendCredits(id, 30, "test")).toBe(70);
+    expect(await getBalance(id)).toBe(70);
   });
 
-  it("refuses to overspend and leaves the balance untouched", () => {
-    const id = makeUser(10);
-    expect(spendCredits(id, 11, "test")).toBeNull();
-    expect(getBalance(id)).toBe(10);
+  it("refuses to overspend and leaves the balance untouched", async () => {
+    const id = await makeUser(10);
+    expect(await spendCredits(id, 11, "test")).toBeNull();
+    expect(await getBalance(id)).toBe(10);
   });
 
-  it("adds credits and records the transaction", () => {
-    const id = makeUser(0);
-    expect(addCredits(id, 400, "credit pack: starter", "stripe:evt_1")).toBe(400);
-    const row = getAuthDb()
-      .prepare("SELECT delta, reason, ref FROM credit_transactions WHERE user_id = ?")
-      .get(id) as any;
-    expect(row.delta).toBe(400);
-    expect(row.ref).toBe("stripe:evt_1");
+  it("adds credits and records the transaction", async () => {
+    const id = await makeUser(0);
+    expect(await addCredits(id, 400, "credit pack: starter", "stripe:evt_1")).toBe(400);
+    const row = await getDb().get<any>(
+      "SELECT delta, reason, ref FROM credit_transactions WHERE user_id = $1",
+      [id]
+    );
+    expect(row!.delta).toBe(400);
+    expect(row!.ref).toBe("stripe:evt_1");
   });
 
-  it("is idempotent on webhook retries with the same event ref", () => {
-    const id = makeUser(0);
-    addCredits(id, 400, "credit pack", "stripe:evt_dup");
-    expect(addCredits(id, 400, "credit pack", "stripe:evt_dup")).toBe(400); // not 800
-    expect(getBalance(id)).toBe(400);
+  it("is idempotent on webhook retries with the same event ref", async () => {
+    const id = await makeUser(0);
+    await addCredits(id, 400, "credit pack", "stripe:evt_dup");
+    expect(await addCredits(id, 400, "credit pack", "stripe:evt_dup")).toBe(400); // not 800
+    expect(await getBalance(id)).toBe(400);
   });
 });

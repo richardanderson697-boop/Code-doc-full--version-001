@@ -12,37 +12,37 @@ import { readProjects, writeProjects, initProjectsStore, dataDir } from "../serv
 const DATA_DIR = dataDir();
 
 describe("project store durability", () => {
-  beforeEach(() => {
-    initProjectsStore();
+  beforeEach(async () => {
+    await initProjectsStore();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     // Leave the store in a valid state for the next test / dev run.
-    initProjectsStore();
+    await initProjectsStore();
   });
 
-  it("writes and reads back a project", () => {
-    const ok = writeProjects([{ id: "vibe_test_1", title: "T" }]);
+  it("writes and reads back a project", async () => {
+    const ok = await writeProjects([{ id: "vibe_test_1", title: "T" }]);
     expect(ok).toBe(true);
-    expect(readProjects()).toEqual([{ id: "vibe_test_1", title: "T" }]);
+    expect(await readProjects()).toEqual([{ id: "vibe_test_1", title: "T" }]);
   });
 
-  it("recreates the store when data/ is deleted mid-run", () => {
-    expect(writeProjects([{ id: "before" }])).toBe(true);
+  it("recreates the store when data/ is deleted mid-run", async () => {
+    expect(await writeProjects([{ id: "before" }])).toBe(true);
 
     fs.rmSync(DATA_DIR, { recursive: true, force: true });
     expect(fs.existsSync(DATA_DIR)).toBe(false);
 
     // Without the per-call initDatabase(), this write throws ENOENT and the
     // store never recovers until the process restarts.
-    expect(writeProjects([{ id: "after" }])).toBe(true);
+    expect(await writeProjects([{ id: "after" }])).toBe(true);
     expect(fs.existsSync(DATA_DIR)).toBe(true);
-    expect(readProjects()).toEqual([{ id: "after" }]);
+    expect(await readProjects()).toEqual([{ id: "after" }]);
   });
 
-  it("reads an empty list when data/ is deleted rather than throwing", () => {
+  it("reads an empty list when data/ is deleted rather than throwing", async () => {
     fs.rmSync(DATA_DIR, { recursive: true, force: true });
-    expect(readProjects()).toEqual([]);
+    expect(await readProjects()).toEqual([]);
     expect(fs.existsSync(DATA_DIR)).toBe(true);
   });
 });
