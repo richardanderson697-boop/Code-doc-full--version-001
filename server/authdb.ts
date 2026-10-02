@@ -44,6 +44,19 @@ export function getAuthDb(): DatabaseSync {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_txn_ref ON credit_transactions(ref);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_txn_user ON credit_transactions(user_id);
+    -- Credits parked by the Stripe webhook when the paying user was missing
+    -- (e.g. the database was replaced between checkout and delivery).
+    -- Claimed by claimPendingCredits() on the next signup/login for the email,
+    -- so paid-for credits are never silently lost.
+    CREATE TABLE IF NOT EXISTS pending_credits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      credits INTEGER NOT NULL,
+      pack_id TEXT,
+      stripe_event_id TEXT UNIQUE,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_credits_email ON pending_credits(email);
   `);
   return db;
 }

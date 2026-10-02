@@ -14,6 +14,7 @@ import {
   getSessionUser,
 } from "../auth";
 import { asyncRoute } from "../async-route";
+import { claimPendingCredits } from "../credits";
 import { log } from "../logger";
 
 const router = Router();
@@ -53,8 +54,12 @@ router.post("/api/auth/signup", asyncRoute(async (req, res) => {
 
   const { token, expiresAt } = createSession(id);
   setSessionCookie(res, token, expiresAt);
-  log.info(`New signup: ${cleanEmail}`);
-  res.status(201).json({ user: { id, email: cleanEmail, credits: WELCOME_CREDITS } });
+  // Credits parked by the Stripe webhook for this email (e.g. the database
+  // was replaced between checkout and delivery) are claimed onto the new
+  // account, so a completed purchase is never lost.
+  const claimed = claimPendingCredits(id, cleanEmail);
+  log.info(`New signup: ${cleanEmail}${claimed ? ` (claimed ${claimed} pending credits)` : ""}`);
+  res.status(201).json({ user: { id, email: cleanEmail, credits: WELCOME_CREDITS + claimed } });
 }));
 
 router.post("/api/auth/login", asyncRoute(async (req, res) => {
@@ -74,7 +79,10 @@ router.post("/api/auth/login", asyncRoute(async (req, res) => {
   }
   const { token, expiresAt } = createSession(row.id);
   setSessionCookie(res, token, expiresAt);
-  res.json({ user: { id: row.id, email: row.email, credits: row.credits_balance } });
+  // Same safety net as signup: parked webhook credits for this email land on
+  // the account at login.
+  const claimed = claimPendingCredits(row.id, row.email);
+  res.json({ user: { id: row.id, email: row.email, credits: row.credits_balance + claimed } });
 }));
 
 router.post("/api/auth/logout", (req, res) => {

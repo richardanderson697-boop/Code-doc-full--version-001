@@ -15,6 +15,7 @@ import coldAuditRouter from "./server/routes/cold-audit";
 import workspaceRouter from "./server/routes/workspace";
 import intelligenceRouter from "./server/routes/intelligence";
 import { ensureOpengrepBinary } from "./server/preflight/opengrep/runner";
+import { warnIfEphemeralDataDir } from "./server/db";
 
 dotenv.config();
 
@@ -102,6 +103,10 @@ async function startServer() {
   // Fire-and-forget: never blocks startup, scans degrade gracefully until it
   // lands, and any failure just logs a warning.
   ensureOpengrepBinary();
+
+  // A missing persistent volume means every redeploy wipes users, sessions,
+  // and credit ledgers. Loud at startup so it cannot go unnoticed again.
+  warnIfEphemeralDataDir();
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

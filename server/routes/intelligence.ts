@@ -6,6 +6,13 @@ import fs from "fs";
 import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
 import { getWorkspaceFiles, WorkspaceFile, uploadedDir as uploadedDirPath } from "../workspace";
 import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
+import {
+  computeDeterministicAssessment,
+  formatAssessmentForPrompt,
+  fallbackReason,
+  fallbackMissingReason,
+  CATEGORY_KEYS,
+} from "../deterministic-score";
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
@@ -80,6 +87,13 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
     });
     workspaceContext += `\n---\n${formatFindingsForPrompt(preflight)}\nWhen scoring the "security" category, weigh these deterministic findings; cite them by file and line in the reason instead of guessing.\n`;
 
+    // Deterministic assessment: the 10 category scores, the missing-features
+    // list, and the total are computed from scan evidence (pure functions —
+    // identical input always yields identical numbers). The model explains
+    // these facts; it does not invent or adjust them.
+    const assessment = computeDeterministicAssessment(files, preflight);
+    workspaceContext += `\n---\n${formatAssessmentForPrompt(assessment)}\n`;
+
     const INTEL_SYSTEM_PROMPT = `You are VibeCoder Project Intelligence Engine, an elite full-workspace software architect. 
 Your task is to analyze the complete set of files in this project workspace, build a comprehensive file ledger, construct a complete application architecture map, and evaluate the overall codebase completeness score out of 100.
 
@@ -126,6 +140,13 @@ Your response must be returned STRICTLY in this JSON format:
 }
 
 CRITICAL RULES FOR PROJECT SCOPE ANALYSIS & INTENT DETECTION:
+0. DETERMINISTIC GROUND TRUTH (OVERRIDES YOUR JUDGMENT ON NUMBERS):
+   - The user message ends with a DETERMINISTIC GROUND TRUTH block listing the 10 category scores, the missing-features list, and the total completeness score, all computed from scan evidence. These are FINAL.
+   - You MUST copy each category's score EXACTLY into categoryScores.<key>.score (max stays 10).
+   - You MUST reproduce missingFeatures EXACTLY: same feature and category strings, same order. Do not add, remove, split, or reword entries.
+   - completenessScore MUST equal the exact total shown (it is the precomputed sum).
+   - Your judgment lives in the WORDS, not the numbers: write truthful, specific "reason" strings for every category and every missing feature, CITING the evidence anchors provided (file:line). Write overallSummary, fileLedger, and applicationMap from the code as usual.
+   - Do not invent scores, do not invent missing features, do not hallucinate files. If the evidence says a capability is not in scope, say so in the reason — the score already reflects it.
 0. DOMAIN INTENT & SCOPE DETECTION:
    - First, determine the application's intended domain and architectural scope by inspecting README.md, package.json description, component names, comments, and API endpoints.
    - STATELESS / PRIVACY-FIRST / STANDALONE UTILITIES: If the application is intentionally designed as a client-side utility, calculator, converter, generator, audio tool, or privacy-first app that requires no user accounts, database persistence, or payment processing, DO NOT PENALIZE the app for omitting them!
@@ -310,6 +331,45 @@ The total completenessScore must be exactly the sum of these 10 category scores.
     const parsedIntel = JSON.parse(cleanText);
     // Attach the deterministic report for the dedicated UI panel.
     parsedIntel.preflight = preflight;
+
+    // Enforce determinism: the served report always carries the computed
+    // scores and missing-feature list, even if the model drifted. The model's
+    // reason strings are kept (that is its job now); numbers are facts.
+    if (parsedIntel.categoryScores && typeof parsedIntel.categoryScores === "object") {
+      for (const key of CATEGORY_KEYS) {
+        const cat = parsedIntel.categoryScores[key] || {};
+        parsedIntel.categoryScores[key] = {
+          score: assessment.categories[key].score,
+          max: 10,
+          reason:
+            typeof cat.reason === "string" && cat.reason.trim().length > 0
+              ? cat.reason
+              : fallbackReason(key, assessment),
+        };
+      }
+    }
+    parsedIntel.completenessScore = assessment.completenessScore;
+    {
+      const modelMissing = Array.isArray(parsedIntel.missingFeatures) ? parsedIntel.missingFeatures : [];
+      const reasonByFeature = new Map<string, string>();
+      for (const m of modelMissing) {
+        if (m && typeof m.feature === "string" && typeof m.reason === "string" && m.reason.trim()) {
+          if (!reasonByFeature.has(m.feature)) reasonByFeature.set(m.feature, m.reason);
+        }
+      }
+      parsedIntel.missingFeatures = assessment.missingFeatures.map((f) => ({
+        feature: f.feature,
+        category: f.category,
+        reason: reasonByFeature.get(f.feature) || fallbackMissingReason(f),
+      }));
+    }
+    // Expose the deterministic assessment for debugging/transparency.
+    parsedIntel.deterministicAssessment = {
+      capsApplied: assessment.capsApplied,
+      evidence: Object.fromEntries(
+        CATEGORY_KEYS.map((k) => [k, assessment.categories[k].evidence])
+      ),
+    };
     res.json(parsedIntel);
   } catch (error: any) {
     log.error("Project Intelligence API Error:", error);

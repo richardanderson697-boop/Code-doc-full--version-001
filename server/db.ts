@@ -116,3 +116,33 @@ export function initProjectsStore(): void {
   initDatabase();
   migrateProjects();
 }
+
+// Warn loudly when the data directory is not on a persistent volume. On
+// Railway the container filesystem is ephemeral: without a volume mounted at
+// CODEDOC_DATA_DIR, every redeploy wipes users, sessions, and credit ledgers.
+// Linux-only check; any failure just skips the warning.
+export function warnIfEphemeralDataDir(): void {
+  try {
+    if (process.platform !== "linux") return;
+    const dir = path.resolve(dataDir());
+    const mounts = fs.readFileSync("/proc/mounts", "utf8").split("\n");
+    let onVolume = false;
+    for (const line of mounts) {
+      const parts = line.split(" ");
+      if (parts.length < 2) continue;
+      const mountPoint = parts[1].replace(/\\040/g, " ");
+      if (mountPoint !== "/" && (dir === mountPoint || dir.startsWith(mountPoint + "/"))) {
+        onVolume = true;
+        break;
+      }
+    }
+    if (!onVolume) {
+      log.warn(
+        `DATA LOSS RISK: ${dir} is not on a persistent volume. Every redeploy will wipe users, ` +
+          `sessions, and credit ledgers. Attach a Railway volume at this path.`
+      );
+    }
+  } catch {
+    // /proc/mounts unreadable (non-Linux, sandboxed): stay quiet.
+  }
+}

@@ -1,6 +1,7 @@
 // Credit metering for Gemini usage.
 // 1 credit = $0.01 of API cost. Rates mirror server/gemini.ts models.
 import { getAuthDb } from "./authdb";
+import { log } from "./logger";
 import { PRIMARY_MODEL, FALLBACK_MODEL } from "./gemini";
 
 interface ModelRate {
@@ -79,6 +80,40 @@ export function addCredits(userId: string, amount: number, reason: string, ref?:
   }
   return getBalance(userId);
 }
+// Credits parked by the Stripe webhook when the paying user was missing
+// (e.g. the database was replaced between checkout and webhook delivery).
+// Called on signup and login: any parked credits for the email are moved onto
+// the account, so money is never silently lost. Returns the credits claimed.
+export function claimPendingCredits(userId: string, email: string): number {
+  const cleanEmail = email.trim().toLowerCase();
+  if (!cleanEmail) return 0;
+  const db = getAuthDb();
+  const rows = db
+    .prepare("SELECT id, credits, pack_id, stripe_event_id FROM pending_credits WHERE email = ?")
+    .all(cleanEmail) as { id: number; credits: number; pack_id: string | null; stripe_event_id: string | null }[];
+  let claimed = 0;
+  for (const row of rows) {
+    try {
+      const ref = `pending:${row.stripe_event_id ?? `row-${row.id}`}`;
+      const balance = addCredits(
+        userId,
+        row.credits,
+        `claimed pending credit pack${row.pack_id ? `: ${row.pack_id}` : ""}`,
+        ref
+      );
+      if (balance !== null) {
+        db.prepare("DELETE FROM pending_credits WHERE id = ?").run(row.id);
+        claimed += row.credits;
+      }
+    } catch (err) {
+      log.error(`Failed to claim pending credits row ${row.id} for ${cleanEmail}:`, err);
+    }
+  }
+  if (claimed > 0) log.info(`Claimed ${claimed} pending credits for ${cleanEmail}`);
+  return claimed;
+}
+
+
 
 // Minimum balance required BEFORE an AI call starts. We can't know the exact
 // cost up front, so each endpoint declares a ceiling-ish minimum and we meter

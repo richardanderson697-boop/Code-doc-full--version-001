@@ -6,6 +6,8 @@ import https from "https";
 import { asyncRoute } from "../async-route";
 import { requireAuth, AuthedRequest } from "../middleware/requireAuth";
 import { addCredits } from "../credits";
+import { getAuthDb } from "../authdb";
+import { normalizeEmail, validEmail } from "../auth";
 import { log } from "../logger";
 
 const router = Router();
@@ -193,6 +195,29 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
     if (!userId || !credits) {
       log.warn("Stripe webhook: completed session missing userId/credits metadata");
       return res.json({ received: true, skipped: "missing metadata" });
+    }
+    // The user can be gone when the event arrives (e.g. the database was
+    // replaced between checkout and delivery). Crediting blindly would attach
+    // the purchase to nobody: SQLite does not enforce the declared foreign
+    // keys, so the INSERT would succeed as an orphan. Park the credits against
+    // the customer email instead; the next signup/login for that email claims
+    // them, so the money is never lost.
+    const userRow = getAuthDb().prepare("SELECT id FROM users WHERE id = ?").get(userId);
+    if (!userRow) {
+      const email = normalizeEmail(String(session.customer_email || session.customer_details?.email || ""));
+      if (email && validEmail(email)) {
+        getAuthDb().prepare(
+          "INSERT OR IGNORE INTO pending_credits (email, credits, pack_id, stripe_event_id, created_at) VALUES (?, ?, ?, ?, ?)"
+        ).run(email, credits, session.metadata?.packId ?? null, eventId, new Date().toISOString());
+        log.error(
+          `Stripe webhook: user ${userId} missing; parked ${credits} credits for ${email} (Stripe ${eventId})`
+        );
+        return res.json({ received: true, skipped: "user_missing_parked" });
+      }
+      log.error(
+        `Stripe webhook: user ${userId} missing and no customer email; ${credits} credits need manual reconciliation (Stripe ${eventId})`
+      );
+      return res.json({ received: true, skipped: "user_missing_no_email" });
     }
     // addCredits is idempotent on the Stripe event id: safe to retry.
     const balance = addCredits(userId, credits, `credit pack: ${session.metadata?.packId ?? "pack"}`, `stripe:${eventId}`);
