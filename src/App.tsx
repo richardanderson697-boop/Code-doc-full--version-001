@@ -967,6 +967,7 @@ export default function App() {
                       isGenerating={isGenerating}
                       highlightedLine={highlightedLine}
                       onHighlightLine={(lineNum) => setHighlightedLine(lineNum)}
+                      isActive={activeRightTab === "auditor"}
                     />
                   </div>
                 </div>

@@ -60,13 +60,18 @@ interface CodeAuditorProps {
   isGenerating?: boolean;
   highlightedLine: number | null;
   onHighlightLine: (lineNum: number) => void;
+  // True while the auditor tab is visible. The panel stays mounted while
+  // hidden (CSS), so the workspace file list must refresh when the tab is
+  // opened — otherwise it shows the state from first mount forever.
+  isActive?: boolean;
 }
 
-export default function CodeAuditor({ 
-  workspaceCode, 
+export default function CodeAuditor({
+  workspaceCode,
   isGenerating = false,
-  highlightedLine, 
-  onHighlightLine 
+  highlightedLine,
+  onHighlightLine,
+  isActive = true
 }: CodeAuditorProps) {
   const [code, setCode] = useState(workspaceCode || "");
   const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
@@ -218,25 +223,30 @@ export default function CodeAuditor({
   const [activeSubTab, setActiveSubTab] = useState<"audit" | "github">("audit");
 
 
-  // Load ZIP upload status on mount
-  useEffect(() => {
-    const checkUploadStatus = async () => {
-      try {
-        const res = await fetch("/api/upload-status");
-        if (res.ok) {
-          const data = await res.json();
-          if (data.uploaded) {
-            setZipUploaded(true);
-            setZipFiles(data.files || []);
-            setAuditMode("project-intelligence");
-          }
+  // Load ZIP upload status on mount and every time the auditor tab is
+  // opened. Files generated in the main view land in the server workspace
+  // while this panel is hidden, so a mount-only fetch goes stale.
+  const refreshWorkspaceFiles = async () => {
+    try {
+      const res = await fetch("/api/upload-status");
+      if (res.ok) {
+        const data = await res.json();
+        if (data.uploaded) {
+          setZipUploaded(true);
+          setZipFiles(data.files || []);
+          setAuditMode("project-intelligence");
+        } else {
+          setZipUploaded(false);
+          setZipFiles([]);
         }
-      } catch (err) {
-        logError("Failed to retrieve initial zip status", err);
       }
-    };
-    void checkUploadStatus();
-  }, []);
+    } catch (err) {
+      logError("Failed to retrieve zip status", err);
+    }
+  };
+  useEffect(() => {
+    if (isActive) void refreshWorkspaceFiles();
+  }, [isActive]);
 
   const handleZipUpload = async (file: File) => {
     if (!file) return;
