@@ -1,9 +1,9 @@
 ﻿// Whole-workspace project intelligence route.
 import { Router } from "express";
 import { asyncRoute } from "../async-route";
-import fs from "fs";
 import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
-import { getWorkspaceFiles, WorkspaceFile, uploadedDir as uploadedDirPath, resolveInsideDir, countLines } from "../workspace";
+import { WorkspaceFile, cleanWorkspacePath, countLines } from "../workspace";
+import { listWorkspaceFiles, getWorkspaceFile } from "../workspace-store";
 import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
 import {
   computeDeterministicAssessment,
@@ -29,7 +29,7 @@ const MAX_INTEL_TOTAL_BYTES = 5 * 1024 * 1024;
 router.post("/api/project-intelligence", requireAuth, requireCredits("intelligence"), asyncRoute(async (req: AuthedRequest, res) => {
   try {
     let files: WorkspaceFile[] = [];
-    const uploadedDir = uploadedDirPath(req.user!.id);
+    const userId = req.user!.id;
 
     // Source selection, in priority order. The client may name the exact
     // source it wants scored; the server never guesses.
@@ -68,21 +68,22 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
         if (typeof p !== "string" || p.length === 0) {
           return res.status(400).json({ error: "Invalid file path." });
         }
-        const full = resolveInsideDir(uploadedDir, p);
-        if (!full || !fs.existsSync(full) || !fs.statSync(full).isFile()) {
+        const relPath = cleanWorkspacePath(p);
+        const row = relPath ? await getWorkspaceFile(userId, relPath) : undefined;
+        if (!row) {
           return res.status(400).json({ error: `Unknown workspace file: ${p.slice(0, 120)}` });
         }
-        const content = fs.readFileSync(full, "utf8");
+        const content = row.content;
         if (content.length > MAX_INTEL_FILE_BYTES) {
           return res.status(400).json({ error: "One file exceeds the 1MB per-file limit." });
         }
-        files.push({ path: p, content, lineCount: countLines(content) });
+        files.push({ path: relPath!, content, lineCount: countLines(content) });
       }
-    } else if (fs.existsSync(uploadedDir)) {
+    } else {
       // 3. The whole uploaded workspace.
-      const scannedFiles = getWorkspaceFiles(uploadedDir, uploadedDir);
+      const scannedFiles = await listWorkspaceFiles(userId);
       if (scannedFiles.length > 0) {
-        files = scannedFiles;
+        files = scannedFiles.map((f) => ({ path: f.path, content: f.content, lineCount: f.lineCount }));
       }
     }
 

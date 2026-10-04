@@ -137,6 +137,29 @@ describe("postgres backend", () => {
     expect(rows[0].data).toMatchObject({ id: "p1", title: "Hello", nested: { a: [1, 2] } });
   });
 
+  it("upserts workspace files and scopes them per user", async () => {
+    const upsert = `INSERT INTO workspace_files (user_id, path, content, line_count, updated_at)
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (user_id, path) DO UPDATE SET
+        content = excluded.content,
+        line_count = excluded.line_count,
+        updated_at = excluded.updated_at`;
+    await db.run(upsert, ["u1", "src/a.ts", "v1", 1, new Date().toISOString()]);
+    await db.run(upsert, ["u1", "src/a.ts", "v2", 1, new Date().toISOString()]);
+    await db.run(upsert, ["u1", "src/b.ts", "b", 1, new Date().toISOString()]);
+    const rows = await db.all<{ path: string; content: string }>(
+      `SELECT path, content FROM workspace_files WHERE user_id = $1 ORDER BY path`, ["u1"]);
+    expect(rows.map((r) => r.path)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(rows[0].content).toBe("v2");
+    // Other users see nothing.
+    const other = await db.all(`SELECT path FROM workspace_files WHERE user_id = $1`, ["u2"]);
+    expect(other).toHaveLength(0);
+    // Deleting the user cascades to their files.
+    await db.run(`DELETE FROM users WHERE id = $1`, ["u1"]);
+    const gone = await db.all(`SELECT path FROM workspace_files WHERE user_id = $1`, ["u1"]);
+    expect(gone).toHaveLength(0);
+  });
+
   // Note: pg-mem cannot re-run CREATE TABLE IF NOT EXISTS once the table
   // exists (emulator limitation); real Postgres handles it. Idempotency of
   // the schema itself is therefore not asserted here — beforeAll proves a

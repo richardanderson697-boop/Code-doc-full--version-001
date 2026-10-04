@@ -2,10 +2,8 @@
 // and the upgraded per-file generation endpoint (context injection +
 // refinement). Gemini is mocked; every assertion is about validation,
 // file selection, and disk effects — never model output quality.
-import { describe, it, expect, beforeAll, afterAll, vi, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, vi, beforeEach } from "vitest";
 import express from "express";
-import fs from "fs";
-import path from "path";
 import request from "supertest";
 import AdmZip from "adm-zip";
 
@@ -13,7 +11,6 @@ import authRouter from "../server/routes/auth";
 import aiRouter from "../server/routes/ai";
 import workspaceRouter from "../server/routes/workspace";
 import { initStore } from "../server/store";
-import { uploadedDir } from "../server/workspace";
 
 const mockGenerate = vi.fn();
 
@@ -24,8 +21,6 @@ vi.mock("../server/gemini", async (importOriginal) => {
     generateWithFallback: (...args: any[]) => mockGenerate(...args),
   };
 });
-
-const UPLOADED = uploadedDir();
 
 function buildApp() {
   const app = express();
@@ -57,10 +52,6 @@ beforeEach(() => {
   mockGenerate.mockReset();
 });
 
-afterAll(() => {
-  fs.rmSync(UPLOADED, { recursive: true, force: true });
-});
-
 let cookieCounter = 0;
 async function authedCookie(app: any): Promise<string> {
   cookieCounter += 1;
@@ -75,15 +66,15 @@ async function authedCookie(app: any): Promise<string> {
   return session!.split(";")[0];
 }
 
-function findWrittenFile(relPath: string): string {
-  // Each test signs up its own user, so the base dir holds several per-user
-  // subdirectories. Find the one that actually contains the written file.
-  const entries = fs.readdirSync(UPLOADED);
-  for (const e of entries) {
-    const candidate = path.join(UPLOADED, e, relPath);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  throw new Error(`written file not found under test workspace: ${relPath}`);
+async function readWorkspaceFile(app: any, cookie: string, relPath: string): Promise<string> {
+  // Workspace files live in the DB now, not on disk: read them back through
+  // the same API the client uses.
+  const res = await request(app)
+    .get("/api/uploaded-file")
+    .query({ path: relPath })
+    .set("Cookie", cookie);
+  expect(res.status).toBe(200);
+  return res.body.content as string;
 }
 
 describe("POST /api/generate-manifest", () => {
@@ -247,7 +238,7 @@ describe("POST /api/generate-workspace-file upgrades", () => {
       .send({ filePath: "src/components/Header.tsx", prompt: "a header" });
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
-    const written = fs.readFileSync(findWrittenFile("src/components/Header.tsx"), "utf8");
+    const written = await readWorkspaceFile(app, cookie, "src/components/Header.tsx");
     expect(written).toContain("export const greeting");
   });
 
@@ -265,7 +256,7 @@ describe("POST /api/generate-workspace-file upgrades", () => {
       .set("Cookie", cookie)
       .send({ filePath: "src/lib.ts", prompt: "bump it", existingCode: "export const v = 1;" });
     expect(res.status).toBe(200);
-    const written = fs.readFileSync(findWrittenFile("src/lib.ts"), "utf8");
+    const written = await readWorkspaceFile(app, cookie, "src/lib.ts");
     expect(written).toContain("export const v = 2;");
   });
 });

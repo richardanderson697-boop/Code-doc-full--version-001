@@ -1,8 +1,6 @@
 // Uploaded-workspace file helpers: strict path containment and the
 // recursive source-file scanner shared by the upload and audit routes.
 import path from "path";
-import fs from "fs";
-import { log } from "./logger";
 
 export const UPLOADED_DIR_NAME = "uploaded_project";
 
@@ -63,53 +61,50 @@ export function resolveInsideDir(baseDir: string, userPath: unknown): string | n
   return resolved;
 }
 
-export function getWorkspaceFiles(dir: string, baseDir: string = dir): WorkspaceFile[] {
-  let results: WorkspaceFile[] = [];
-  if (!fs.existsSync(dir)) return results;
-  try {
-    const list = fs.readdirSync(dir);
-    for (const file of list) {
-      const filePath = path.join(dir, file);
-      const stat = fs.statSync(filePath);
-      const relativePath = path.relative(baseDir, filePath).replace(/\\/g, "/");
+// Source-code extensions the workspace tracks. Mirrors the old on-disk
+// scanner: only these are listed, scored, or zipped.
+export const WORKSPACE_FILE_EXTS = [".ts", ".tsx", ".json", ".js", ".jsx", ".css", ".html", ".md"];
 
-      // Skip ignored paths
-      if (
-        relativePath.startsWith("node_modules") ||
-        relativePath.startsWith(".git") ||
-        relativePath.startsWith("dist") ||
-        relativePath.startsWith("data") ||
-        relativePath.startsWith("assets") ||
-        relativePath.includes("bun.lock") ||
-        relativePath.includes("package-lock.json") ||
-        relativePath.includes("yarn.lock")
-      ) {
-        continue;
-      }
-
-      if (stat && stat.isDirectory()) {
-        results = results.concat(getWorkspaceFiles(filePath, baseDir));
-      } else {
-        const ext = path.extname(file).toLowerCase();
-        // Only read source code, scripts, configuration, and documentation
-        if ([".ts", ".tsx", ".json", ".js", ".jsx", ".css", ".html", ".md"].includes(ext)) {
-          try {
-            const content = fs.readFileSync(filePath, "utf8");
-            const lineCount = countLines(content);
-            results.push({
-              path: relativePath,
-              content,
-              lineCount
-            });
-          } catch (e) {
-            log.error(`Failed to read file ${relativePath}:`, e);
-          }
-        }
-      }
-    }
-  } catch (err) {
-    log.error("Directory scanning error:", err);
-  }
-  return results;
+export function isWorkspaceFileExt(relPath: string): boolean {
+  const dot = relPath.lastIndexOf(".");
+  const ext = dot >= 0 ? relPath.slice(dot).toLowerCase() : "";
+  return WORKSPACE_FILE_EXTS.includes(ext);
 }
 
+// Paths the old on-disk scanner skipped (vendored/derived artifacts).
+// Applied at ZIP ingest so junk is never stored.
+export function isIgnorableWorkspacePath(relPath: string): boolean {
+  return (
+    relPath.startsWith("node_modules") ||
+    relPath.startsWith(".git") ||
+    relPath.startsWith("dist") ||
+    relPath.startsWith("data") ||
+    relPath.startsWith("assets") ||
+    relPath.includes("bun.lock") ||
+    relPath.includes("package-lock.json") ||
+    relPath.includes("yarn.lock")
+  );
+}
+
+// Lexical path cleaning for DB-backed storage. The database has no
+// directories, so containment is enforced on the path string itself: no
+// absolute paths, no ".." escapes (even ones that would resolve inside),
+// no empty segments. Returns the canonical forward-slash path or null.
+export function cleanWorkspacePath(userPath: unknown): string | null {
+  if (typeof userPath !== "string" || userPath.length === 0 || userPath.includes("\0")) {
+    return null;
+  }
+  const cleaned = userPath.trim().replace(/\\/g, "/");
+  const segs: string[] = [];
+  for (const part of cleaned.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (segs.length === 0) return null;
+      segs.pop();
+      continue;
+    }
+    segs.push(part);
+  }
+  if (segs.length === 0) return null;
+  return segs.join("/");
+}

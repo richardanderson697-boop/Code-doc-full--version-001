@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS projects (
   data TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS workspace_files (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  content TEXT NOT NULL,
+  line_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_files_user ON workspace_files(user_id);
 `;
 
 function toSqlite(sql: string): string {

@@ -1,11 +1,27 @@
-﻿// Uploaded-codebase workspace routes: ZIP intake, file CRUD, AI file generation.
+// Uploaded-codebase workspace routes: ZIP intake, file CRUD, AI file generation.
+//
+// Workspace files live in Postgres (workspace_files table), not on disk:
+// the old on-disk uploaded_project/<userId>/ directories were wiped by every
+// Railway redeploy. All paths are validated with cleanWorkspacePath; tenant
+// isolation comes from the user_id column on every query.
 import { Router } from "express";
 import { asyncRoute } from "../async-route";
-import path from "path";
-import fs from "fs";
 import AdmZip from "adm-zip";
 import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
-import { resolveInsideDir, getWorkspaceFiles, uploadedDir as uploadedDirPath, countLines } from "../workspace";
+import {
+  cleanWorkspacePath,
+  isIgnorableWorkspacePath,
+  isWorkspaceFileExt,
+  countLines,
+} from "../workspace";
+import {
+  listWorkspaceFiles,
+  getWorkspaceFile,
+  saveWorkspaceFile,
+  deleteWorkspaceFile,
+  clearWorkspaceFiles,
+  replaceWorkspaceFiles,
+} from "../workspace-store";
 import { readZipHeader, hasUnsafeEntryName } from "../zip-guard";
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
@@ -19,6 +35,8 @@ export const MAX_ZIP_ENTRIES = 2000;
 export const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
 export const MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
 
+const EMPTY_WORKSPACE_ERROR = "Workspace is empty \u2014 nothing to download.";
+
 // ZIP Codebase Upload, Status, and Clear Endpoints
 router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const { zipBase64 } = req.body;
@@ -27,7 +45,7 @@ router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest
   }
 
   try {
-    const uploadedDir = uploadedDirPath(req.user!.id);
+    const userId = req.user!.id;
 
     // Validate the archive completely before touching the existing workspace:
     // a malformed upload used to delete the user's files and then fail.
@@ -85,16 +103,17 @@ router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest
       });
     }
 
-    // Validation passed: only now replace the existing workspace.
-    if (fs.existsSync(uploadedDir)) {
-      fs.rmSync(uploadedDir, { recursive: true, force: true });
+    // Validation passed: only now replace the existing workspace, atomically.
+    const ingest: { path: string; content: string }[] = [];
+    for (const entry of entries) {
+      if (entry.isDirectory) continue;
+      const relPath = cleanWorkspacePath(entry.entryName);
+      if (!relPath || isIgnorableWorkspacePath(relPath) || !isWorkspaceFileExt(relPath)) continue;
+      ingest.push({ path: relPath, content: entry.getData().toString("utf8") });
     }
-    fs.mkdirSync(uploadedDir, { recursive: true });
-    zip.extractAllTo(uploadedDir, true);
+    await replaceWorkspaceFiles(userId, ingest);
 
-    // Scan the unzipped files
-    const files = getWorkspaceFiles(uploadedDir, uploadedDir);
-
+    const files = await listWorkspaceFiles(userId);
     res.json({
       success: true,
       message: `Extracted ${files.length} files successfully.`,
@@ -106,30 +125,23 @@ router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest
   }
 }));
 
-router.post("/api/clear-upload", requireAuth, (req: AuthedRequest, res) => {
+router.post("/api/clear-upload", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   try {
-    const uploadedDir = uploadedDirPath(req.user!.id);
-    if (fs.existsSync(uploadedDir)) {
-      fs.rmSync(uploadedDir, { recursive: true, force: true });
-    }
+    await clearWorkspaceFiles(req.user!.id);
     res.json({ success: true, message: "Uploaded codebase cleared successfully." });
   } catch (error: any) {
     log.error("Clear Upload Error:", error);
     res.status(500).json({ error: "Failed to clear uploaded codebase" });
   }
-});
+}));
 
 // Download the user's workspace as a ZIP archive. Streams the archive;
 // nothing is written to disk and the workspace is untouched.
-router.get("/api/download-workspace", requireAuth, (req: AuthedRequest, res) => {
+router.get("/api/download-workspace", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   try {
-    const uploadedDir = uploadedDirPath(req.user!.id);
-    if (!fs.existsSync(uploadedDir)) {
-      return res.status(404).json({ error: "Workspace is empty \u2014 nothing to download." });
-    }
-    const files = getWorkspaceFiles(uploadedDir, uploadedDir);
+    const files = await listWorkspaceFiles(req.user!.id);
     if (files.length === 0) {
-      return res.status(404).json({ error: "Workspace is empty \u2014 nothing to download." });
+      return res.status(404).json({ error: EMPTY_WORKSPACE_ERROR });
     }
     const zip = new AdmZip();
     for (const f of files) {
@@ -144,73 +156,61 @@ router.get("/api/download-workspace", requireAuth, (req: AuthedRequest, res) => 
     log.error("Workspace Download Error:", error);
     res.status(500).json({ error: "Failed to build workspace ZIP" });
   }
-});
+}));
 
-router.get("/api/upload-status", requireAuth, (req: AuthedRequest, res) => {
+router.get("/api/upload-status", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   try {
-    const uploadedDir = uploadedDirPath(req.user!.id);
-    if (fs.existsSync(uploadedDir)) {
-      const files = getWorkspaceFiles(uploadedDir, uploadedDir);
-      return res.json({
-        uploaded: files.length > 0,
-        files: files.map(f => ({ path: f.path, lineCount: f.lineCount }))
-      });
-    }
-    res.json({ uploaded: false, files: [] });
+    const files = await listWorkspaceFiles(req.user!.id);
+    return res.json({
+      uploaded: files.length > 0,
+      files: files.map(f => ({ path: f.path, lineCount: f.lineCount }))
+    });
   } catch (error: any) {
+    log.error("Upload Status Error:", error);
     res.json({ uploaded: false, files: [] });
   }
-});
+}));
 
-router.get("/api/uploaded-file", requireAuth, (req: AuthedRequest, res) => {
+router.get("/api/uploaded-file", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   try {
     const filePath = req.query.path as string;
     if (!filePath) {
       return res.status(400).json({ error: "Missing path parameter" });
     }
-    const uploadedDir = uploadedDirPath(req.user!.id);
-    const fullPath = resolveInsideDir(uploadedDir, filePath);
-    if (!fullPath) {
+    const relPath = cleanWorkspacePath(filePath);
+    if (!relPath) {
       return res.status(403).json({ error: "Access denied" });
     }
-    if (fs.existsSync(fullPath)) {
-      const content = fs.readFileSync(fullPath, "utf8");
-      return res.json({ content });
-    } else {
+    const row = await getWorkspaceFile(req.user!.id, relPath);
+    if (!row) {
       return res.status(404).json({ error: "File not found" });
     }
+    return res.json({ content: row.content });
   } catch (error: any) {
     log.error("Uploaded File Error:", error);
     res.status(500).json({ error: "Failed to retrieve file content" });
   }
-});
+}));
 
 // Save custom file directly into the uploaded workspace
-router.post("/api/save-workspace-file", requireAuth, (req: AuthedRequest, res) => {
+router.post("/api/save-workspace-file", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   try {
     const { filePath, content } = req.body;
     if (!filePath || typeof content !== "string") {
       return res.status(400).json({ error: "filePath and content string are required" });
     }
-    const uploadedDir = uploadedDirPath(req.user!.id);
-    if (!fs.existsSync(uploadedDir)) {
-      fs.mkdirSync(uploadedDir, { recursive: true });
-    }
-
-    const fullPath = resolveInsideDir(uploadedDir, filePath);
-    if (!fullPath) {
+    const relPath = cleanWorkspacePath(filePath);
+    if (!relPath) {
       return res.status(403).json({ error: "Access denied" });
     }
-    const safePath = path.relative(uploadedDir, fullPath).replace(/\\/g, "/");
 
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, content, "utf8");
+    await saveWorkspaceFile(req.user!.id, relPath, content);
 
-    const scannedFiles = getWorkspaceFiles(uploadedDir, uploadedDir);
+    const scannedFiles = await listWorkspaceFiles(req.user!.id);
     res.json({
       success: true,
-      message: `File "${safePath}" saved to workspace ledger successfully.`,
-      filePath: safePath,
+      message: `File "${relPath}" saved to workspace ledger successfully.`,
+      filePath: relPath,
       lineCount: countLines(content),
       files: scannedFiles.map(f => ({ path: f.path, lineCount: f.lineCount }))
     });
@@ -218,37 +218,33 @@ router.post("/api/save-workspace-file", requireAuth, (req: AuthedRequest, res) =
     log.error("Save Workspace File Error:", error);
     res.status(500).json({ error: "Failed to save file to workspace" });
   }
-});
+}));
 
 // Delete a custom file from the uploaded workspace
-router.post("/api/delete-workspace-file", requireAuth, (req: AuthedRequest, res) => {
+router.post("/api/delete-workspace-file", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   try {
     const { filePath } = req.body;
     if (!filePath) {
       return res.status(400).json({ error: "filePath is required" });
     }
-    const uploadedDir = uploadedDirPath(req.user!.id);
-    const fullPath = resolveInsideDir(uploadedDir, filePath);
-    if (!fullPath) {
+    const relPath = cleanWorkspacePath(filePath);
+    if (!relPath) {
       return res.status(403).json({ error: "Access denied" });
     }
-    const safePath = path.relative(uploadedDir, fullPath).replace(/\\/g, "/");
 
-    if (fs.existsSync(fullPath)) {
-      fs.unlinkSync(fullPath);
-    }
+    await deleteWorkspaceFile(req.user!.id, relPath);
 
-    const scannedFiles = fs.existsSync(uploadedDir) ? getWorkspaceFiles(uploadedDir, uploadedDir) : [];
+    const scannedFiles = await listWorkspaceFiles(req.user!.id);
     res.json({
       success: true,
-      message: `File "${safePath}" removed from workspace.`,
+      message: `File "${relPath}" removed from workspace.`,
       files: scannedFiles.map(f => ({ path: f.path, lineCount: f.lineCount }))
     });
   } catch (error: any) {
     log.error("Delete Workspace File Error:", error);
     res.status(500).json({ error: "Failed to delete file from workspace" });
   }
-});
+}));
 
 // AI Generate individual workspace file across multiple prompts
 router.post("/api/generate-workspace-file", requireAuth, requireCredits("workspaceFile"), asyncRoute(async (req: AuthedRequest, res) => {
@@ -258,22 +254,18 @@ router.post("/api/generate-workspace-file", requireAuth, requireCredits("workspa
   }
 
   try {
-    const uploadedDir = uploadedDirPath(req.user!.id);
-    if (!fs.existsSync(uploadedDir)) {
-      fs.mkdirSync(uploadedDir, { recursive: true });
-    }
+    const userId = req.user!.id;
 
-    // Validate the target path before it is used anywhere (prompt or disk).
-    const fullPath = resolveInsideDir(uploadedDir, filePath);
-    if (!fullPath) {
+    // Validate the target path before it is used anywhere (prompt or store).
+    const safePath = cleanWorkspacePath(filePath);
+    if (!safePath) {
       return res.status(403).json({ error: "Access denied" });
     }
-    const safePath = path.relative(uploadedDir, fullPath).replace(/\\/g, "/");
 
     // Context: the path list PLUS truncated contents of existing files
     // (excluding the target), so imports/exports across files actually line
     // up. Budget-capped to bound input tokens per file.
-    const existingFiles = getWorkspaceFiles(uploadedDir, uploadedDir);
+    const existingFiles = await listWorkspaceFiles(userId);
     const CONTEXT_BUDGET = 30000;
     const contextParts: string[] = [];
     let contextUsed = 0;
@@ -336,8 +328,8 @@ You MUST format your response EXACTLY as follows:
 
     if (codeIdx !== -1 && purposeIdx !== -1) {
       if (codeIdx < purposeIdx) {
-        code = responseText.substring(codeIdx + 12, purposeIdx).trim();
         purpose = responseText.substring(purposeIdx + 15).trim();
+        code = responseText.substring(codeIdx + 12, purposeIdx).trim();
       } else {
         purpose = responseText.substring(purposeIdx + 15, codeIdx).trim();
         code = responseText.substring(codeIdx + 12).trim();
@@ -348,11 +340,10 @@ You MUST format your response EXACTLY as follows:
       code = responseText.trim();
     }
 
-    // Save to disk (fullPath was containment-checked before generation)
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, code, "utf8");
+    // Save to the store (safePath was validated before generation)
+    await saveWorkspaceFile(userId, safePath, code);
 
-    const scannedFiles = getWorkspaceFiles(uploadedDir, uploadedDir);
+    const scannedFiles = await listWorkspaceFiles(userId);
     res.json({
       success: true,
       filePath: safePath,

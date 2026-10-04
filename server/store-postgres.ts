@@ -46,6 +46,15 @@ CREATE TABLE IF NOT EXISTS projects (
   data JSONB NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS workspace_files (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  content TEXT NOT NULL,
+  line_count INTEGER NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_files_user ON workspace_files(user_id);
 `;
 
 /** Minimal pool surface; real pg.Pool and pg-mem's pool both satisfy it. */
