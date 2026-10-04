@@ -1,10 +1,9 @@
 ﻿// Whole-workspace project intelligence route.
 import { Router } from "express";
 import { asyncRoute } from "../async-route";
-import path from "path";
 import fs from "fs";
 import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
-import { getWorkspaceFiles, WorkspaceFile, uploadedDir as uploadedDirPath } from "../workspace";
+import { getWorkspaceFiles, WorkspaceFile, uploadedDir as uploadedDirPath, resolveInsideDir } from "../workspace";
 import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
 import {
   computeDeterministicAssessment,
@@ -19,55 +18,84 @@ import { chargeForCall } from "../credits";
 
 const router = Router();
 
+// Bounds for client-supplied intelligence sources. The workspace ZIP path
+// already has its own limits; these cover the virtual-file and selected-path
+// variants so one request cannot blow up memory.
+const MAX_INTEL_FILES = 200;
+const MAX_INTEL_FILE_BYTES = 1024 * 1024;
+const MAX_INTEL_TOTAL_BYTES = 5 * 1024 * 1024;
+
 
 router.post("/api/project-intelligence", requireAuth, requireCredits("intelligence"), asyncRoute(async (req: AuthedRequest, res) => {
   try {
     let files: WorkspaceFile[] = [];
     const uploadedDir = uploadedDirPath(req.user!.id);
-    let isUploadedProject = false;
 
-    if (fs.existsSync(uploadedDir)) {
+    // Source selection, in priority order. The client may name the exact
+    // source it wants scored; the server never guesses.
+    //
+    // 1. codeFiles: raw code supplied by the client (e.g. the active editor
+    //    code). Virtual files: the path is a display label only, the content
+    //    never touches disk.
+    const codeFiles = (req.body as any)?.codeFiles;
+    if (Array.isArray(codeFiles) && codeFiles.length > 0) {
+      if (codeFiles.length > MAX_INTEL_FILES) {
+        return res.status(400).json({ error: `Too many files (limit ${MAX_INTEL_FILES}).` });
+      }
+      let totalChars = 0;
+      for (const f of codeFiles) {
+        if (!f || typeof f.path !== "string" || typeof f.content !== "string") {
+          return res.status(400).json({ error: "Each code file needs a string path and string content." });
+        }
+        if (f.content.length > MAX_INTEL_FILE_BYTES) {
+          return res.status(400).json({ error: "One file exceeds the 1MB per-file limit." });
+        }
+        totalChars += f.content.length;
+        if (totalChars > MAX_INTEL_TOTAL_BYTES) {
+          return res.status(400).json({ error: "Files exceed the 5MB total limit." });
+        }
+        const label = f.path.trim().replace(/^\/+/, "").replace(/\.\./g, "").slice(0, 300) || "pasted-code.txt";
+        files.push({ path: label, content: f.content, lineCount: f.content.split("\n").length });
+      }
+    } else if (Array.isArray((req.body as any)?.paths) && (req.body as any).paths.length > 0) {
+      // 2. paths: selected files from the user's own uploaded workspace,
+      //    resolved strictly inside their per-user directory.
+      const paths = (req.body as any).paths;
+      if (paths.length > MAX_INTEL_FILES) {
+        return res.status(400).json({ error: `Too many files (limit ${MAX_INTEL_FILES}).` });
+      }
+      for (const p of paths) {
+        if (typeof p !== "string" || p.length === 0) {
+          return res.status(400).json({ error: "Invalid file path." });
+        }
+        const full = resolveInsideDir(uploadedDir, p);
+        if (!full || !fs.existsSync(full) || !fs.statSync(full).isFile()) {
+          return res.status(400).json({ error: `Unknown workspace file: ${p.slice(0, 120)}` });
+        }
+        const content = fs.readFileSync(full, "utf8");
+        if (content.length > MAX_INTEL_FILE_BYTES) {
+          return res.status(400).json({ error: "One file exceeds the 1MB per-file limit." });
+        }
+        files.push({ path: p, content, lineCount: content.split("\n").length });
+      }
+    } else if (fs.existsSync(uploadedDir)) {
+      // 3. The whole uploaded workspace.
       const scannedFiles = getWorkspaceFiles(uploadedDir, uploadedDir);
       if (scannedFiles.length > 0) {
         files = scannedFiles;
-        isUploadedProject = true;
       }
     }
 
-    if (!isUploadedProject) {
-      const workspaceFiles = getWorkspaceFiles(process.cwd());
-
-      // Files that make up the GradeVibes application itself. If only these
-      // exist, the user has not uploaded or created their own codebase.
-      // Directory prefixes cover the app's own source trees so refactors
-      // don't silently reclassify app code as a user project.
-      const DEFAULT_FILES = new Set([
-        "server.ts",
-        "package.json",
-        "tsconfig.json",
-        "vite.config.ts",
-        "index.html",
-        "metadata.json",
-        "bun.lock",
-        "package-lock.json",
-        "yarn.lock",
-        ".env.example",
-        ".npmrc",
-        "README.md"
-      ]);
-      const DEFAULT_PREFIXES = ["src/", "server/", "shared/", "assets/", "docs/"];
-
-      const customFiles = workspaceFiles.filter(
-        f => !DEFAULT_FILES.has(f.path) && !DEFAULT_PREFIXES.some(p => f.path.startsWith(p))
-      );
-
-      if (customFiles.length === 0) {
-        return res.status(200).json({
-          notEnoughFiles: true,
-          error: "Not enough files to run scan on your codebase. Or upload a ZIP of your codebase to get a total scoring analysis!"
-        });
-      }
-      files = customFiles;
+    // There is deliberately no fallback to the application's own directory.
+    // An earlier version scanned process.cwd() with an exclusion list, which
+    // silently graded GradeVibes' own source (test/, scripts/, ...) as the
+    // user's project whenever no upload existed. No upload and no explicit
+    // source means there is nothing of the user's to score.
+    if (files.length === 0) {
+      return res.status(200).json({
+        notEnoughFiles: true,
+        error: "Not enough files to run scan on your codebase. Upload a ZIP of your codebase, select a file, or generate code first!"
+      });
     }
 
     const totalFiles = files.length;

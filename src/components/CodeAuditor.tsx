@@ -83,6 +83,12 @@ export default function CodeAuditor({
   const [intelResult, setIntelResult] = useState<any | null>(null);
   const [intelError, setIntelError] = useState("");
 
+  // Step 2 score source: the user chooses what gets graded. "workspace" is
+  // the whole uploaded workspace, "selected" is the file picked in Step 1,
+  // "editor" is the active generated code. The server never falls back to
+  // its own directory anymore.
+  const [intelSource, setIntelSource] = useState<"workspace" | "selected" | "editor">("workspace");
+
   // ZIP codebase upload states
   const [zipFiles, setZipFiles] = useState<{ path: string; lineCount: number }[]>([]);
   const [zipUploaded, setZipUploaded] = useState(false);
@@ -546,15 +552,52 @@ export default function CodeAuditor({
     }
   };
 
+  // Step 2 score-source options, in preference order. The effective source is
+  // the user's pick when still available, otherwise the first available one.
+  const intelSourceOptions = [
+    {
+      id: "workspace" as const,
+      label: `Uploaded workspace (${zipFiles.length} file${zipFiles.length === 1 ? "" : "s"})`,
+      available: zipUploaded && zipFiles.length > 0,
+    },
+    {
+      id: "selected" as const,
+      label: selectedZipPath ? `Selected file: ${selectedZipPath.split("/").pop()}` : "Selected file",
+      available: selectedZipPath !== null,
+    },
+    {
+      id: "editor" as const,
+      label: "Active editor code",
+      available:
+        workspaceCode.trim().length > 0 &&
+        !workspaceCode.includes("Custom ZIP Codebase Loaded Successfully!"),
+    },
+  ];
+  const effectiveIntelSource =
+    intelSourceOptions.find((o) => o.id === intelSource && o.available)?.id ??
+    intelSourceOptions.find((o) => o.available)?.id ??
+    null;
+
   const runProjectIntelligence = async () => {
     setIntelStatus("loading");
     setIntelError("");
     setIntelResult(null);
 
+    // The server grades exactly what we send: nothing is ever inferred.
+    // "workspace" sends nothing (server uses the whole uploaded workspace),
+    // "selected" names the Step 1 file, "editor" ships the generated code.
+    const body: Record<string, unknown> = {};
+    if (effectiveIntelSource === "selected" && selectedZipPath) {
+      body.paths = [selectedZipPath];
+    } else if (effectiveIntelSource === "editor") {
+      body.codeFiles = [{ path: "src/App.tsx", content: workspaceCode }];
+    }
+
     try {
       const response = await apiFetch("/api/project-intelligence", {
         method: "POST",
-        headers: { "Content-Type": "application/json" }
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
       });
 
       const contentType = response.headers.get("content-type") || "";
@@ -694,7 +737,7 @@ export default function CodeAuditor({
                   </p>
                   <p className="text-[11px] text-amber-100/80 mt-1 leading-relaxed">
                     Your workspace still holds {zipFiles.length} uploaded file{zipFiles.length === 1 ? "" : "s"} (e.g. {zipFiles.slice(0, 2).map(f => f.path).join(", ")})
-                    — not the code in your editor. Step 1 audits the source box below; Step 2 scores these uploaded files.
+                    — not the code in your editor. Step 1 audits the source box below; Step 2 defaults to these uploaded files (pick another source in Step 2 to score something else).
                   </p>
                   <div className="flex flex-wrap gap-2 mt-2">
                     <button
@@ -1223,21 +1266,50 @@ export default function CodeAuditor({
                   </div>
                   <div>
                     <h5 className="font-bold text-slate-200 text-xs uppercase tracking-wider font-sans">
-                      Full-Workspace Project Intelligence
+                      Project Intelligence
                     </h5>
                     <p className="text-[10px] text-slate-400 leading-relaxed font-sans mt-1 max-w-xl">
-                      {zipUploaded 
-                        ? "Evaluates your uploaded ZIP codebase file-by-file. It lists files in a ledger, maps your custom API routes & components, and scores completeness."
-                        : "Reads and parses all TypeScript, React, Express, and config files in your workspace recursively. It maps component-endpoint architecture and runs completeness checks."
-                      }
+                      {effectiveIntelSource === "workspace" &&
+                        "Evaluates your uploaded workspace file-by-file: file ledger, architecture map, and completeness score."}
+                      {effectiveIntelSource === "selected" &&
+                        "Scores the file you selected in Step 1 above."}
+                      {effectiveIntelSource === "editor" &&
+                        "Scores the code currently in your editor."}
+                      {effectiveIntelSource === null &&
+                        "Upload a ZIP, select a file in Step 1, or generate code — then pick a source below to score."}
                     </p>
                   </div>
+                </div>
+
+                {/* Score-source picker: exactly one source is ever graded. */}
+                <div className="flex flex-wrap gap-2">
+                  {intelSourceOptions.map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      disabled={!opt.available}
+                      onClick={() => setIntelSource(opt.id)}
+                      title={opt.available ? opt.label : "Not available right now"}
+                      className={`px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider border transition duration-150 ${
+                        effectiveIntelSource === opt.id
+                          ? "bg-indigo-500/20 border-indigo-500/50 text-indigo-200"
+                          : opt.available
+                            ? "bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200 hover:border-slate-600"
+                            : "bg-slate-950 border-slate-800/60 text-slate-600 cursor-not-allowed"
+                      }`}
+                    >
+                      {opt.id === "workspace" && "📦 "}
+                      {opt.id === "selected" && "📄 "}
+                      {opt.id === "editor" && "📝 "}
+                      {opt.label}
+                    </button>
+                  ))}
                 </div>
 
                 <button
                   type="button"
                   onClick={runProjectIntelligence}
-                  disabled={intelStatus === "loading"}
+                  disabled={intelStatus === "loading" || effectiveIntelSource === null}
                   className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-indigo-500/10 hover:bg-indigo-500/20 active:bg-indigo-500/30 text-indigo-300 hover:text-indigo-200 rounded-xl font-semibold text-xs transition duration-150 disabled:opacity-45 disabled:cursor-not-allowed border border-indigo-500/20 shadow-md cursor-pointer"
                 >
                   {intelStatus === "loading" ? (
@@ -1248,7 +1320,12 @@ export default function CodeAuditor({
                   ) : (
                     <>
                       <Brain className="w-4 h-4 text-indigo-400" />
-                      <span>{zipUploaded ? "Scan Uploaded Codebase" : "Scan Full Project Workspace"}</span>
+                      <span>
+                        {effectiveIntelSource === "workspace" && "Scan Uploaded Codebase"}
+                        {effectiveIntelSource === "selected" && "Score Selected File"}
+                        {effectiveIntelSource === "editor" && "Score Editor Code"}
+                        {effectiveIntelSource === null && "No Source Available"}
+                      </span>
                     </>
                   )}
                 </button>
