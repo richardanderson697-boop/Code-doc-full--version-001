@@ -116,14 +116,60 @@ rules:
       fix: Pass arguments as an array (execFile/spawn with args) so no shell
         interprets them, and never build the command from untrusted input.
       gradevibes_severity: high
+    # $CP is constrained to the child_process module (direct, required, or
+    # imported). An unconstrained $CP.exec(...) also matches db.exec(),
+    # regex.exec(), etc. - pure noise. Literal command strings are excluded
+    # per branch (a metavariable-pattern exclusion misfires on this engine).
     patterns:
       - pattern-either:
-          - pattern: $CP.exec($CMD, ...)
-          - pattern: $CP.execSync($CMD, ...)
-          - pattern: $CP.spawn($CMD, ...)
-      - pattern-not: $CP.exec("...", ...)
-      - pattern-not: $CP.execSync("...", ...)
-      - pattern-not: $CP.spawn("...", ...)
+          - patterns:
+              - pattern: child_process.exec($CMD, ...)
+              - pattern-not: child_process.exec("...", ...)
+          - patterns:
+              - pattern: child_process.execSync($CMD, ...)
+              - pattern-not: child_process.execSync("...", ...)
+          - patterns:
+              - pattern: child_process.spawn($CMD, ...)
+              - pattern-not: child_process.spawn("...", ...)
+          - patterns:
+              - pattern-inside: |
+                  $CP = require('child_process');
+                  ...
+              - pattern-either:
+                  - pattern: $CP.exec($CMD, ...)
+                  - pattern: $CP.execSync($CMD, ...)
+                  - pattern: $CP.spawn($CMD, ...)
+              - pattern-not: $CP.exec("...", ...)
+              - pattern-not: $CP.execSync("...", ...)
+              - pattern-not: $CP.spawn("...", ...)
+          - patterns:
+              - pattern-inside: |
+                  $CP = require('node:child_process');
+                  ...
+              - pattern-either:
+                  - pattern: $CP.exec($CMD, ...)
+                  - pattern: $CP.execSync($CMD, ...)
+                  - pattern: $CP.spawn($CMD, ...)
+              - pattern-not: $CP.exec("...", ...)
+              - pattern-not: $CP.execSync("...", ...)
+              - pattern-not: $CP.spawn("...", ...)
+          - patterns:
+              - pattern-inside: |
+                  import $CP from 'child_process';
+                  ...
+              - pattern-either:
+                  - pattern: $CP.exec($CMD, ...)
+                  - pattern: $CP.execSync($CMD, ...)
+                  - pattern: $CP.spawn($CMD, ...)
+              - pattern-not: $CP.exec("...", ...)
+              - pattern-not: $CP.execSync("...", ...)
+              - pattern-not: $CP.spawn("...", ...)
+          - patterns:
+              - pattern-inside: |
+                  import { exec as $E } from 'child_process';
+                  ...
+              - pattern: $E($CMD, ...)
+              - pattern-not: $E("...", ...)
 
   - id: gv-sql-string-concat
     languages: [javascript, typescript]

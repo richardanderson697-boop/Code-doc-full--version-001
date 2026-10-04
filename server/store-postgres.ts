@@ -161,10 +161,9 @@ class PostgresTx implements Db {
 
 export function createPostgresDb(connectionString: string, pool?: PgPoolLike): Db {
   if (pool) return new PostgresDb(pool);
-  // Railway's internal database URL needs no TLS; the public one does.
-  const ssl = connectionString.includes("railway.internal")
-    ? false
-    : { rejectUnauthorized: false };
+  // Railway's internal database URL is plaintext on the private network;
+  // anything else verifies TLS normally (never skip verification).
+  const ssl = connectionString.includes("railway.internal") ? false : true;
   return new PostgresDb(
     new Pool({ connectionString, ssl, max: 5 }) as unknown as PgPoolLike
   );

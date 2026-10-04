@@ -90,6 +90,15 @@ export default function CodeAuditor({
   const [zipError, setZipError] = useState("");
   const [dragActive, setDragActive] = useState(false);
 
+  // Stale-workspace banner: the uploaded workspace is per-user, not
+  // per-project, so files from an earlier upload survive into a new project.
+  // Warn when the editor holds real generated code while the workspace still
+  // contains uploaded files, so Step 2 never silently scores the wrong project.
+  const [staleBannerDismissed, setStaleBannerDismissed] = useState(false);
+  useEffect(() => {
+    setStaleBannerDismissed(false);
+  }, [zipFiles.length]);
+
   // Deterministic findings kept from a failed AI audit, so an outage of the
   // AI service still shows the scan results instead of only an error.
   const [degradedPreflight, setDegradedPreflight] = useState<PreFlightReport | null>(null);
@@ -670,6 +679,50 @@ export default function CodeAuditor({
           discard the config the user typed into it. */}
       <div className="flex-1 overflow-y-auto p-4">
         <div className={activeSubTab === "audit" ? "space-y-4" : "hidden"}>
+            {/* Stale-workspace warning: uploaded files persist per-user across
+                projects. If the editor holds real generated code while the
+                workspace still contains an earlier upload, say so loudly and
+                offer the two correct exits before any audit runs. */}
+            {zipUploaded && zipFiles.length > 0 && !staleBannerDismissed &&
+              workspaceCode.trim().length > 0 &&
+              !workspaceCode.includes("Custom ZIP Codebase Loaded Successfully!") && (
+              <div className="flex items-start gap-3 p-3 rounded-xl border border-amber-500/40 bg-amber-500/10">
+                <AlertTriangle className="w-4 h-4 text-amber-300 shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-[11px] font-bold text-amber-200 uppercase tracking-wider">
+                    Workspace files are from an earlier upload
+                  </p>
+                  <p className="text-[11px] text-amber-100/80 mt-1 leading-relaxed">
+                    Your workspace still holds {zipFiles.length} uploaded file{zipFiles.length === 1 ? "" : "s"} (e.g. {zipFiles.slice(0, 2).map(f => f.path).join(", ")})
+                    — not the code in your editor. Step 1 audits the source box below; Step 2 scores these uploaded files.
+                  </p>
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    <button
+                      type="button"
+                      onClick={handlePullFromWorkspace}
+                      className="px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider bg-amber-500/20 border border-amber-500/40 text-amber-200 hover:bg-amber-500/30 transition"
+                    >
+                      Load Active Code
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleClearZip}
+                      className="px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wider bg-slate-900 border border-slate-700 text-slate-300 hover:bg-slate-800 transition"
+                    >
+                      Clear Workspace
+                    </button>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setStaleBannerDismissed(true)}
+                  className="text-amber-300/60 hover:text-amber-200 text-sm leading-none px-1"
+                  title="Dismiss"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
             {/* Two Mode Auditing Selector */}
             <div className="grid grid-cols-2 bg-slate-950 p-1 rounded-xl border border-slate-800/80 mb-4 select-none shrink-0">
               <button
