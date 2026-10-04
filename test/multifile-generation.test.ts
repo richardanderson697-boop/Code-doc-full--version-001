@@ -7,6 +7,7 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import request from "supertest";
+import AdmZip from "adm-zip";
 
 import authRouter from "../server/routes/auth";
 import aiRouter from "../server/routes/ai";
@@ -162,6 +163,48 @@ describe("POST /api/generate-manifest", () => {
       .set("Cookie", await authedCookie(app))
       .send({ prompt: "a todo app" });
     expect(res.status).toBe(502);
+  });
+});
+
+describe("GET /api/download-workspace", () => {
+  it("404s when the workspace is empty", async () => {
+    const app = buildApp();
+    const res = await request(app)
+      .get("/api/download-workspace")
+      .set("Cookie", await authedCookie(app));
+    expect(res.status).toBe(404);
+  });
+
+  it("streams a ZIP containing the workspace files", async () => {
+    const app = buildApp();
+    const cookie = await authedCookie(app);
+    mockGenerate.mockResolvedValue({
+      response: {
+        text: "====CODE====\nexport const v = 1;\n====PURPOSE====\ntest",
+        usageMetadata: { promptTokenCount: 800, candidatesTokenCount: 400 },
+      },
+      modelName: "test-model",
+    });
+    await request(app)
+      .post("/api/generate-workspace-file")
+      .set("Cookie", cookie)
+      .send({ filePath: "src/app.ts", prompt: "an app" });
+
+    const res = await request(app)
+      .get("/api/download-workspace")
+      .set("Cookie", cookie)
+      .buffer(true)
+      .parse((res2: any, cb: any) => {
+        const chunks: Buffer[] = [];
+        res2.on("data", (c: Buffer) => chunks.push(c));
+        res2.on("end", () => cb(null, Buffer.concat(chunks)));
+      });
+    expect(res.status).toBe(200);
+    expect(res.headers["content-type"]).toContain("application/zip");
+    const zip = new AdmZip(res.body as Buffer);
+    const names = zip.getEntries().map((e) => e.entryName);
+    expect(names).toContain("src/app.ts");
+    expect(zip.readAsText("src/app.ts")).toContain("export const v = 1;");
   });
 });
 

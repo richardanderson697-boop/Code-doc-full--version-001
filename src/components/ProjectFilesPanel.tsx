@@ -1,8 +1,9 @@
 import React, { useState } from "react";
 import { apiFetch } from "../utils/apiFetch";
-import { FileCode, Loader2, FolderGit2 } from "lucide-react";
+import { FileCode, Loader2, FolderGit2, Download } from "lucide-react";
 import CodeVisualizer from "./CodeVisualizer";
 import { logError } from "../utils/logger";
+import { tryDownloadWorkspaceZip } from "../utils/downloadWorkspace";
 
 interface ProjectFilesPanelProps {
   files: { path: string }[];
@@ -14,6 +15,7 @@ interface ProjectFilesPanelProps {
 // Cold Read Auditor's Step 2 with the "Uploaded workspace" source.
 export default function ProjectFilesPanel({ files, title }: ProjectFilesPanelProps) {
   const [selected, setSelected] = useState<string | null>(null);
+  const [dlError, setDlError] = useState("");
   const [code, setCode] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -47,7 +49,18 @@ export default function ProjectFilesPanel({ files, title }: ProjectFilesPanelPro
         <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-teal-500/20 text-teal-300 border border-teal-500/30">
           {files.length} files
         </span>
+        <button
+          type="button"
+          onClick={() => void tryDownloadWorkspaceZip(setDlError)}
+          title="Download project as ZIP"
+          className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-bold bg-teal-500/10 hover:bg-teal-500/20 border border-teal-500/30 text-teal-300 transition"
+        >
+          <Download className="w-3.5 h-3.5" /> Download ZIP
+        </button>
       </div>
+      {dlError && (
+        <p className="text-[11px] text-rose-400 font-mono bg-rose-500/5 border border-rose-500/10 rounded-lg p-2 mb-2">{dlError}</p>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3 flex-1 min-h-0">
         <div className="space-y-1 overflow-y-auto pr-1 max-h-96 md:max-h-none">
           {files.map((f) => (

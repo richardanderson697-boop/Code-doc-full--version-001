@@ -119,6 +119,33 @@ router.post("/api/clear-upload", requireAuth, (req: AuthedRequest, res) => {
   }
 });
 
+// Download the user's workspace as a ZIP archive. Streams the archive;
+// nothing is written to disk and the workspace is untouched.
+router.get("/api/download-workspace", requireAuth, (req: AuthedRequest, res) => {
+  try {
+    const uploadedDir = uploadedDirPath(req.user!.id);
+    if (!fs.existsSync(uploadedDir)) {
+      return res.status(404).json({ error: "Workspace is empty \u2014 nothing to download." });
+    }
+    const files = getWorkspaceFiles(uploadedDir, uploadedDir);
+    if (files.length === 0) {
+      return res.status(404).json({ error: "Workspace is empty \u2014 nothing to download." });
+    }
+    const zip = new AdmZip();
+    for (const f of files) {
+      zip.addFile(f.path, Buffer.from(f.content, "utf8"));
+    }
+    const buf = zip.toBuffer();
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="gradevibes-project.zip"');
+    res.setHeader("Content-Length", String(buf.length));
+    res.send(buf);
+  } catch (error: any) {
+    log.error("Workspace Download Error:", error);
+    res.status(500).json({ error: "Failed to build workspace ZIP" });
+  }
+});
+
 router.get("/api/upload-status", requireAuth, (req: AuthedRequest, res) => {
   try {
     const uploadedDir = uploadedDirPath(req.user!.id);

@@ -47,6 +47,7 @@ import {
 } from "lucide-react";
 import { motion } from "motion/react";
 import { logError } from "../utils/logger";
+import { tryDownloadWorkspaceZip } from "../utils/downloadWorkspace";
 import type { PreFlightReport } from "../../shared/preflight-types";
 import { AuditResult } from "./auditor/types";
 import PreFlightFindingsPanel from "./auditor/PreFlightFindingsPanel";
@@ -1169,14 +1170,25 @@ export default function CodeAuditor({
                             {zipFiles.length} files stored in workspace memory. Click any file to extract Step 1 evidence or generate additional files.
                           </p>
                         </div>
-                        <button
-                          type="button"
-                          onClick={handleClearZip}
-                          className="flex items-center gap-1.5 px-2.5 py-1 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 hover:text-rose-200 border border-rose-500/20 rounded-lg text-[10px] font-bold uppercase transition duration-150 cursor-pointer shrink-0"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                          <span>Clear Workspace</span>
-                        </button>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => void tryDownloadWorkspaceZip(setZipError)}
+                            title="Download workspace as ZIP"
+                            className="flex items-center gap-1.5 px-2.5 py-1 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-indigo-200 border border-indigo-500/20 rounded-lg text-[10px] font-bold uppercase transition duration-150 cursor-pointer"
+                          >
+                            <Download className="w-3 h-3" />
+                            <span>Download ZIP</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleClearZip}
+                            className="flex items-center gap-1.5 px-2.5 py-1 bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 hover:text-rose-200 border border-rose-500/20 rounded-lg text-[10px] font-bold uppercase transition duration-150 cursor-pointer"
+                          >
+                            <Trash2 className="w-3 h-3" />
+                            <span>Clear Workspace</span>
+                          </button>
+                        </div>
                       </div>
 
                       <div className="max-h-48 overflow-y-auto bg-slate-950/80 border border-slate-900 rounded-xl p-2 text-left text-[10px] font-mono space-y-1.5 scrollbar-thin">
