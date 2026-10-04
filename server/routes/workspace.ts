@@ -225,7 +225,7 @@ router.post("/api/delete-workspace-file", requireAuth, (req: AuthedRequest, res)
 
 // AI Generate individual workspace file across multiple prompts
 router.post("/api/generate-workspace-file", requireAuth, requireCredits("workspaceFile"), asyncRoute(async (req: AuthedRequest, res) => {
-  const { filePath, prompt, systemInstruction: customInstruction } = req.body;
+  const { filePath, prompt, systemInstruction: customInstruction, existingCode } = req.body;
   if (!filePath || !prompt) {
     return res.status(400).json({ error: "filePath and prompt are required" });
   }
@@ -243,16 +243,43 @@ router.post("/api/generate-workspace-file", requireAuth, requireCredits("workspa
     }
     const safePath = path.relative(uploadedDir, fullPath).replace(/\\/g, "/");
 
-    // Scan existing workspace files to give AI full context of accumulated files
+    // Context: the path list PLUS truncated contents of existing files
+    // (excluding the target), so imports/exports across files actually line
+    // up. Budget-capped to bound input tokens per file.
     const existingFiles = getWorkspaceFiles(uploadedDir, uploadedDir);
-    const existingFileList = existingFiles.map(f => f.path).join("\n- ");
+    const CONTEXT_BUDGET = 30000;
+    const contextParts: string[] = [];
+    let contextUsed = 0;
+    for (const f of existingFiles) {
+      if (f.path === safePath) continue;
+      const snippet = f.content.slice(0, 2000);
+      if (contextUsed + snippet.length > CONTEXT_BUDGET) break;
+      contextUsed += snippet.length;
+      contextParts.push(`--- ${f.path} ---\n${snippet}`);
+    }
+    const contextBlock = contextParts.length > 0
+      ? contextParts.join("\n\n")
+      : "(None yet - this is the first file)";
 
-    const fileGenSystemInstruction = customInstruction || `You are VibeCoder, a master AI software architect. You are generating a specific project file named "${safePath}" as part of an accumulated multi-file workspace application.
+    const isRefinement = typeof existingCode === "string" && existingCode.trim().length > 0;
+    const createInstruction = `You are VibeCoder, a master AI software architect. You are generating a specific project file named "${safePath}" as part of an accumulated multi-file workspace application.
 
-Existing Workspace Files accumulated so far:
-- ${existingFileList || "(None yet - this is the first file)"}
+Existing Workspace Files (truncated contents for cross-file consistency):
+${contextBlock}
 
-Task: Generate the complete, production-ready code content for "${safePath}" based on the user's prompt. Ensure all exports, imports, and functions match standard modern TypeScript/JavaScript patterns.
+Task: Generate the complete, production-ready code content for "${safePath}" based on the user's prompt. Import from sibling files with relative paths ONLY, and only import names that are actually exported by those files (see contents above). Ensure all exports, imports, and functions match standard modern TypeScript/JavaScript patterns.`;
+    const refineInstruction = `You are VibeCoder, a master AI software architect. You are REFINING a specific project file named "${safePath}" as part of an accumulated multi-file workspace application.
+
+Existing Workspace Files (truncated contents for cross-file consistency):
+${contextBlock}
+
+=== CURRENT CONTENT OF "${safePath}" ===
+${existingCode}
+=== END CURRENT CONTENT ===
+
+Task: EDIT the current content according to the user's prompt. Preserve all working logic, exports, and import paths unless the prompt asks to change them. Keep every import specifier relative and pointing at files that exist in the workspace above.`;
+    // Shared response-format contract for both create and refine paths.
+    const formatBlock = `
 
 You MUST format your response EXACTLY as follows:
 
@@ -261,6 +288,7 @@ You MUST format your response EXACTLY as follows:
 
 ====PURPOSE====
 [Provide a concise 2-4 sentence explanation of what this specific file does, key exported functions/types, and its architectural role in the overall application]`;
+    const fileGenSystemInstruction = (customInstruction || (isRefinement ? refineInstruction : createInstruction)) + (customInstruction ? "" : formatBlock);
 
     const { response: genResponse, modelName } = await generateWithFallback({
       contents: `File to create: ${safePath}\nPrompt instructions: ${prompt}`,

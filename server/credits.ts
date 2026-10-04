@@ -148,6 +148,7 @@ export const MIN_CREDITS = {
   intelligence: 40, // full workspace scan, scales with project size
   generate: 25, // SSE code generation
   workspaceFile: 15,
+  manifest: 5, // multi-file project planning (small JSON response)
 } as const;
 
 export type CreditTier = keyof typeof MIN_CREDITS;

@@ -21,9 +21,11 @@ import {
 } from "lucide-react";
 import { VibeProject } from "../types";
 import { logError } from "../utils/logger";
+import MultiFileBuilder, { MultiFileInfo } from "./MultiFileBuilder";
 
 interface WelcomeViewProps {
   onGenerate: (prompt: string) => void;
+  onMultiFileComplete: (info: MultiFileInfo) => void;
   onAuditExternalCode: (code: string) => void;
   onUploadZipCodebase: (files: { path: string; lineCount: number }[]) => void;
   isLoading: boolean;
@@ -31,14 +33,16 @@ interface WelcomeViewProps {
   onOpenRegistry: () => void;
 }
 
-export default function WelcomeView({ 
-  onGenerate, 
+export default function WelcomeView({
+  onGenerate,
+  onMultiFileComplete,
   onAuditExternalCode,
   onUploadZipCodebase,
   isLoading, 
   savedCount, 
   onOpenRegistry 
 }: WelcomeViewProps) {
+  const [buildMode, setBuildMode] = useState<"single" | "multi">("single");
   const [prompt, setPrompt] = useState("");
   const [activeTab, setActiveTab] = useState<"generate" | "audit" | "zip">("generate");
   const [externalCode, setExternalCode] = useState("");
@@ -245,7 +249,37 @@ export default function WelcomeView({
       {/* Main Mode Selection Content */}
       {activeTab === "generate" ? (
         /* Mode 1: App Generator */
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 md:p-6 shadow-xl mb-12">
+        <>
+          <div className="flex justify-center mb-4">
+            <div className="flex bg-slate-900/80 border border-slate-800 p-1 rounded-xl select-none">
+              <button
+                type="button"
+                onClick={() => setBuildMode("single")}
+                className={`px-4 py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-wider transition duration-150 cursor-pointer ${
+                  buildMode === "single"
+                    ? "bg-emerald-500/15 border border-emerald-500/30 text-emerald-300"
+                    : "text-slate-500 hover:text-slate-300 border border-transparent"
+                }`}
+              >
+                Single file
+              </button>
+              <button
+                type="button"
+                onClick={() => setBuildMode("multi")}
+                className={`px-4 py-1.5 rounded-lg text-[11px] font-bold uppercase tracking-wider transition duration-150 cursor-pointer ${
+                  buildMode === "multi"
+                    ? "bg-emerald-500/15 border border-emerald-500/30 text-emerald-300"
+                    : "text-slate-500 hover:text-slate-300 border border-transparent"
+                }`}
+              >
+                Multi-file project
+              </button>
+            </div>
+          </div>
+          {buildMode === "multi" ? (
+            <MultiFileBuilder onComplete={onMultiFileComplete} />
+          ) : (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 md:p-6 shadow-xl mb-12">
           <form onSubmit={handleSubmit} className="space-y-4">
             <div className="relative">
               <textarea
@@ -286,6 +320,8 @@ export default function WelcomeView({
             </div>
           </form>
         </div>
+          )}
+        </>
       ) : activeTab === "audit" ? (
         /* Mode 2: Paste External Code for Auditing */
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 md:p-6 shadow-xl mb-12">

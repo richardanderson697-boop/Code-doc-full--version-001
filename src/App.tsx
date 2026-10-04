@@ -5,6 +5,7 @@ import WelcomeView from "./components/WelcomeView";
 import CodeVisualizer from "./components/CodeVisualizer";
 import PurposeVisualizer from "./components/PurposeVisualizer";
 import HistorySidebar from "./components/HistorySidebar";
+import ProjectFilesPanel from "./components/ProjectFilesPanel";
 import AnatomyInspector from "./components/AnatomyInspector";
 import AIDebugger from "./components/AIDebugger";
 import CodeAuditor from "./components/CodeAuditor";
@@ -20,6 +21,7 @@ export default function App() {
   
   // Workspace states
   const [activeCode, setActiveCode] = useState("");
+  const [projectFiles, setProjectFiles] = useState<{ path: string }[] | null>(null);
   const [activePurpose, setActivePurpose] = useState("");
   const [currentPrompt, setCurrentPrompt] = useState("");
   const [currentTitle, setCurrentTitle] = useState("");
@@ -437,6 +439,20 @@ export default function App() {
   // Select project from registry
   const handleSelectProject = (project: VibeProject) => {
     setCurrentProject(project);
+    try {
+      const parsed = JSON.parse(project.code);
+      if (parsed && parsed.multiFile === true && Array.isArray(parsed.files)) {
+        setProjectFiles(parsed.files);
+        setActiveCode("");
+        setActivePurpose(project.purpose);
+        setCurrentPrompt(project.prompt);
+        setCurrentTitle(project.title);
+        setErrorMessage("");
+        setActiveRightTab("auditor");
+        return;
+      }
+    } catch { /* not a multi-file project payload */ }
+    setProjectFiles(null);
     setActiveCode(project.code);
     setActivePurpose(project.purpose);
     setCurrentPrompt(project.prompt);
@@ -444,10 +460,42 @@ export default function App() {
     setErrorMessage("");
   };
 
+  // Multi-file project completion: enter the workspace with the generated
+  // file list on the left and the auditor (Step 2 scoring) one click away.
+  const handleMultiFileComplete = (info: { title: string; prompt: string; files: { path: string }[] }) => {
+    setCurrentProject(null);
+    setActiveCode("");
+    setProjectFiles(info.files);
+    setCurrentPrompt(info.prompt);
+    setCurrentTitle(info.title);
+    setActivePurpose(
+      `### MULTI-FILE PROJECT\n${info.files.length} files generated into your workspace.\n\n` +
+      info.files.map((f) => `- ${f.path}`).join("\n") +
+      `\n\nOpen the Cold Read Auditor and run Step 2 (Project Completion Evaluator) with the "Uploaded workspace" source to score the whole project.`
+    );
+    setErrorMessage("");
+    setActiveRightTab("auditor");
+    // Save to history ledger so the project is visible alongside single-file builds.
+    const payload = {
+      id: `vibe_${Date.now()}`,
+      title: info.title,
+      prompt: info.prompt,
+      code: JSON.stringify({ multiFile: true, files: info.files }),
+      purpose: `${info.files.length}-file generated project`,
+      createdAt: new Date().toISOString(),
+    };
+    void apiFetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(() => void fetchProjects()).catch(() => {});
+  };
+
   // Reset and load Welcome View
   const handleNewVibe = () => {
     setCurrentProject(null);
     setActiveCode("");
+    setProjectFiles(null);
     setActivePurpose("");
     setCurrentPrompt("");
     setCurrentTitle("");
@@ -635,6 +683,7 @@ export default function App() {
           <div className="flex-1 overflow-y-auto">
             <WelcomeView
               onGenerate={handleGenerate}
+              onMultiFileComplete={handleMultiFileComplete}
               onAuditExternalCode={(pastedCode) => {
                 setActiveCode(pastedCode);
                 setActivePurpose("### EXTERNAL SOURCE CODE AUDIT\nThis is an external code file analyzed by the Cold Read Auditor. No active generator blueprint is attached to this workspace.");
@@ -661,6 +710,8 @@ export default function App() {
         ) : (
           /* Split Workspace Editor Screen */
           <div className="flex-1 flex flex-col p-5 gap-4 min-h-0">
+            {!projectFiles && (
+            <>
             {/* Active Workspace Code Evolution & Refinement Dock */}
             <div className="bg-slate-900/90 border border-emerald-500/30 rounded-2xl p-3.5 shadow-xl backdrop-blur-md">
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-2.5 mb-2.5">
@@ -798,22 +849,28 @@ export default function App() {
                 </div>
               )}
             </div>
+            </>
+            )}
 
             {/* Side-by-side Dual Panels */}
             <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-5 min-h-0">
               
-              {/* Left Pane - Code view */}
+              {/* Left Pane - Code view (file browser in multi-file mode) */}
               <div className="h-full flex flex-col min-h-0">
-                <CodeVisualizer 
-                  code={activeCode} 
-                  isGenerating={isGenerating} 
-                  appName={currentTitle} 
-                  highlightedLine={highlightedLine}
-                  onLineClick={(lineNum) => {
-                    setHighlightedLine(lineNum);
-                    setActiveRightTab("debugger");
-                  }}
-                />
+                {projectFiles ? (
+                  <ProjectFilesPanel files={projectFiles} title={currentTitle} />
+                ) : (
+                  <CodeVisualizer
+                    code={activeCode}
+                    isGenerating={isGenerating}
+                    appName={currentTitle}
+                    highlightedLine={highlightedLine}
+                    onLineClick={(lineNum) => {
+                      setHighlightedLine(lineNum);
+                      setActiveRightTab("debugger");
+                    }}
+                  />
+                )}
               </div>
 
               {/* Right Pane - Modular Multi-Tabs view */}

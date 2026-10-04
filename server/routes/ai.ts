@@ -349,5 +349,89 @@ Do not skip sections, and make sure the code is completely written (no comments 
   }
 }));
 
+// Multi-file project planning: one cheap call that returns a strict-JSON file
+// manifest for the user's prompt. The client shows it for approval before any
+// per-file generation runs, so the expensive loop never starts blind.
+export const MAX_MANIFEST_FILES = 25;
+
+router.post("/api/generate-manifest", requireAuth, requireCredits("manifest"), asyncRoute(async (req: AuthedRequest, res) => {
+  const { prompt, maxFiles } = req.body;
+  if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+    return res.status(400).json({ error: "Prompt is required" });
+  }
+  const cap = Math.min(Math.max(parseInt(maxFiles, 10) || MAX_MANIFEST_FILES, 1), MAX_MANIFEST_FILES);
+
+  const systemInstruction = `You are VibeCoder, an elite AI software architect. The user wants a multi-file React+TypeScript project. Your ONLY job is to plan the file structure — do NOT write any code.
+
+Return STRICT JSON (no markdown fences, no prose, no commentary) with exactly this shape:
+{"entry": "src/App.tsx", "files": [{"path": "src/components/Header.tsx", "purpose": "Top navigation bar with project switcher"}]}
+
+Rules, all mandatory:
+- "entry" must be exactly "src/App.tsx" and it must appear in "files".
+- At most ${cap} files. Prefer fewer, well-factored files over many tiny ones.
+- Every path is relative and under src/. No absolute paths, no ".." segments, no duplicates.
+- React + TypeScript only. Components import each other with relative paths. No new npm dependencies.
+- Every file must be independently meaningful — no junk-drawer utils files.
+- "purpose" is one plain sentence per file describing its role.`;
+
+  try {
+    const { response: genResponse, modelName } = await generateWithFallback({
+      contents: prompt,
+      config: {
+        systemInstruction,
+        temperature: 0.3,
+        responseMimeType: "application/json",
+      },
+    });
+
+    const manifestBalance = await chargeForCall(req.user!.id, extractUsage(genResponse), modelName, "manifest planning");
+    if (manifestBalance != null) res.set("X-Credits-Balance", String(manifestBalance));
+
+    let manifest: any;
+    try {
+      const text = (genResponse.text || "").trim()
+        .replace(/^```(?:json)?\s*/i, "")
+        .replace(/\s*```$/, "");
+      manifest = JSON.parse(text);
+    } catch {
+      return res.status(502).json({ error: "The planner returned invalid JSON. Please try again." });
+    }
+
+    // The model produced this, not the user: malformed plans are 502s so the
+    // client can retry, never silent acceptance of a broken manifest.
+    if (!manifest || manifest.entry !== "src/App.tsx" || !Array.isArray(manifest.files) || manifest.files.length === 0) {
+      return res.status(502).json({ error: "The planner returned an invalid manifest. Please try again." });
+    }
+    if (manifest.files.length > cap) {
+      return res.status(502).json({ error: `The planner returned ${manifest.files.length} files (limit ${cap}). Please try again.` });
+    }
+    const seen = new Set<string>();
+    const files: { path: string; purpose: string }[] = [];
+    for (const f of manifest.files) {
+      if (!f || typeof f.path !== "string" || typeof f.purpose !== "string") {
+        return res.status(502).json({ error: "The planner returned a malformed file entry. Please try again." });
+      }
+      const clean = f.path.trim().replace(/^\/+/, "");
+      if (!clean.startsWith("src/") || clean.includes("..") || seen.has(clean)) {
+        return res.status(502).json({ error: `The planner returned an invalid path "${f.path}". Please try again.` });
+      }
+      seen.add(clean);
+      files.push({ path: clean, purpose: f.purpose.trim().slice(0, 300) });
+    }
+    if (!seen.has("src/App.tsx")) {
+      return res.status(502).json({ error: "The planner omitted the src/App.tsx entry point. Please try again." });
+    }
+
+    // Dependencies before dependents, entry last: when each file is generated,
+    // every import target already exists in the workspace context.
+    const entry = files.find((f) => f.path === "src/App.tsx")!;
+    const rest = files.filter((f) => f.path !== "src/App.tsx");
+    res.json({ entry: entry.path, files: [...rest, entry] });
+  } catch (error: any) {
+    log.error("Manifest Planning Error:", error);
+    res.status(500).json({ error: formatGeminiError(error) });
+  }
+}));
+
 
 export default router;
