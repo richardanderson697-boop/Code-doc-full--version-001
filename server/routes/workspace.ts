@@ -5,7 +5,7 @@ import path from "path";
 import fs from "fs";
 import AdmZip from "adm-zip";
 import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
-import { resolveInsideDir, getWorkspaceFiles, uploadedDir as uploadedDirPath } from "../workspace";
+import { resolveInsideDir, getWorkspaceFiles, uploadedDir as uploadedDirPath, countLines } from "../workspace";
 import { readZipHeader, hasUnsafeEntryName } from "../zip-guard";
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
@@ -211,7 +211,7 @@ router.post("/api/save-workspace-file", requireAuth, (req: AuthedRequest, res) =
       success: true,
       message: `File "${safePath}" saved to workspace ledger successfully.`,
       filePath: safePath,
-      lineCount: content.split("\n").length,
+      lineCount: countLines(content),
       files: scannedFiles.map(f => ({ path: f.path, lineCount: f.lineCount }))
     });
   } catch (error: any) {
@@ -358,7 +358,7 @@ You MUST format your response EXACTLY as follows:
       filePath: safePath,
       content: code,
       purpose: purpose || "Custom generated project file.",
-      lineCount: code.split("\n").length,
+      lineCount: countLines(code),
       files: scannedFiles.map(f => ({ path: f.path, lineCount: f.lineCount }))
     });
   } catch (error: any) {

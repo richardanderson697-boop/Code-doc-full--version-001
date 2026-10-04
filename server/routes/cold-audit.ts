@@ -6,6 +6,7 @@ import { runDeterministicScan } from "../deterministic-scan";
 import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
 import type { PreFlightReport } from "../../shared/preflight-types";
 import { log } from "../logger";
+import { countLines } from "../workspace";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
 
@@ -137,7 +138,7 @@ Keep the assessment highly detailed, precise, professional, and strictly factual
     const hasAuthKeywords = /\b(login|signup|signin|signout|auth|register|jwt|bcrypt|session|cookie|token)\b/i.test(code);
     if (!hasAuthKeywords && !parsedData.evidence.some((e: any) => e.conclusion.toLowerCase().includes("authentication"))) {
       parsedData.evidence.push({
-        lines: "1-" + code.split("\n").length,
+        lines: "1-" + countLines(code),
         codeSnippet: "// Full file scan",
         conclusion: "No authentication-related code detected in this file.",
         confidence: "High"

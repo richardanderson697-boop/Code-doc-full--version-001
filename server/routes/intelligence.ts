@@ -3,7 +3,7 @@ import { Router } from "express";
 import { asyncRoute } from "../async-route";
 import fs from "fs";
 import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
-import { getWorkspaceFiles, WorkspaceFile, uploadedDir as uploadedDirPath, resolveInsideDir } from "../workspace";
+import { getWorkspaceFiles, WorkspaceFile, uploadedDir as uploadedDirPath, resolveInsideDir, countLines } from "../workspace";
 import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
 import {
   computeDeterministicAssessment,
@@ -55,7 +55,7 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
           return res.status(400).json({ error: "Files exceed the 5MB total limit." });
         }
         const label = f.path.trim().replace(/^\/+/, "").replace(/\.\./g, "").slice(0, 300) || "pasted-code.txt";
-        files.push({ path: label, content: f.content, lineCount: f.content.split("\n").length });
+        files.push({ path: label, content: f.content, lineCount: countLines(f.content) });
       }
     } else if (Array.isArray((req.body as any)?.paths) && (req.body as any).paths.length > 0) {
       // 2. paths: selected files from the user's own uploaded workspace,
@@ -76,7 +76,7 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
         if (content.length > MAX_INTEL_FILE_BYTES) {
           return res.status(400).json({ error: "One file exceeds the 1MB per-file limit." });
         }
-        files.push({ path: p, content, lineCount: content.split("\n").length });
+        files.push({ path: p, content, lineCount: countLines(content) });
       }
     } else if (fs.existsSync(uploadedDir)) {
       // 3. The whole uploaded workspace.
@@ -168,12 +168,13 @@ Your response must be returned STRICTLY in this JSON format:
 }
 
 CRITICAL RULES FOR PROJECT SCOPE ANALYSIS & INTENT DETECTION:
-0. DETERMINISTIC GROUND TRUTH (OVERRIDES YOUR JUDGMENT ON NUMBERS):
-   - The user message ends with a DETERMINISTIC GROUND TRUTH block listing the 10 category scores, the missing-features list, and the total completeness score, all computed from scan evidence. These are FINAL.
+0. DETERMINISTIC GROUND TRUTH (OVERRIDES YOUR JUDGMENT ON NUMBERS AND IMPORTS):
+   - The user message ends with a DETERMINISTIC GROUND TRUTH block listing the 10 category scores, the missing-features list, the total completeness score, and a per-file import map, all computed from scan evidence. These are FINAL.
    - You MUST copy each category's score EXACTLY into categoryScores.<key>.score (max stays 10).
    - You MUST reproduce missingFeatures EXACTLY: same feature and category strings, same order. Do not add, remove, split, or reword entries.
    - completenessScore MUST equal the exact total shown (it is the precomputed sum).
-   - Your judgment lives in the WORDS, not the numbers: write truthful, specific "reason" strings for every category and every missing feature, CITING the evidence anchors provided (file:line). Write overallSummary, fileLedger, and applicationMap from the code as usual.
+   - You MUST reproduce the import map EXACTLY in applicationMap.components[].imports: every specifier listed for a file, no additions, no drops. Match components to files by filePath.
+   - Your judgment lives in the WORDS, not the numbers: write truthful, specific "reason" strings for every category and every missing feature, CITING the evidence anchors provided (file:line). Write overallSummary, fileLedger, and the rest of applicationMap from the code as usual.
    - Do not invent scores, do not invent missing features, do not hallucinate files. If the evidence says a capability is not in scope, say so in the reason — the score already reflects it.
 0. DOMAIN INTENT & SCOPE DETECTION:
    - First, determine the application's intended domain and architectural scope by inspecting README.md, package.json description, component names, comments, and API endpoints.

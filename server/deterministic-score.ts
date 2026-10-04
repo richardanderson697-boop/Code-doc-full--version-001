@@ -64,6 +64,7 @@ export interface DeterministicAssessment {
   missingFeatures: MissingFeatureFact[];
   completenessScore: number; // exact sum of the 10 category scores
   capsApplied: string[];
+  importMap: { path: string; imports: string[] }[]; // deterministic per-file import lists
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,7 @@ interface FileSignals {
   lineCount: number;
   lower: string;
   analysis: DeterministicAnalysis;
+  imports: string[];
 }
 
 function hasWord(haystack: string, pattern: RegExp): boolean {
@@ -127,6 +129,53 @@ const API_ROUTE_FILE =
 const VENDORED_PATH =
   /(^|\/)(node_modules|dist|build|vendor|\.git|\.next|coverage)\/|__pycache__|\.min\.(js|css)$|\.bundle\.js$/i;
 
+// Deterministic import extraction: module specifiers from import/export-from/
+// require()/dynamic-import statements, with comments stripped so commented-out
+// code never pollutes the map. The LLM-written application map must reproduce
+// these lists exactly (rule 0 in the intelligence prompt).
+const IMPORT_SPEC_RE =
+  /(?:import\s+(?:[^'"`]*?\s+from\s+)?|export\s+(?:[^'"`]*?\s+from\s+)?|require\s*\(\s*|import\s*\(\s*)["'`]([^"'`]+)["'`]/g;
+
+export function extractImports(content: string): string[] {
+  const noComments = content
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/(^|[^:"'\\])\/\/[^\n]*/g, "$1");
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  IMPORT_SPEC_RE.lastIndex = 0;
+  while ((m = IMPORT_SPEC_RE.exec(noComments)) !== null) {
+    const spec = m[1].trim();
+    if (spec && !seen.has(spec)) {
+      seen.add(spec);
+      out.push(spec);
+    }
+  }
+  return out;
+}
+
+// Resolve a relative import specifier ("./x", "../y") against the importing
+// file to a workspace path, trying the usual TS/JS extension probes. Returns
+// null for bare package specifiers or unresolvable paths.
+export function resolveWorkspaceImport(
+  importerPath: string,
+  spec: string,
+  knownPaths: Set<string>
+): string | null {
+  if (!spec.startsWith(".")) return null;
+  const dir = importerPath.includes("/") ? importerPath.slice(0, importerPath.lastIndexOf("/")) : "";
+  const segs: string[] = [];
+  for (const part of ((dir ? dir + "/" : "") + spec).split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") segs.pop();
+    else segs.push(part);
+  }
+  const base = segs.join("/");
+  const candidates = [base, `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}.jsx`, `${base}/index.ts`, `${base}/index.tsx`, `${base}/index.js`];
+  for (const c of candidates) if (knownPaths.has(c)) return c;
+  return null;
+}
+
 function collectSignals(files: WorkspaceFile[]): WorkspaceSignals {
   const sorted = [...files]
     .filter((f) => !VENDORED_PATH.test(f.path))
@@ -144,7 +193,7 @@ function collectSignals(files: WorkspaceFile[]): WorkspaceSignals {
     const lower = content.toLowerCase();
     let analysis: DeterministicAnalysis;
     try {
-      analysis = runDeterministicScan(content);
+      analysis = runDeterministicScan(content, f.path);
     } catch {
       continue; // never let signal extraction break scoring
     }
@@ -167,7 +216,7 @@ function collectSignals(files: WorkspaceFile[]): WorkspaceSignals {
         packageJson = null;
       }
     }
-    out.push({ path: f.path, content, lineCount: f.lineCount, lower, analysis });
+    out.push({ path: f.path, content, lineCount: f.lineCount, lower, analysis, imports: extractImports(content) });
   }
   return { files: out, packageJson, totalEndpoints, totalStubs, totalTodos, tryCatchCount, totalCodeLines };
 }
@@ -570,6 +619,31 @@ function computeMissingFeatures(
     push("Implement missing background automation (scheduler/worker/webhook)", CATEGORY_LABELS.backgroundAutomation, autoCat.evidence);
   }
 
+  // Imported-but-empty files: the module resolves, the named import does not —
+  // the build breaks. Worse than an unused placeholder, so this outranks stubs.
+  const knownPaths = new Set(sig.files.map((f) => f.path));
+  const importTargets = new Map<string, string[]>();
+  for (const f of sig.files) {
+    for (const spec of f.imports) {
+      const target = resolveWorkspaceImport(f.path, spec, knownPaths);
+      if (target && target !== f.path) {
+        const list = importTargets.get(target) ?? [];
+        if (!list.includes(f.path)) list.push(f.path);
+        importTargets.set(target, list);
+      }
+    }
+  }
+  for (const [target, importers] of [...importTargets.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    const tf = sig.files.find((x) => x.path === target);
+    if (tf && tf.content.trim().length === 0) {
+      push(
+        "Implement " + target + " \u2014 imported by " + importers.join(", ") + " but the file is empty (breaks the build)",
+        CATEGORY_LABELS.coreLogic,
+        [target + " is empty; imported by " + importers.join(", ")]
+      );
+    }
+  }
+
   // Stubbed implementations and TODOs, file by file, line by line.
   const stubItems: { path: string; line: string; code: string }[] = [];
   const todoItems: { path: string; line: string; code: string }[] = [];
@@ -638,9 +712,17 @@ export function computeDeterministicAssessment(
     CATEGORY_KEYS.map((k) => [k, categories[k].score])
   ) as Record<CategoryKey, number>;
 
-  const missingFrontDoor =
-    categories.serverStarts.note === "missing-front-door" &&
-    (depNames(sig).includes("next") || depNames(sig).includes("react") || depNames(sig).includes("vite"));
+  // A package.json dependency list is corroboration, not a requirement: a
+  // workspace of .tsx files importing 'react' with no package.json at all is
+  // still a frontend project, and its missing front door still caps the total.
+  const looksLikeFrontend =
+    depNames(sig).includes("next") ||
+    depNames(sig).includes("react") ||
+    depNames(sig).includes("vite") ||
+    sig.files.some(
+      (f) => /\.(tsx|jsx)$/.test(f.path) && f.imports.some((spec) => spec === "react" || spec === "react-dom" || spec === "next")
+    );
+  const missingFrontDoor = categories.serverStarts.note === "missing-front-door" && looksLikeFrontend;
   if (missingFrontDoor) {
     scores = scaleToCap(scores, 30);
     capsApplied.push("CAP A (missing front door: total capped at 30)");
@@ -668,8 +750,9 @@ export function computeDeterministicAssessment(
 
   const missingFeatures = computeMissingFeatures(sig, categories);
   const completenessScore = CATEGORY_KEYS.reduce((n, k) => n + categories[k].score, 0);
+  const importMap = sig.files.map((f) => ({ path: f.path, imports: f.imports.slice(0, 40) }));
 
-  return { categories, missingFeatures, completenessScore, capsApplied };
+  return { categories, missingFeatures, completenessScore, capsApplied, importMap };
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +776,11 @@ export function formatAssessmentForPrompt(a: DeterministicAssessment): string {
     lines.push(`${i + 1}. [${m.category}] ${m.feature} — evidence: ${m.evidence.join(" | ")}`);
   });
   if (a.missingFeatures.length === 0) lines.push("(none — every referenced capability is implemented)");
+  lines.push("");
+  lines.push("Import map (deterministic \u2014 reproduce each file's import list EXACTLY in applicationMap.components[].imports; never add or drop entries):");
+  for (const e of a.importMap) {
+    lines.push("- " + e.path + ": " + (e.imports.length > 0 ? e.imports.join(" | ") : "(no imports)"));
+  }
   return lines.join("\n");
 }
 

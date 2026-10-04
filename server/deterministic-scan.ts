@@ -41,7 +41,7 @@ export interface DeterministicAnalysis {
   tests: ScanIssue[];
 }
 
-export function runDeterministicScan(code: string): DeterministicAnalysis {
+export function runDeterministicScan(code: string, filePath = ""): DeterministicAnalysis {
   // Truncate before splitting: past the byte cap the extra input adds no
   // useful evidence and only costs backtracking time.
   const bounded = code.length > MAX_SCAN_BYTES ? code.slice(0, MAX_SCAN_BYTES) : code;
@@ -101,7 +101,10 @@ export function runDeterministicScan(code: string): DeterministicAnalysis {
 
     // 5. Stubs / Mocks
     const stubKeywords = /\b(stub|mock|placeholder|temporary|simulated|hardcoded)\b/i;
-    const isMockDeclaration = /\b(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock/i.test(line) || /\bconst\s+temp/i.test(line);
+    // A file whose whole job is mock/fixture/seed data is not "unfinished"
+    // because it declares const MOCK_*: flagging it is pure noise.
+    const isMockDataFile = /(^|\/)(mock|mocks|fixture|fixtures|seed|seeds|stub|stubs)[^/]*\.(ts|tsx|js|jsx)$/i.test(filePath);
+    const isMockDeclaration = !isMockDataFile && (/\b(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock/i.test(line) || /\bconst\s+temp/i.test(line));
     const isEmptyFunction = /=>\s*\{\s*\}/.test(line) || /function\s*\w*\s*\(\s*\)\s*\{\s*\}/.test(line);
     const isTodoImplement = /TODO:\s*implement/i.test(line);
     

@@ -33,6 +33,16 @@ export interface WorkspaceFile {
   lineCount: number;
 }
 
+// Line count with no phantom lines: an empty file is 0 lines, and a trailing
+// newline does not create an extra line. (content.split("\n").length reports
+// 1 for "" and N+1 for N lines ending in "\n" — every report we emit was off
+// by one because of this.)
+export function countLines(content: string): number {
+  if (content.length === 0) return 0;
+  const withoutTrailing = content.endsWith("\n") ? content.slice(0, -1) : content;
+  return withoutTrailing.split("\n").length;
+}
+
 // Resolve a client-supplied path strictly inside `baseDir`. Returns null for
 // anything that would land on or outside the base directory: absolute paths,
 // ".." segments, or a prefix sibling like "uploaded_project-evil" (which a
@@ -85,7 +95,7 @@ export function getWorkspaceFiles(dir: string, baseDir: string = dir): Workspace
         if ([".ts", ".tsx", ".json", ".js", ".jsx", ".css", ".html", ".md"].includes(ext)) {
           try {
             const content = fs.readFileSync(filePath, "utf8");
-            const lineCount = content.split("\n").length;
+            const lineCount = countLines(content);
             results.push({
               path: relativePath,
               content,
