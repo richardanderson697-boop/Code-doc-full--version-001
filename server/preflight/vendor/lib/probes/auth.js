@@ -1262,6 +1262,42 @@ export function probeCookieFlags(files) {
 
 export function probeAPIRouteAuth(files) {
   const findings = [];
+  // Detect the project's auth stack once, so remediation text names the
+  // library the project actually uses (Supabase, not passport, for a
+  // Supabase app). Checked in priority order; first match wins.
+  let authStack = 'generic';
+  for (const sf of files) {
+    const sc = sf.content;
+    if (typeof sc !== 'string') continue;
+    if (/@supabase\/supabase-js/.test(sc) || /supabase\.auth\.getUser/.test(sc)) {
+      authStack = 'supabase';
+      break;
+    }
+    if (/\bpassport\b/.test(sc) || /jsonwebtoken/.test(sc)) {
+      authStack = 'passport';
+      break;
+    }
+    if (/next-auth|@auth\//.test(sc)) {
+      authStack = 'nextauth';
+      break;
+    }
+    if (/@clerk\//.test(sc)) {
+      authStack = 'clerk';
+      break;
+    }
+  }
+  const authRemediation = {
+    supabase:
+      'Verify the Supabase JWT from the Authorization header (e.g. const { data: { user } } = await supabase.auth.getUser(token); return 401 if !user), then derive the user id from the verified user object — never trust a userId from req.body or req.query.',
+    passport:
+      "Add passport.authenticate('jwt', { session: false }) as route middleware, then check role and resource ownership against req.user — never trust a userId from req.body or req.query.",
+    nextauth:
+      'Call getServerSession(authOptions) at the top of the handler and return 401 when there is no session — never trust a userId from req.body or req.query.',
+    clerk:
+      'Use auth() from @clerk/nextjs to get the verified userId at the top of the handler — never trust a userId from req.body or req.query.',
+    generic:
+      'Verify auth at the top of the handler: getServerSession (Next), locals.user (SvelteKit), c.get("user") (Hono), passport.authenticate (Express). Then check role and resource ownership. Never trust a userId from req.body or req.query.',
+  }[authStack];
   // Corpus-level signal: a Next.js middleware.ts/.js at the project root (or
   // src/) that matches /api/* paths is the canonical place to enforce auth
   // across many routes. When present, per-route findings would be
@@ -1471,7 +1507,7 @@ export function probeAPIRouteAuth(files) {
           line: routeLine,
           evidence: `${method} ${routePath} — no auth middleware or auth call detected in this file`,
           remediation:
-            `API routes are reachable by direct fetch from anywhere. Add authentication to ${method} ${routePath}: verify the caller at the top of the handler (e.g. passport.authenticate('jwt') for Express), then check role and resource ownership. ` +
+            `API routes are reachable by direct fetch from anywhere. Add authentication to ${method} ${routePath}: ${authRemediation} ` +
             'Manual review recommended if auth lives in middleware not visible here.',
         });
       }
@@ -1493,7 +1529,9 @@ export function probeAPIRouteAuth(files) {
           ? `Path matches sensitive pattern, no in-source auth call (gap acknowledged by comment or external gating mention)`
           : `Path matches sensitive pattern, no auth function call detected`,
         remediation:
-          'API routes are reachable by direct fetch from anywhere. Verify auth at the top of the handler: getServerSession (Next), locals.user (SvelteKit), c.get("user") (Hono), passport.authenticate (Express). Then check role and resource ownership. Manual review recommended if auth lives in middleware not visible here.',
+          'API routes are reachable by direct fetch from anywhere. ' +
+          authRemediation +
+          ' Manual review recommended if auth lives in middleware not visible here.',
       });
     }
     if (!emittedPerRoute && hasDestructiveVerb && !hasAuth) {
@@ -1514,6 +1552,90 @@ export function probeAPIRouteAuth(files) {
         remediation:
           'Mutation endpoints must verify the caller is authenticated AND authorized for the specific resource. Otherwise an unauthenticated curl can delete or modify any record. The May 2025 Lovable BOLA incident (CVE-2025-48757) is an instance of this class.',
       });
+    }
+  });
+  return findings;
+}
+
+// --- Demo / test-mode auth bypass -------------------------------------------
+//
+// A request-body flag (isDemo, demoMode, testMode, skipAuth…) that lets the
+// handler return early — before any authentication check — while the early
+// branch reaches a paid or external API. Anyone can set the flag and consume
+// API quota / invoke the provider with no login and no limit. The SecureToken
+// case: POST /api/generate reads isDemo from req.body and, when true, calls
+// Gemini and returns — skipping the userId/auth/credit checks below it.
+// A demo branch that returns mock data (no external call) is fine and does
+// not fire.
+export function probeDemoBypass(files) {
+  const findings = [];
+  const FLAG_RE = /\b(isDemo|demoMode|demo|testMode|skipAuth|bypassAuth|isTest)\b/i;
+  const EXPENSIVE_RE = /\b(gemini|openai|anthropic|cohere|generateBlueprint|stripe|sendgrid|twilio)\b|\bfetch\s*\(/i;
+  const AUTH_RE =
+    /(getServerSession|requireAuth|getUser|currentUser|withAuth|verifyToken|passport\.authenticate|supabase\.auth\.getUser|\bAuthorization\b|\bauth\s*\(\s*\))/i;
+
+  files.forEach((file) => {
+    if (isTestFile(file.path) || isScannerSelfSource(file.path)) return;
+    if (!/\.[jt]sx?$/.test(file.path)) return;
+    const c = file.content;
+    if (typeof c !== 'string') return;
+
+    const routeRe =
+      /\b(?:app|router)\s*\.\s*(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*(?:async\s*)?\(/g;
+    let rm;
+    const seen = new Set();
+    while ((rm = routeRe.exec(c)) !== null) {
+      const method = rm[1].toUpperCase();
+      const routePath = rm[2];
+      const key = `${method} ${routePath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const handlerStart = rm.index;
+      const win = c.slice(handlerStart, handlerStart + 5000);
+      const lines = win.split('\n');
+      const baseLine = c.slice(0, handlerStart).split('\n').length;
+
+      for (let i = 0; i < Math.min(40, lines.length); i++) {
+        const gate = lines[i].match(/if\s*\(\s*!?\s*([A-Za-z_$][\w$]*)\s*\)/);
+        if (!gate) continue;
+        const flagName = gate[1];
+        if (!FLAG_RE.test(flagName)) continue;
+
+        // The flag must be client-controlled (from req.body/query/params).
+        const before = lines.slice(0, i + 1).join('\n');
+        const fromRequest =
+          new RegExp(`\\b${flagName}\\b[^;\\n]*=\\s*req\\.(body|query|params)`).test(before) ||
+          new RegExp(`req\\.(body|query|params)\\b[^;\\n]*\\b${flagName}\\b`).test(before) ||
+          /\{\s*[^}]*\b(isDemo|demoMode|demo|testMode|skipAuth|bypassAuth|isTest)\b[^}]*\}\s*=\s*req\.body/i.test(
+            before
+          );
+        if (!fromRequest) continue;
+
+        // The gated branch must reach a paid/external API and return early.
+        const branch = lines.slice(i, Math.min(lines.length, i + 18)).join('\n');
+        if (!EXPENSIVE_RE.test(branch)) continue;
+        if (!/\breturn\b/.test(branch)) continue;
+
+        // No authentication check before the gate.
+        if (AUTH_RE.test(before)) continue;
+
+        findings.push({
+          id: `demo-bypass-${file.path}-${baseLine + i}`,
+          probe: 'Demo Bypass',
+          title: `Request-controlled "${flagName}" flag bypasses auth to reach a paid API (${method} ${routePath})`,
+          severity: 'high',
+          category: 'Auth & Access',
+          cwe: 'CWE-287',
+          file: file.path,
+          line: baseLine + i,
+          evidence: `if (${flagName}) returns early with a paid/external API call before any auth check; "${flagName}" comes from the request body, so anyone can set it.`,
+          remediation:
+            `Demo/test flags must not gate unauthenticated access to paid APIs. Move the "${flagName}" check behind authentication (require login even for demo, with a demo credit allowance), or put this route behind a rate limiter (e.g. N requests per IP per day). ` +
+            `Never trust a client-sent flag to skip identity verification on a billable operation.`,
+        });
+        break; // one finding per route
+      }
     }
   });
   return findings;

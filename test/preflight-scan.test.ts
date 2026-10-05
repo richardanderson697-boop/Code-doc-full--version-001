@@ -497,3 +497,62 @@ describe("probeAPIRouteAuth: per-route anchoring", () => {
     expect(hits[0].title).toMatch(/POST \/api\/reset-credits/);
   });
 });
+
+describe("probeDemoBypass: request-controlled flag skipping auth to a paid API", () => {
+  const GEN_ROUTE = `const app = express();
+app.post('/api/generate', async (req, res) => {
+  const { inputText, isDemo } = req.body;
+  if (isDemo) {
+    const { generateBlueprint } = await import('./src/services/gemini.js');
+    const result = await generateBlueprint(inputText);
+    return res.json(result);
+  }
+  res.json({ ok: true });
+});
+`;
+
+  it("flags an isDemo gate that reaches Gemini before any auth check", () => {
+    const r = runPreFlightScan([{ path: "server.ts", content: GEN_ROUTE }]);
+    const hits = r.findings.filter((f) => f.probe === "Demo Bypass");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].severity).toBe("high");
+    expect(hits[0].title).toMatch(/isDemo/);
+    expect(hits[0].title).toMatch(/POST \/api\/generate/);
+  });
+
+  it("stays silent when the demo branch returns mock data (no paid API)", () => {
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const app = express();\napp.post('/api/preview', async (req, res) => {\n  const { isDemo } = req.body;\n  if (isDemo) { return res.json({ mock: true }); }\n  res.json({ ok: true });\n});\n`,
+      },
+    ]);
+    expect(r.findings.filter((f) => f.probe === "Demo Bypass")).toHaveLength(0);
+  });
+
+  it("stays silent when auth runs before the demo gate", () => {
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const app = express();\napp.post('/api/generate', requireAuth, async (req, res) => {\n  const { isDemo } = req.body;\n  const user = getUser(req);\n  if (isDemo) { const x = await gemini.generate('y'); return res.json(x); }\n  res.json({ ok: true });\n});\n`,
+      },
+    ]);
+    expect(r.findings.filter((f) => f.probe === "Demo Bypass")).toHaveLength(0);
+  });
+});
+
+describe("probeAPIRouteAuth: library-aware remediation", () => {
+  it("names Supabase (not passport) for a Supabase project", () => {
+    const r = runPreFlightScan([
+      { path: "package.json", content: `{ "dependencies": { "@supabase/supabase-js": "^2.0.0" } }` },
+      {
+        path: "server.ts",
+        content: `import { createClient } from '@supabase/supabase-js';\nconst app = express();\napp.post('/api/checkout', (req, res) => res.send('x'));\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "API Route Auth");
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits[0].remediation).toMatch(/supabase\.auth\.getUser/);
+    expect(hits[0].remediation).not.toMatch(/passport\.authenticate/);
+  });
+});

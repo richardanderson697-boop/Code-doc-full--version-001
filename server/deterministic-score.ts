@@ -424,7 +424,20 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
   const impl = anyFile(sig, (f) => isCodeFile(f.path) && hasWord(f.content, AUTOMATION_IMPL));
   if (impl) {
-    evidence.push(`${impl.path} (scheduler/worker/webhook implementation)`);
+    // Name the actual signal so the score is explainable: a Stripe webhook
+    // handler is event-driven automation (the app processes payments without
+    // human intervention), which is what this category measures.
+    const c = impl.content;
+    const what = /webhook/i.test(c)
+      ? "webhook handler (event-driven automation)"
+      : /node-cron|cron\.schedule/i.test(c)
+        ? "cron scheduler"
+        : /bullmq|inngest|agenda|queue/i.test(c)
+          ? "job queue"
+          : /new\s+Worker/i.test(c)
+            ? "background worker"
+            : "scheduler/worker/webhook implementation";
+    evidence.push(`${impl.path}: ${what} found`);
     return { score: 10, max: 10, evidence };
   }
   const referenced = anyFile(sig, (f) => hasWord(f.content, AUTOMATION_REF) || hasWord(f.content, PAYMENT_REF));
@@ -738,6 +751,7 @@ function findingCategories(f: PreFlightFinding): CategoryKey[] {
 // but never a third category via keyword coincidence.
 const PROBE_CATEGORY_MAP: Record<string, CategoryKey[]> = {
   "API Route Auth": ["authentication", "security"],
+  "Demo Bypass": ["authentication", "security"],
   "Auth Weakness": ["authentication", "security"],
   "Admin Route Exposure": ["authentication", "security"],
   "Client Auth Storage": ["authentication", "security"],

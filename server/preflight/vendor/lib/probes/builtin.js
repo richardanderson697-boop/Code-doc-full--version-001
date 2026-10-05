@@ -23,6 +23,7 @@ export {
   probeClientAuthStorage,
   probeCookieFlags,
   probeAPIRouteAuth,
+  probeDemoBypass,
 } from './auth.js';
 export { probeMissingHeaders, probeCORS, probeSSRFOpenRedirect } from './transport.js';
 export { probeLLMSecurity, probeMCPSecurity, probeAICodeSmells } from './llm.js';
