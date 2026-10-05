@@ -46,11 +46,8 @@ ${code}`;
         temperature: 0.2, // Low temperature for high precision code healing
       },
     });
-    const healBalance = await chargeForCall(req.user!.id, extractUsage(healedResponse), modelName, "ai heal");
-    if (healBalance != null) res.set("X-Credits-Balance", String(healBalance));
-
     let healedCode = healedResponse.text || "";
-    
+
     // Clean up code formatting tags if the model ignored instructions
     if (healedCode.startsWith("```")) {
       const lines = healedCode.split("\n");
@@ -62,8 +59,20 @@ ${code}`;
       }
       healedCode = lines.join("\n");
     }
+    healedCode = healedCode.trim();
 
-    res.json({ healedCode: healedCode.trim() });
+    if (!healedCode) {
+      const finishReason = (healedResponse as any)?.candidates?.[0]?.finishReason;
+      if (finishReason === "SAFETY") {
+        throw new Error("The AI's safety filters blocked this content, so no healed code could be returned. No credits were charged.");
+      }
+      throw new Error("The AI returned an empty response, so the heal could not complete. No credits were charged — please try again.");
+    }
+
+    const chargedBalance = await chargeForCall(req.user!.id, extractUsage(healedResponse), modelName, "ai heal");
+    if (chargedBalance != null) res.set("X-Credits-Balance", String(chargedBalance));
+
+    res.json({ healedCode });
   } catch (error: any) {
     log.error("Healing API Error:", error);
     res.status(500).json({ error: formatGeminiError(error) });
