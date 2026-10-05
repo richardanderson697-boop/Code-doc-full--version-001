@@ -106,8 +106,12 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     // stubs — a comment describing simulated data is documentation, not
     // unfinished code. Only an explicit TODO: implement marker in a comment
     // counts as a stub signal.
+    // NOTE: mock declarations in *test* files are fixtures, not unfinished
+    // code — `const mockBlueprint = {...}` in orchestration.test.ts is the
+    // test doing its job.
     const isMockDataFile = /(^|\/)(mock|mocks|fixture|fixtures|seed|seeds|stub|stubs)[^/]*\.(ts|tsx|js|jsx)$/i.test(filePath);
-    const isMockDeclaration = !isMockDataFile && (/\b(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock/i.test(line) || /\bconst\s+temp/i.test(line));
+    const isTestFile = /(^|\/)(__tests__|__test__|tests?|testdata|cypress|e2e|playwright|__mocks__|mocks?)\/|\.(test|spec)\.[jt]sx?$/i.test(filePath);
+    const isMockDeclaration = !isMockDataFile && !isTestFile && (/\b(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock/i.test(line) || /\bconst\s+temp/i.test(line));
     const isEmptyFunction = /=>\s*\{\s*\}/.test(line) || /function\s*\w*\s*\(\s*\)\s*\{\s*\}/.test(line);
     const isTodoImplement = /TODO:\s*implement/i.test(line);
 

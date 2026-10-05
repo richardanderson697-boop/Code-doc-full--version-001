@@ -1433,7 +1433,48 @@ export function probeAPIRouteAuth(files) {
     const sensitiveSeverity = hasAuthAcknowledgmentComment ? 'medium' : 'critical';
     const destructiveSeverity = hasAuthAcknowledgmentComment ? 'medium' : 'high';
 
-    if (isSensitivePath && !hasAuth) {
+    // Per-route anchoring for Express-like files: one finding per sensitive /
+    // destructive route, anchored at the route's line, instead of a single
+    // file-level finding at line 1. Same firing conditions (no auth signal
+    // anywhere in the file); only the anchor and evidence get specific, so
+    // the fix step is shown the actual handler.
+    let emittedPerRoute = false;
+    if (isExpressLike && !hasAuth) {
+      const routeRe = /\b(?:app|router)\s*\.\s*(get|post|put|patch|delete|use|all)\s*\(\s*['"`]([^'"`]+)['"`]/gi;
+      const seenRoutes = new Set();
+      let rm;
+      while ((rm = routeRe.exec(c)) !== null) {
+        const method = rm[1].toUpperCase();
+        const routePath = rm[2];
+        const routeKey = `${method} ${routePath}`;
+        if (seenRoutes.has(routeKey)) continue;
+        seenRoutes.add(routeKey);
+        const routeSensitive = sensitiveKw.test(routePath);
+        const routeDestructive = method === 'DELETE' || method === 'PUT' || method === 'PATCH';
+        if (!routeSensitive && !routeDestructive) continue;
+        const routeLine = c.slice(0, rm.index).split('\n').length;
+        const sev = routeSensitive ? sensitiveSeverity : destructiveSeverity;
+        emittedPerRoute = true;
+        findings.push({
+          id: `api-noauth-${file.path}-${routeLine}`,
+          probe: 'API Route Auth',
+          title: hasAuthAcknowledgmentComment
+            ? `${method} ${routePath} without static auth check (TODO/FIXME/CDN-gated)`
+            : `${method} ${routePath} without auth check`,
+          severity: sev,
+          category: 'Auth & Access',
+          cwe: 'CWE-306',
+          file: file.path,
+          line: routeLine,
+          evidence: `${method} ${routePath} — no auth middleware or auth call detected in this file`,
+          remediation:
+            `API routes are reachable by direct fetch from anywhere. Add authentication to ${method} ${routePath}: verify the caller at the top of the handler (e.g. passport.authenticate('jwt') for Express), then check role and resource ownership. ` +
+            'Manual review recommended if auth lives in middleware not visible here.',
+        });
+      }
+    }
+
+    if (!emittedPerRoute && isSensitivePath && !hasAuth) {
       findings.push({
         id: `api-noauth-${file.path}`,
         probe: 'API Route Auth',
@@ -1452,7 +1493,7 @@ export function probeAPIRouteAuth(files) {
           'API routes are reachable by direct fetch from anywhere. Verify auth at the top of the handler: getServerSession (Next), locals.user (SvelteKit), c.get("user") (Hono), passport.authenticate (Express). Then check role and resource ownership. Manual review recommended if auth lives in middleware not visible here.',
       });
     }
-    if (hasDestructiveVerb && !hasAuth) {
+    if (!emittedPerRoute && hasDestructiveVerb && !hasAuth) {
       findings.push({
         id: `api-destructive-${file.path}`,
         probe: 'API Route Auth',

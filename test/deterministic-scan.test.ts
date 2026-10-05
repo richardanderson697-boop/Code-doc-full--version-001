@@ -75,4 +75,12 @@ describe("runDeterministicScan", () => {
     const s = runDeterministicScan(`const mockUsers = [{ id: 1 }];`, "src/App.tsx");
     expect(s.stubCount).toBe(1);
   });
+
+  it("does not flag mock declarations in test files (fixtures, not stubs)", () => {
+    const s = runDeterministicScan(
+      `const mockBlueprint = { title: "t" };\ndescribe("x", () => { it("works", () => { expect(mockBlueprint.title).toBe("t"); }); });`,
+      "src/__tests__/orchestration.test.ts"
+    );
+    expect(s.stubCount).toBe(0);
+  });
 });

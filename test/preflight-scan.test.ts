@@ -360,3 +360,55 @@ describe("probeSupabaseServiceRole: admin client bypasses RLS", () => {
     expect(r.findings.filter((f) => f.probe === "Supabase Service Role")).toHaveLength(0);
   });
 });
+
+describe("probeAPIRouteAuth: per-route anchoring", () => {
+  it("anchors findings at the route line, not line 1, for Express files", () => {
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `import express from 'express';\nconst app = express();\napp.post('/api/create-checkout-session', async (req, res) => {\n  res.json({});\n});\napp.get('/api/health', (req, res) => res.send('ok'));\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "API Route Auth");
+    // /api/create-checkout-session is sensitive (checkout) -> one finding at line 3.
+    // /api/health is not sensitive and GET is not destructive -> no finding.
+    expect(hits).toHaveLength(1);
+    expect(hits[0].line).toBe(3);
+    expect(hits[0].title).toMatch(/POST \/api\/create-checkout-session/);
+    expect(hits[0].severity).toBe("critical");
+  });
+
+  it("emits one finding per unauthenticated sensitive route", () => {
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const app = express();\napp.post('/api/checkout', (req, res) => res.send('x'));\napp.post('/api/billing', (req, res) => res.send('y'));\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "API Route Auth");
+    expect(hits).toHaveLength(2);
+    expect(hits.map((h) => h.line).sort()).toEqual([2, 3]);
+  });
+
+  it("keeps file-level anchoring for non-Express route files", () => {
+    const r = runPreFlightScan([
+      {
+        path: "app/api/admin/route.ts",
+        content: `export async function POST(req: Request) {\n  return Response.json({});\n}\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "API Route Auth");
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits[0].line).toBe(1);
+  });
+
+  it("stays silent when the file has an auth signal", () => {
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const app = express();\napp.post('/api/checkout', requireAuth, (req, res) => res.send('x'));\n`,
+      },
+    ]);
+    expect(r.findings.filter((f) => f.probe === "API Route Auth")).toHaveLength(0);
+  });
+});
