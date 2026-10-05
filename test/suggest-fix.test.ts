@@ -209,3 +209,37 @@ describe("dev handoff packet renderer", () => {
     expect(markdown).toMatch(/No effort estimates are included in v1/);
   });
 });
+
+describe("dev handoff packet fence safety", () => {
+  it("keeps model-emitted fences inside evidence from breaking the packet", () => {
+    // Real-world case: the model returned the evidence already wrapped in its
+    // own fenced block. The packet must lengthen its outer fence instead of
+    // nesting triple fences (which rendered as a garbled block).
+    const packet = renderDevHandoffPacket({
+      product: "GradeVibes",
+      finding: {
+        title: FINDING.message,
+        message: FINDING.message,
+        severity: FINDING.severity,
+        type: FINDING.type,
+        file: "server.ts",
+        line: 1,
+        suggestion: FINDING.suggestion,
+      },
+      fix: {
+        ...MODEL_FIX,
+        evidence:
+          "File: server.ts:1\n```typescript\napp.use('/api/sensitive-data', sensitiveDataRouter);\n```",
+      },
+      generatedAt: "2026-10-05T12:00:00.000Z",
+    });
+    // Outer fence is lengthened past the embedded triple fences...
+    expect(packet).toContain("````");
+    // ...and the snippet survives intact, fences included.
+    expect(packet).toContain("```typescript");
+    expect(packet).toContain("app.use('/api/sensitive-data', sensitiveDataRouter);");
+    // Fences stay balanced: every opened block is closed.
+    const fenceLines = packet.split("\n").filter((l) => /^`{3,}/.test(l.trim()));
+    expect(fenceLines.length % 2).toBe(0);
+  });
+});

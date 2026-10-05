@@ -36,14 +36,17 @@ export interface DevHandoffPacketInput {
   generatedAt: string;
 }
 
-/** Strip one layer of markdown code fences so a diff can be safely embedded
- *  inside the packet's own fenced block. */
-function unfence(text: string): string {
-  const lines = String(text ?? "").split("\n");
-  if (lines.length >= 2 && lines[0].trim().startsWith("```")) lines.shift();
-  while (lines.length && lines[lines.length - 1].trim() === "```") lines.pop();
-  if (lines.length && lines[lines.length - 1].trim().startsWith("```")) lines.pop();
-  return lines.join("\n").trim();
+/** Wrap content in a fenced block whose fence is one backtick longer than the
+ *  longest backtick run inside the content. Model-emitted fences (e.g. an
+ *  evidence snippet that arrives as "File: x\n```ts\ncode\n```") can therefore
+ *  never break the packet's own blocks, and the content is preserved exactly
+ *  instead of being stripped. */
+function fenceBlock(content: string, info: string): string {
+  const text = String(content ?? "").trim();
+  let longest = 0;
+  for (const m of text.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return [info ? fence + info : fence, text, fence].join("\n");
 }
 
 function lineAnchor(file: string, line: number | null): string {
@@ -84,17 +87,13 @@ export function renderDevHandoffPacket(input: DevHandoffPacketInput): string {
     ``,
     `\`${anchor}\``,
     ``,
-    "```",
-    unfence(fix.evidence),
-    "```",
+    fenceBlock(fix.evidence, ""),
     ``,
     `## Suggested remediation`,
     ``,
     `The diff below is a suggestion only — it has not been applied to your code.`,
     ``,
-    "```diff",
-    unfence(fix.remediationDiff),
-    "```",
+    fenceBlock(fix.remediationDiff, "diff"),
     ``,
     `## How to verify the fix`,
     ``,

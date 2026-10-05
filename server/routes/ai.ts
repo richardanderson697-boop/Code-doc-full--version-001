@@ -105,6 +105,7 @@ Hard rules:
 - Output raw JSON only. No markdown fences, no prose before or after the JSON.
 - NEVER include effort estimates: no hours, no story points, no t-shirt sizes, no "easy", "hard", or "trivial", no timelines.
 - If the finding looks like a false positive or cannot be fixed in code, say so in plainEnglishIssue and explain why instead of inventing a diff.
+- If the fix references a symbol, import, or middleware that is not visible in the provided code context, say so explicitly in the remediation (e.g. "assumes requireAuth is already imported in this file — add the import if it is not") instead of silently assuming it exists.
 - The audience is a developer who will review this suggestion, not a machine applying it.`;
 
     const fixPrompt = `Finding type: "${type || "unknown"}"
