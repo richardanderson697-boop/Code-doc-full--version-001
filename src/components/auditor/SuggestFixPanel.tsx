@@ -44,6 +44,7 @@ export default function SuggestFixPanel({ finding, codeContext }: SuggestFixPane
   const [phase, setPhase] = useState<Phase>("idle");
   const [fix, setFix] = useState<SuggestedFix | null>(null);
   const [insufficientNote, setInsufficientNote] = useState<string | null>(null);
+  const [insufficientFileFound, setInsufficientFileFound] = useState(false);
   const [error, setError] = useState("");
 
   const handleSuggest = async () => {
@@ -51,6 +52,7 @@ export default function SuggestFixPanel({ finding, codeContext }: SuggestFixPane
     setPhase("loading");
     setError("");
     setInsufficientNote(null);
+    setInsufficientFileFound(false);
     try {
       const res = await apiFetch("/api/suggest-fix", {
         method: "POST",
@@ -74,6 +76,7 @@ export default function SuggestFixPanel({ finding, codeContext }: SuggestFixPane
         // The model honestly declined: the flagged code wasn't visible, so it
         // refused to invent a fix. No credits were charged.
         setFix(null);
+        setInsufficientFileFound(data.workspaceFileFound === true);
         setInsufficientNote(
           data.suggestion?.plainEnglishIssue ||
             "Not enough of the flagged code was available to suggest a safe fix, so none was written."
@@ -153,8 +156,10 @@ export default function SuggestFixPanel({ finding, codeContext }: SuggestFixPane
         </p>
         <p className="text-[11px] text-slate-300 leading-relaxed select-text">{insufficientNote}</p>
         <p className="text-[10px] text-slate-500 leading-relaxed">
-          Rather than invent a fix against code it couldn't see, the model declined. No credits were charged.
-          Re-run this on the finding with its file present in the workspace for a concrete suggestion.
+          Rather than invent a fix against code it couldn't see, the model declined. No credits were charged.{" "}
+          {insufficientFileFound
+            ? "The file is already in your workspace — the flagged section itself couldn't be shown to the model (it may sit outside the visible window or the finding's line may not match the file)."
+            : "Re-run this on the finding with its file present in the workspace for a concrete suggestion."}
         </p>
         <button
           type="button"

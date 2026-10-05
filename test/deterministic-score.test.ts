@@ -169,6 +169,7 @@ describe("deterministic scoring", () => {
     const a = computeDeterministicAssessment(HEALTHY_NEXT, emptyPreflight());
     expect(Object.keys(a.categories).sort()).toEqual([...CATEGORY_KEYS].sort());
     let sum = 0;
+    let applicable = 0;
     for (const k of CATEGORY_KEYS) {
       const c = a.categories[k];
       expect(Number.isInteger(c.score)).toBe(true);
@@ -176,9 +177,13 @@ describe("deterministic scoring", () => {
       expect(c.score).toBeLessThanOrEqual(10);
       expect(c.max).toBe(10);
       expect(c.evidence.length).toBeGreaterThan(0);
-      sum += c.score;
+      if (c.applicable !== false) {
+        sum += c.score;
+        applicable++;
+      }
     }
-    expect(a.completenessScore).toBe(sum);
+    expect(a.applicableCount).toBe(applicable);
+    expect(a.completenessScore).toBe(Math.round((sum / (applicable * 10)) * 100));
   });
 
   it("rewards a complete Next.js app", () => {
@@ -256,7 +261,12 @@ describe("deterministic scoring", () => {
     const text = formatAssessmentForPrompt(a);
     expect(text).toContain(`Total completeness score: ${a.completenessScore}/100`);
     for (const k of CATEGORY_KEYS) {
-      expect(text).toContain(`${k}: ${a.categories[k].score}/10`);
+      const c = a.categories[k];
+      if (c.applicable === false) {
+        expect(text).toContain(`${k}: N/A`);
+      } else {
+        expect(text).toContain(`${k}: ${c.score}/10`);
+      }
     }
   });
 
@@ -410,10 +420,82 @@ describe("finding/category reconciliation (both checks rule)", () => {
     expect(a.capsApplied.join(" ")).not.toMatch(/reconciliation/i);
   });
 
-  it("keeps the total as the exact sum after reconciliation", () => {
+  it("keeps the total as the rescaled sum over applicable categories", () => {
     const a = computeDeterministicAssessment(AUTH_FILES, preflightWith([finding({})]));
-    let sum = 0;
-    for (const k of CATEGORY_KEYS) sum += a.categories[k].score;
-    expect(a.completenessScore).toBe(sum);
+    const applicable = CATEGORY_KEYS.filter((k) => a.categories[k].applicable !== false);
+    const sum = applicable.reduce((n, k) => n + a.categories[k].score, 0);
+    expect(a.completenessScore).toBe(Math.round((sum / (applicable.length * 10)) * 100));
+  });
+
+  it("caps databaseLayer on a high Supabase service_role finding", () => {
+    const dbFiles = [
+      wf("server/db.ts", `import { createClient } from '@supabase/supabase-js';\nexport const db = createClient(url, key);\n`),
+    ];
+    const a = computeDeterministicAssessment(
+      dbFiles,
+      preflightWith([
+        finding({
+          severity: "high",
+          probe: "Supabase Service Role",
+          title: 'Supabase client "db" is initialized with the service_role key — bypasses Row Level Security',
+          file: "server/db.ts",
+          cwe: "CWE-284",
+        }),
+      ])
+    );
+    expect(a.categories.databaseLayer.score).toBeLessThanOrEqual(6);
+    expect(a.capsApplied.join(" ")).toMatch(/reconciliation/i);
+  });
+});
+
+describe("backgroundAutomation N/A (rule-based, never model judgment)", () => {
+  const BARE_FILES = [wf("src/App.tsx", `export default function App() { return null; }\n`)];
+
+  it("marks the category N/A when no automation code, reference, or dependency exists", () => {
+    const a = computeDeterministicAssessment(BARE_FILES, emptyPreflight());
+    const cat = a.categories.backgroundAutomation;
+    expect(cat.applicable).toBe(false);
+    expect(cat.score).toBe(0);
+    expect(cat.note).toBe("not-applicable");
+    expect(a.applicableCount).toBe(9);
+  });
+
+  it("rescales the total over the applicable categories", () => {
+    const a = computeDeterministicAssessment(BARE_FILES, emptyPreflight());
+    const applicable = CATEGORY_KEYS.filter((k) => a.categories[k].applicable !== false);
+    const sum = applicable.reduce((n, k) => n + a.categories[k].score, 0);
+    expect(a.completenessScore).toBe(Math.round((sum / (applicable.length * 10)) * 100));
+    // N/A must not inflate the total: it is excluded, not scored 10.
+    expect(a.completenessScore).toBeLessThanOrEqual(100);
+  });
+
+  it("stays applicable (dangling, score 3) when a queue dependency exists without usage", () => {
+    const files = [
+      wf("package.json", `{ "dependencies": { "bullmq": "^5.0.0" } }`),
+      wf("src/App.tsx", `export default function App() { return null; }\n`),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    const cat = a.categories.backgroundAutomation;
+    expect(cat.applicable).not.toBe(false);
+    expect(cat.note).toBe("dangling-automation");
+    expect(cat.score).toBe(3);
+    expect(a.applicableCount).toBe(10);
+  });
+
+  it("stays applicable (score 10) when a scheduler is implemented", () => {
+    const files = [
+      wf("server/cron.ts", `import cron from 'node-cron';\ncron.schedule('* * * * *', () => console.log('tick'));\n`),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    const cat = a.categories.backgroundAutomation;
+    expect(cat.applicable).not.toBe(false);
+    expect(cat.score).toBe(10);
+  });
+
+  it("renders N/A in the prompt ground truth", () => {
+    const a = computeDeterministicAssessment(BARE_FILES, emptyPreflight());
+    const prompt = formatAssessmentForPrompt(a);
+    expect(prompt).toMatch(/backgroundAutomation: N\/A/);
+    expect(prompt).toMatch(/9 applicable/);
   });
 });

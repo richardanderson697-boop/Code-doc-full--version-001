@@ -8,7 +8,7 @@
 // and every other caller keep importing from here unchanged.
 
 export { probeSecrets, probeNextPublic, probeEnvFiles } from './secrets-config.js';
-export { probeSupabaseRLS, probeFirebaseRules } from './database.js';
+export { probeSupabaseRLS, probeSupabaseServiceRole, probeFirebaseRules } from './database.js';
 export {
   probePackageJson,
   probeCompromisedPackages,

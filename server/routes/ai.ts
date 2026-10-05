@@ -13,7 +13,7 @@ import {
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
-import { getWorkspaceFile } from "../workspace-store";
+import { getWorkspaceFile, listWorkspaceFiles } from "../workspace-store";
 
 const router = Router();
 
@@ -115,8 +115,22 @@ Hard rules:
     // so the model patches actual code instead of inventing routes/handlers.
     // Falls back to the scanner-provided snippet when the file isn't stored.
     let effectiveContext = codeContext || "";
+    let workspaceFileFound = false;
     try {
-      const row = await getWorkspaceFile(req.user!.id, String(file));
+      const wanted = String(file);
+      let row = await getWorkspaceFile(req.user!.id, wanted);
+      if (!row) {
+        // The finding's path may be a suffix of the stored path
+        // ("server.ts" vs "SecureToken-AI-main/server.ts"). A single
+        // unambiguous suffix match is the same file; several matches is a
+        // guess, so fall back to the snippet instead.
+        const suffix = "/" + wanted.replace(/^\/+/, "");
+        const matches = (await listWorkspaceFiles(req.user!.id)).filter(
+          (f) => f.path === wanted || f.path.endsWith(suffix)
+        );
+        if (matches.length === 1) row = matches[0];
+      }
+      workspaceFileFound = !!row?.content;
       const content = row?.content || "";
       if (content) {
         const allLines = content.split("\n");
@@ -205,7 +219,10 @@ ${effectiveContext || "(no code context available)"}`;
 
     if (insufficient) {
       // An honest "I can't see the code" is not a delivered fix: no charge.
-      return res.json({ suggestion: fix, insufficientContext: true });
+      // workspaceFileFound tells the client whether the "add the file to the
+      // workspace" hint applies — the file is often already there and the
+      // flagged section was truncated or unlocatable instead.
+      return res.json({ suggestion: fix, insufficientContext: true, workspaceFileFound });
     }
 
     const fixBalance = await chargeForCall(req.user!.id, extractUsage(fixResponse), modelName, "ai suggest-fix");

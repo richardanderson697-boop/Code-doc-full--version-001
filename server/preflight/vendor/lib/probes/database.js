@@ -262,6 +262,63 @@ export function probeSupabaseRLS(files) {
   return findings;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Supabase service_role / admin client (RLS bypass)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A Supabase client created with the service_role key bypasses Row Level
+// Security entirely: RLS policies do not apply to its queries, on any table.
+// When the server does everything through the admin client, per-table RLS
+// findings understate the exposure — the whole database is reachable through
+// that handle. The key argument is the signal: service_role in the
+// createClient() call, or a handle named *admin* (naming is intent).
+export function probeSupabaseServiceRole(files) {
+  const findings = [];
+  const { isSupabaseProject } = collectSupabaseHandles(files);
+  if (!isSupabaseProject) return findings;
+  const seen = new Set();
+  for (const file of files || []) {
+    const path = file?.path || '';
+    const content = file?.content || '';
+    if (!/\.[jt]sx?$/i.test(path) || isTestFile(path)) continue;
+    for (const m of content.matchAll(
+      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:createClient|createServerClient|createRouteHandlerClient|createMiddlewareClient)\s*\(([^)]{0,500})\)/g
+    )) {
+      const handle = m[1];
+      const args = m[2];
+      const usesServiceRole = /service_role/i.test(args);
+      const namedAdmin = /admin/i.test(handle);
+      if (!usesServiceRole && !namedAdmin) continue;
+      const key = `${path}:${handle}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const line = content.slice(0, m.index).split('\n').length;
+      findings.push({
+        id: `supabase-service-role-${path}-${line}`,
+        probe: 'Supabase Service Role',
+        title: usesServiceRole
+          ? `Supabase client "${handle}" is initialized with the service_role key — bypasses Row Level Security`
+          : `Supabase client "${handle}" is named as an admin client — verify it does not use the service_role key`,
+        severity: usesServiceRole ? 'high' : 'medium',
+        category: 'Data Breach',
+        cwe: 'CWE-284',
+        file: path,
+        line,
+        evidence: m[0].replace(/\s+/g, ' ').slice(0, 180),
+        remediation: [
+          'The service_role key skips every RLS policy on every table: any query through this client reads and writes as a superuser, regardless of what the migrations enable.',
+          'If this client serves browser traffic (directly or through an API route that forwards user input), every table it touches is effectively public to anyone who can reach that route.',
+          'Use the anon key with RLS policies for anything user-reachable, and confine the service_role client to trusted server-side code paths (migrations, admin jobs) that never take unsanitized user input as a table or filter.',
+          namedAdmin && !usesServiceRole
+            ? `This finding fired on the handle name "${handle}" — if it actually uses the anon key, rename it to stop tripping the scanner.`
+            : 'Rotate the service_role key if it has ever appeared in client-side code, logs, or error messages.',
+        ].join('\n\n'),
+      });
+    }
+  }
+  return findings;
+}
+
 export function probeFirebaseRules(files) {
   const findings = [];
   files.forEach((file) => {

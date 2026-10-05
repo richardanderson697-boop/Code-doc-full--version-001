@@ -389,6 +389,12 @@ const LHS_SECURITY_NAME_RE =
   /(?:const|let|var)\s+(\w*(?:token|secret|password|nonce|csrf|otp|key|salt|iv|hash|uuid|pin|api[_-]?key|jwt|sid|bearer|magic|invite|session|access[_-]?code|coupon[_-]?code|discount[_-]?code)\w*)\s*[:=]/i;
 const LHS_UI_NAME_RE =
   /(?:const|let|var)\s+(\w*(?:width|height|opacity|hue|tone|jitter|wobble|bucket|sample|delay|fade|chart|axis|mesh|particle|bullet|color)\w*)\s*[:=]/i;
+// LHS names that are clearly organizational identifiers, not authenticators:
+// a "label", "slug" or "suffix" is a unique display/lookup string, not a
+// secret. Suppresses the "unique label" false positive without touching
+// real signals (security-named LHS still forces a fire, checked first).
+const LHS_BENIGN_NAME_RE =
+  /(?:const|let|var)\s+(\w*(?:label|slug|suffix|prefix)\w*)\s*[:=]/i;
 
 export function probeWeakRandomness(files) {
   const findings = [];
@@ -435,6 +441,7 @@ export function probeWeakRandomness(files) {
       const lhsUi = LHS_UI_NAME_RE.test(line);
 
       if (lhsUi) return; // animation / preview LHS; suppress.
+      if (!lhsSecurity && LHS_BENIGN_NAME_RE.test(line)) return; // label/slug/suffix LHS; suppress.
 
       if (!lhsSecurity) {
         // Fall back to the original window check.

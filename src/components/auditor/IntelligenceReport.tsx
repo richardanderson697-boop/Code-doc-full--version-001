@@ -73,6 +73,9 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                     <span className="text-[10px] uppercase font-bold tracking-wider text-indigo-300 font-mono flex items-center gap-1">
                       <Brain className="w-3.5 h-3.5 animate-pulse" /> Workspace Project Map Active
                     </span>
+                    <span className="text-[9px] font-mono text-slate-500 border border-slate-800 rounded px-1.5 py-0.5 ml-1">
+                      Static analysis — no code was executed
+                    </span>
                   </div>
                   <button
                     type="button"
@@ -149,6 +152,11 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                         <p className="text-slate-500 text-[10px] mt-0.5 leading-tight">
                           Evaluated across the entire workspace (Backend server, Frontend logic, APIs, and layouts combined)
                         </p>
+                        {intelResult.applicableCategories != null && intelResult.applicableCategories < 10 && (
+                          <p className="text-slate-400 text-[10px] mt-0.5 leading-tight font-mono">
+                            {intelResult.applicableCategories} of 10 categories applicable — total rescaled
+                          </p>
+                        )}
                       </div>
                       <div className="flex flex-col items-end">
                         <span className={`text-xl font-bold font-mono tracking-tight ${
@@ -199,6 +207,7 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                             { key: "documentationVerified", label: "Documentation / verified", val: intelResult.categoryScores.documentationVerified }
                           ].map((item, idx) => {
                             const val = item.val || { score: 10, max: 10, reason: "Not required/applicable for this application's design scope" };
+                            const isNA = val.applicable === false;
                             const isExpanded = expandedCategory === `intel_${item.key}`;
                             return (
                               <div key={item.key} className="flex flex-col transition-colors">
@@ -224,8 +233,8 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                                   <div className="flex items-center gap-6 font-mono font-semibold">
                                     <span className="text-slate-500 w-6 text-right">{val.max}</span>
                                     <span className={`w-8 text-right font-bold ${
-                                      val.score >= 8 ? "text-emerald-400" : val.score >= 5 ? "text-amber-400" : "text-rose-400"
-                                    }`}>{val.score}</span>
+                                      isNA ? "text-slate-500" : val.score >= 8 ? "text-emerald-400" : val.score >= 5 ? "text-amber-400" : "text-rose-400"
+                                    }`}>{isNA ? "N/A" : val.score}</span>
                                   </div>
                                 </button>
                                 

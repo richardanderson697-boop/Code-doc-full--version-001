@@ -174,6 +174,7 @@ CRITICAL RULES FOR PROJECT SCOPE ANALYSIS & INTENT DETECTION:
 0. DETERMINISTIC GROUND TRUTH (OVERRIDES YOUR JUDGMENT ON NUMBERS AND IMPORTS):
    - The user message ends with a DETERMINISTIC GROUND TRUTH block listing the 10 category scores, the missing-features list, the total completeness score, and a per-file import map, all computed from scan evidence. These are FINAL.
    - You MUST copy each category's score EXACTLY into categoryScores.<key>.score (max stays 10).
+   - If the ground truth marks a category N/A, write score 0 for it and state in the reason that the category is not applicable to this project (the server replaces it with the N/A marker).
    - You MUST reproduce missingFeatures EXACTLY: same feature and category strings, same order. Do not add, remove, split, or reword entries.
    - completenessScore MUST equal the exact total shown (it is the precomputed sum).
    - You MUST reproduce the import map EXACTLY in applicationMap.components[].imports: every specifier listed for a file, no additions, no drops. Match components to files by filePath.
@@ -205,11 +206,11 @@ CRITICAL RULES FOR PROJECT SCOPE ANALYSIS & INTENT DETECTION:
    - documentationVerified: Rate TypeScript interfaces, comments, and file descriptions.
 
 5. ACCURATE SCORING HARD-CAPS (MANDATORY):
-   - CAP A (Missing Front Door / Routing): If the frontend is largely missing, lacks core page-level views/routes, or lacks main routing files (e.g., has isolated standalone components like ReferralStats or NegotiationReport but lacks app/page.tsx or app/layout.tsx to mount and route them), the total completenessScore MUST BE COERCED AND HARD-CAPPED AT A MAXIMUM OF 30/100. Lower category scores (like serverStarts and coreLogic) proportionally so that the sum of all 10 categories exactly equals this capped score.
+   - CAP A (Missing Front Door / Routing): If the frontend is largely missing, lacks core page-level views/routes, or lacks main routing files (e.g., has isolated standalone components like ReferralStats or NegotiationReport but lacks app/page.tsx or app/layout.tsx to mount and route them), the total completenessScore MUST BE COERCED AND HARD-CAPPED AT A MAXIMUM OF 30/100. Lower category scores (like serverStarts and coreLogic) proportionally.
    - CAP B (Incomplete API Infrastructure): If the ecosystem lists features like user logins, credit balances, purchases, and webhooks, but only has ONE single API endpoint actually implemented (e.g. /api/analyze), the total completenessScore MUST BE HARD-CAPPED AT A MAXIMUM OF 45/100.
    - CAP C (Broken Loop / Missing Webhooks): If helper utilities like Stripe clients are present but critical webhooks (like /api/stripe/webhook or similar) are missing, deduct at least 4 points from externalIntegrations and databaseLayer.
    
-The total completenessScore must be exactly the sum of these 10 category scores. Keep the assessment professional, objective, realistic, and critical. A developer or stakeholder reading this report should find it 100% accurate regarding launch readiness. Do not invent or hallucinate files.`;
+The total completenessScore is computed server-side (rescaled over the applicable categories) — reproduce the exact total shown in the ground truth block. Keep the assessment professional, objective, realistic, and critical. Every claim in the reasons must cite evidence from the code provided; do not invent or hallucinate files.`;
 
     const INTEL_SCHEMA = {
       type: "OBJECT",
@@ -370,9 +371,12 @@ The total completenessScore must be exactly the sum of these 10 category scores.
     if (parsedIntel.categoryScores && typeof parsedIntel.categoryScores === "object") {
       for (const key of CATEGORY_KEYS) {
         const cat = parsedIntel.categoryScores[key] || {};
+        const det = assessment.categories[key];
+        const applicable = det.applicable !== false;
         parsedIntel.categoryScores[key] = {
-          score: assessment.categories[key].score,
+          score: applicable ? det.score : null,
           max: 10,
+          applicable,
           reason:
             typeof cat.reason === "string" && cat.reason.trim().length > 0
               ? cat.reason
@@ -381,6 +385,9 @@ The total completenessScore must be exactly the sum of these 10 category scores.
       }
     }
     parsedIntel.completenessScore = assessment.completenessScore;
+    // How many of the 10 rubric categories apply — the client shows
+    // "N of 10 categories applicable" so the rescaling is never hidden.
+    parsedIntel.applicableCategories = assessment.applicableCount;
     {
       const modelMissing = Array.isArray(parsedIntel.missingFeatures) ? parsedIntel.missingFeatures : [];
       const reasonByFeature = new Map<string, string>();

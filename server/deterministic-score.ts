@@ -51,6 +51,9 @@ export interface CategoryResult {
   max: 10;
   evidence: string[]; // file:line anchors and signal descriptions
   note?: string; // e.g. "not in scope by design"
+  applicable?: boolean; // false = N/A: the category does not apply to this project
+  // by rule (not by model judgment) and is excluded from totals. Undefined
+  // means applicable.
 }
 
 export interface MissingFeatureFact {
@@ -62,7 +65,8 @@ export interface MissingFeatureFact {
 export interface DeterministicAssessment {
   categories: Record<CategoryKey, CategoryResult>;
   missingFeatures: MissingFeatureFact[];
-  completenessScore: number; // exact sum of the 10 category scores
+  completenessScore: number; // rescaled to 0-100 over the applicable categories
+  applicableCount: number; // how many of the 10 categories apply (for "N of 10" display)
   capsApplied: string[];
   importMap: { path: string; imports: string[] }[]; // deterministic per-file import lists
 }
@@ -421,12 +425,21 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
     return { score: 10, max: 10, evidence };
   }
   const referenced = anyFile(sig, (f) => hasWord(f.content, AUTOMATION_REF) || hasWord(f.content, PAYMENT_REF));
-  if (referenced) {
-    evidence.push(`${referenced.path} references automation/webhooks with no implementation`);
+  // A scheduler/queue/worker dependency with no code usage yet still counts
+  // as "in scope" — the rule is "no such dependency anywhere", not "no import".
+  const automationDep = depNames(sig).some((d) => /(cron|bull|queue|worker|schedule|inngest|agenda)/i.test(d));
+  if (referenced || automationDep) {
+    if (automationDep && !referenced) evidence.push(`package.json depends on automation (${depNames(sig).filter((d) => /(cron|bull|queue|worker|schedule|inngest|agenda)/i.test(d)).join(", ")}) with no implementation`);
+    else evidence.push(`${referenced!.path} references automation/webhooks with no implementation`);
     return { score: 3, max: 10, evidence, note: "dangling-automation" };
   }
-  evidence.push("no automation code and no automation references — not in scope by design");
-  return { score: 10, max: 10, evidence, note: "not-in-scope" };
+  // Rule-based N/A (never model judgment): no scheduler/queue/worker/cron
+  // implementation in code AND no such reference or dependency anywhere.
+  // Scoring this 10/10 would read as "excellent automation" for an app that
+  // has none; it is excluded from the total instead, and the total is
+  // rescaled over the applicable categories.
+  evidence.push("no scheduler, queue, worker, cron, or webhook code or dependencies found — not applicable");
+  return { score: 0, max: 10, evidence, note: "not-applicable", applicable: false };
 }
 
 function scoreExternalIntegrations(sig: WorkspaceSignals): CategoryResult {
@@ -554,11 +567,12 @@ function stripePresentWithoutWebhook(sig: WorkspaceSignals): boolean {
 // deterministically (fractional part desc, ties broken by CATEGORY_KEYS order).
 function scaleToCap(
   scores: Record<CategoryKey, number>,
-  cap: number
+  cap: number,
+  keys: readonly CategoryKey[]
 ): Record<CategoryKey, number> {
-  const total = CATEGORY_KEYS.reduce((n, k) => n + scores[k], 0);
+  const total = keys.reduce((n, k) => n + scores[k], 0);
   if (total <= cap || total === 0) return { ...scores };
-  const exact = CATEGORY_KEYS.map((k) => ({ k, v: (scores[k] * cap) / total }));
+  const exact = keys.map((k) => ({ k, v: (scores[k] * cap) / total }));
   const floored = exact.map((e) => ({ ...e, f: Math.floor(e.v), r: e.v - Math.floor(e.v) }));
   let remainder = cap - floored.reduce((n, e) => n + e.f, 0);
   floored.sort((a, b) => b.r - a.r || CATEGORY_KEYS.indexOf(a.k) - CATEGORY_KEYS.indexOf(b.k));
@@ -569,6 +583,8 @@ function scaleToCap(
     out[e.k] += 1;
     remainder -= 1;
   }
+  // Preserve any keys not being scaled (e.g. N/A categories at 0).
+  for (const k of CATEGORY_KEYS) if (!(k in out)) out[k] = scores[k];
   return out;
 }
 
@@ -704,7 +720,7 @@ function findingCategories(f: PreFlightFinding): CategoryKey[] {
     cats.add("authentication");
   }
   if (/stripe|payment|billing|checkout|webhook/.test(text)) cats.add("externalIntegrations");
-  if (/sql injection|\bprisma\b|\bdrizzle\b|mongodb|postgres/.test(text)) cats.add("databaseLayer");
+  if (/sql injection|\bprisma\b|\bdrizzle\b|mongodb|postgres|supabase|\brls\b|row level security|service_role/.test(text)) cats.add("databaseLayer");
   return [...cats];
 }
 
@@ -727,6 +743,7 @@ function reconcileFindingCaps(
     }
   }
   for (const [k, hit] of [...worst.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    if (categories[k].applicable === false) continue; // N/A categories are excluded from scoring
     const cap = hit.severity === "critical" ? 4 : 6;
     const before = categories[k].score;
     if (before > cap) {
@@ -788,6 +805,9 @@ export function computeDeterministicAssessment(
   reconcileFindingCaps(categories, preflight, capsApplied);
 
   // CAP A / CAP B scale the total; largest-remainder keeps ints exact.
+  // N/A categories are excluded from scaling entirely (they stay 0 and the
+  // applicable set is rescaled instead).
+  const applicableKeys = CATEGORY_KEYS.filter((k) => categories[k].applicable !== false);
   let scores: Record<CategoryKey, number> = Object.fromEntries(
     CATEGORY_KEYS.map((k) => [k, categories[k].score])
   ) as Record<CategoryKey, number>;
@@ -803,8 +823,13 @@ export function computeDeterministicAssessment(
       (f) => /\.(tsx|jsx)$/.test(f.path) && f.imports.some((spec) => spec === "react" || spec === "react-dom" || spec === "next")
     );
   const missingFrontDoor = categories.serverStarts.note === "missing-front-door" && looksLikeFrontend;
+  // CAP A / CAP B bound the final 0-100 grade. Category scores are scaled
+  // first (so the rubric stays proportional), then the rescaled total is
+  // clamped to the cap.
+  let totalCap: number | null = null;
   if (missingFrontDoor) {
-    scores = scaleToCap(scores, 30);
+    scores = scaleToCap(scores, 30, applicableKeys);
+    totalCap = 30;
     capsApplied.push("CAP A (missing front door: total capped at 30)");
   } else if (sig.totalEndpoints <= 1) {
     const claimsApi = sig.files.some(
@@ -817,7 +842,8 @@ export function computeDeterministicAssessment(
       (categories[k].note ?? "").startsWith("dangling")
     );
     if (claimsApi && hollowClaim && sig.files.length > 5) {
-      scores = scaleToCap(scores, 45);
+      scores = scaleToCap(scores, 45, applicableKeys);
+      totalCap = 45;
       capsApplied.push("CAP B (single-endpoint API surface: total capped at 45)");
     }
   }
@@ -829,10 +855,17 @@ export function computeDeterministicAssessment(
   }
 
   const missingFeatures = computeMissingFeatures(sig, categories);
-  const completenessScore = CATEGORY_KEYS.reduce((n, k) => n + categories[k].score, 0);
+  // The total is rescaled to 0-100 over the applicable categories only, so an
+  // N/A category neither inflates nor deflates the score. applicableCount is
+  // exposed so the report can show "N of 10 categories applicable".
+  const applicableCount = applicableKeys.length;
+  const applicableSum = applicableKeys.reduce((n, k) => n + categories[k].score, 0);
+  let completenessScore =
+    applicableCount === 0 ? 0 : Math.round((applicableSum / (applicableCount * 10)) * 100);
+  if (totalCap !== null) completenessScore = Math.min(completenessScore, totalCap);
   const importMap = sig.files.map((f) => ({ path: f.path, imports: f.imports.slice(0, 40) }));
 
-  return { categories, missingFeatures, completenessScore, capsApplied, importMap };
+  return { categories, missingFeatures, completenessScore, applicableCount, capsApplied, importMap };
 }
 
 // ---------------------------------------------------------------------------
@@ -842,13 +875,17 @@ export function computeDeterministicAssessment(
 export function formatAssessmentForPrompt(a: DeterministicAssessment): string {
   const lines: string[] = [];
   lines.push("DETERMINISTIC GROUND TRUTH (computed from scan evidence — FINAL, reproduce exactly):");
-  lines.push(`Total completeness score: ${a.completenessScore}/100 (exact sum of the 10 categories).`);
+  lines.push(`Total completeness score: ${a.completenessScore}/100 (rescaled over ${a.applicableCount} applicable of the 10 categories).`);
   lines.push(a.capsApplied.length > 0 ? `Caps applied: ${a.capsApplied.join("; ")}` : "Caps applied: none.");
   lines.push("");
   lines.push("Category scores (copy each score EXACTLY; write the reason from the evidence):");
   for (const k of CATEGORY_KEYS) {
     const c = a.categories[k];
-    lines.push(`- ${k}: ${c.score}/10 — evidence: ${c.evidence.join(" | ")}`);
+    if (c.applicable === false) {
+      lines.push(`- ${k}: N/A (not applicable — ${c.evidence.join(" | ")}; write score 0 and state "not applicable" in the reason; the server replaces it with the N/A marker)`);
+    } else {
+      lines.push(`- ${k}: ${c.score}/10 — evidence: ${c.evidence.join(" | ")}`);
+    }
   }
   lines.push("");
   lines.push("Missing features (reproduce EXACTLY — same feature and category strings, same order; do not add, remove, or reword):");
@@ -867,6 +904,9 @@ export function formatAssessmentForPrompt(a: DeterministicAssessment): string {
 // Fallback reason when the model drops a category reason: built from evidence.
 export function fallbackReason(key: CategoryKey, a: DeterministicAssessment): string {
   const c = a.categories[key];
+  if (c.applicable === false) {
+    return `Not applicable to this project (excluded from the total). Evidence: ${c.evidence.join("; ")}.`;
+  }
   return `Deterministic score ${c.score}/10. Evidence: ${c.evidence.join("; ")}.`;
 }
 

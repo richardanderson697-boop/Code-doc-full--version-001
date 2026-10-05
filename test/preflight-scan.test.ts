@@ -287,3 +287,76 @@ describe("formatFindingsForPrompt", () => {
     expect(digest).not.toMatch(/do not invent/i);
   });
 });
+
+describe("probeWeakRandomness: benign identifiers are not secrets", () => {
+  it("does not flag Math.random() assigned to a label (unique label, not a secret)", () => {
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const label = 'item-' + Math.random().toString(36).slice(2);\nconsole.log(label);\n`,
+      },
+    ]);
+    expect(r.findings.filter((f) => f.probe === "Weak Randomness")).toHaveLength(0);
+  });
+
+  it("still flags Math.random() assigned to a token", () => {
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const token = Math.random().toString(36).slice(2);\nconsole.log(token);\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "Weak Randomness");
+    expect(hits.length).toBeGreaterThan(0);
+    expect(hits[0].severity).toBe("high");
+  });
+});
+
+describe("probeSupabaseServiceRole: admin client bypasses RLS", () => {
+  const PKG = `{ "dependencies": { "@supabase/supabase-js": "^2.0.0" } }`;
+
+  it("flags a client created with the service_role key as high", () => {
+    const r = runPreFlightScan([
+      { path: "package.json", content: PKG },
+      {
+        path: "server/db.ts",
+        content: `import { createClient } from '@supabase/supabase-js';\nexport const supabase = createClient(process.env.URL, process.env.SUPABASE_SERVICE_ROLE_KEY);\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "Supabase Service Role");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].severity).toBe("high");
+    expect(hits[0].title).toMatch(/bypasses Row Level Security/i);
+  });
+
+  it("flags an admin-named handle as medium when the key is not service_role", () => {
+    const r = runPreFlightScan([
+      { path: "package.json", content: PKG },
+      {
+        path: "server/db.ts",
+        content: `import { createClient } from '@supabase/supabase-js';\nexport const supabaseAdmin = createClient(process.env.URL, process.env.ANON_KEY);\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "Supabase Service Role");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].severity).toBe("medium");
+  });
+
+  it("stays silent for an ordinary anon-key client", () => {
+    const r = runPreFlightScan([
+      { path: "package.json", content: PKG },
+      {
+        path: "server/db.ts",
+        content: `import { createClient } from '@supabase/supabase-js';\nexport const supabase = createClient(process.env.URL, process.env.ANON_KEY);\n`,
+      },
+    ]);
+    expect(r.findings.filter((f) => f.probe === "Supabase Service Role")).toHaveLength(0);
+  });
+
+  it("stays silent when the project does not use supabase", () => {
+    const r = runPreFlightScan([
+      { path: "server/db.ts", content: `const x = createClient(a, b);\n` },
+    ]);
+    expect(r.findings.filter((f) => f.probe === "Supabase Service Role")).toHaveLength(0);
+  });
+});
