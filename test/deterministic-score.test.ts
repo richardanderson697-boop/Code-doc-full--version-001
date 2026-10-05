@@ -326,7 +326,7 @@ describe("finding/category reconciliation (both checks rule)", () => {
   function finding(overrides: Record<string, unknown>) {
     return {
       severity: "critical",
-      probe: "test-probe",
+      probe: "API Route Auth",
       title: "Sensitive API route without auth check",
       file: "server/index.ts",
       line: 12,
@@ -376,12 +376,13 @@ describe("finding/category reconciliation (both checks rule)", () => {
         finding({
           title: "Exposed debug route dumps process.env",
           file: "server/index.ts",
-          probe: "debug-route",
+          probe: "Admin Route Exposure",
         }),
       ])
     );
-    expect(a.categories.authentication.score).toBe(10);
-    expect(a.capsApplied.join(" ")).not.toMatch(/reconciliation/i);
+    // Admin Route Exposure maps to authentication + security only.
+    expect(a.categories.databaseLayer.score).toBe(10);
+    expect(a.categories.externalIntegrations.score).toBe(10);
   });
 
   it("maps CWE-306 to authentication even without auth keywords", () => {
@@ -410,6 +411,41 @@ describe("finding/category reconciliation (both checks rule)", () => {
     );
     expect(a.categories.externalIntegrations.score).toBeLessThanOrEqual(4);
     expect(a.capsApplied.join(" ")).toMatch(/reconciliation/i);
+  });
+
+  it("does not cap externalIntegrations on an auth finding even when the route mentions checkout", () => {
+    // SecureToken case: POST /api/create-checkout-session without auth is an
+    // authentication defect, not an integration defect. The Stripe integration
+    // itself (webhook + signature verification) is solid.
+    const files = [
+      wf("server/index.ts", `import Stripe from 'stripe';\nconst stripe = new Stripe('sk');\napp.post('/api/webhook', handler);\napp.post('/api/create-checkout-session', handler);`),
+    ];
+    const a = computeDeterministicAssessment(
+      files,
+      preflightWith([
+        finding({
+          title: "POST /api/create-checkout-session without auth check",
+          file: "server/index.ts",
+          probe: "API Route Auth",
+          cwe: "CWE-306",
+        }),
+      ])
+    );
+    expect(a.categories.externalIntegrations.score).toBe(10);
+    expect(a.categories.authentication.score).toBe(4);
+    expect(a.categories.security.score).toBeLessThanOrEqual(4);
+  });
+
+  it("does not list prose mentions of Stripe as integration usage", () => {
+    // Legal.tsx mentioning "Stripe" in the ToS is not an integration.
+    const files = [
+      wf("server/index.ts", `import Stripe from 'stripe';\nconst stripe = new Stripe(process.env.KEY);\n`),
+      wf("src/components/Legal.tsx", `export const Legal = () => <p>We use Stripe for payments. Stripe is great.</p>;\n`),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    const ev = a.categories.externalIntegrations.evidence.join(" ");
+    expect(ev).toMatch(/server\/index\.ts/);
+    expect(ev).not.toMatch(/Legal\.tsx/);
   });
 
   it("skips reconciliation when the scan failed", () => {

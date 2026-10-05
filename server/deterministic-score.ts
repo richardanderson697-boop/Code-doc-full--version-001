@@ -105,7 +105,10 @@ const DB_REF = /(database|migration|schema\.prisma|collection|table\s+users|pers
 const PAYMENT_REF = /(stripe|checkout|payment|billing|subscription)/i;
 const AUTOMATION_IMPL = /(node-cron|cron\.schedule|setInterval\s*\(|bullmq|inngest|trigger\.dev|new\s+Worker|webhook)/i;
 const AUTOMATION_REF = /(webhook|cron|schedule|worker|queue|background\sjob)/i;
-const EXT_SDK = /(stripe|openai|anthropic|@resend|twilio|sendgrid|elevenlabs|resend)/i;
+// (EXT_SDK retired: bare word mentions like "Stripe" in Legal.tsx are not
+// integrations. EXT_SDK_USE requires an import or API call.)
+const EXT_SDK_USE =
+  /\bimport\s+[^;]*?\b(stripe|openai|anthropic|twilio|sendgrid|elevenlabs|resend)\b|\brequire\s*\(\s*['"][^'"]*\b(stripe|openai|anthropic|twilio|sendgrid|elevenlabs|resend)\b[^'"]*['"]\s*\)|\bnew\s+(Stripe|OpenAI|Anthropic|Twilio)\s*\(|\bstripe\.\w+\s*[.(]|\bopenai\.\w+\s*[.(]/i;
 
 function isCodeFile(path: string): boolean {
   return /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(path);
@@ -444,7 +447,7 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
 
 function scoreExternalIntegrations(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
-  const sdkFiles = sig.files.filter((f) => isCodeFile(f.path) && hasWord(f.content, EXT_SDK));
+  const sdkFiles = sig.files.filter((f) => isCodeFile(f.path) && hasWord(f.content, EXT_SDK_USE));
   const externalFetches = sig.files.filter((f) => /fetch\(\s*[`'"]https?:\/\//i.test(f.content));
 
   if (sdkFiles.length > 0 || externalFetches.length > 0) {
@@ -711,18 +714,72 @@ function findingCategories(f: PreFlightFinding): CategoryKey[] {
   if (/A0?7/.test(owasp) || /\b(287|306|862|863)\b/.test(cwe) || /A0?1/.test(owasp)) {
     cats.add("authentication");
   }
-  const text = `${f.title} ${f.probe} ${f.file}`.toLowerCase();
-  if (
-    /auth|login|log-?in|sign-?in|session|jwt|password|credential|unauthenticated|missing auth|without auth|no auth/.test(
-      text
-    )
-  ) {
-    cats.add("authentication");
+  // Probe-based mapping: a finding caps the categories it is ABOUT, not
+  // categories its route path happens to name. An "API Route Auth" finding
+  // on POST /api/create-checkout-session caps authentication and security —
+  // not external integrations (the Stripe integration itself is fine; the
+  // route's auth is not). Integration caps come from integration defects
+  // (Webhook Validation, hardcoded provider keys), never from path keywords
+  // like "checkout" in a route name.
+  const probeCats: CategoryKey[] | undefined = PROBE_CATEGORY_MAP[f.probe] ?? PROBE_CATEGORY_MAP[f.probe.toLowerCase()];
+  if (probeCats) {
+    for (const k of probeCats) cats.add(k);
+  } else {
+    // Unmapped probe: a critical/high finding is a security matter by
+    // default. No keyword guessing — that was the blunt rule this replaces.
+    cats.add("security");
   }
-  if (/stripe|payment|billing|checkout|webhook/.test(text)) cats.add("externalIntegrations");
-  if (/sql injection|\bprisma\b|\bdrizzle\b|mongodb|postgres|supabase|\brls\b|row level security|service_role/.test(text)) cats.add("databaseLayer");
   return [...cats];
 }
+
+// Every probe that can emit critical/high findings, mapped to the one or two
+// rubric categories its findings are about. Deliberate: an auth finding hits
+// authentication AND security (two legitimate dimensions of the same defect),
+// but never a third category via keyword coincidence.
+const PROBE_CATEGORY_MAP: Record<string, CategoryKey[]> = {
+  "API Route Auth": ["authentication", "security"],
+  "Auth Weakness": ["authentication", "security"],
+  "Admin Route Exposure": ["authentication", "security"],
+  "Client Auth Storage": ["authentication", "security"],
+  "Cookie Security": ["authentication", "security"],
+  "Supabase Service Role": ["databaseLayer", "security"],
+  "Supabase RLS": ["databaseLayer", "security"],
+  "Firebase Rules": ["databaseLayer", "security"],
+  "SQL Injection": ["databaseLayer", "security"],
+  "Webhook Validation": ["externalIntegrations", "security"],
+  "stripe-webhook": ["externalIntegrations", "security"],
+  "Secret Scanner": ["security"],
+  "Weak Randomness": ["security"],
+  "Weak Cryptography": ["security"],
+  "CORS": ["security"],
+  "Security Headers": ["security"],
+  "Path Traversal": ["security"],
+  "SSRF / Open Redirect": ["security"],
+  "Reflected XSS": ["security"],
+  "Taint Flow": ["security"],
+  "Stack Trace Leaks": ["errorHandling", "security"],
+  "Security Logging": ["security"],
+  "Env File Hygiene": ["security"],
+  "NEXT_PUBLIC_ Misuse": ["security"],
+  "Compromised Packages": ["security"],
+  "Slopsquat / Typosquat": ["security"],
+  "Package Manager Hardening": ["security"],
+  "Package.json": ["security"],
+  "LLM Security": ["security", "externalIntegrations"],
+  "MCP Security": ["security", "externalIntegrations"],
+  "RAG Ingestion": ["security"],
+  "Vector Embedding Weaknesses": ["security"],
+  "Agent Config Backdoor": ["security"],
+  "Trojan Source": ["security"],
+  "Malicious Artifacts": ["security"],
+  "Source Map Exposure": ["security"],
+  "Subresource Integrity": ["security"],
+  "Host Detection": ["security"],
+  "URL Reputation": ["security"],
+  "GitHub Actions": ["security", "backgroundAutomation"],
+  "Iframe Sandbox": ["security"],
+  "Python Security": ["security"],
+};
 
 function reconcileFindingCaps(
   categories: Record<CategoryKey, CategoryResult>,
