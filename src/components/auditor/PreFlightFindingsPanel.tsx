@@ -4,6 +4,7 @@
 import { useState } from "react";
 import { ShieldCheck, ShieldAlert, ChevronDown, ChevronRight, ExternalLink } from "lucide-react";
 import VoiceReadoutButton from "../VoiceReadoutButton";
+import SuggestFixPanel from "./SuggestFixPanel";
 import type { PreFlightReport, PreFlightFinding } from "../../../shared/preflight-types";
 import { isScanIncomplete } from "../../../shared/preflight-types";
 
@@ -166,7 +167,19 @@ export default function PreFlightFindingsPanel({ report }: PreFlightFindingsPane
                       {f.remediation}
                     </p>
                   )}
-                  <div className="flex justify-end">
+                  <div className="flex justify-end items-center gap-2">
+                    <SuggestFixPanel
+                      finding={{
+                        title: f.title,
+                        message: f.title,
+                        severity: f.severity,
+                        type: f.probe,
+                        file: f.file,
+                        line: f.line,
+                        suggestion: f.remediation || undefined,
+                      }}
+                      codeContext={f.evidence || undefined}
+                    />
                     <VoiceReadoutButton
                       title={`PreFlight ${f.severity} finding: ${f.title}`}
                       textToSpeak={f.remediation || f.title}

@@ -143,6 +143,7 @@ export async function claimPendingCredits(userId: string, email: string): Promis
 // the true cost afterwards.
 export const MIN_CREDITS = {
   heal: 5, // quick debugger chat
+  suggestFix: 5, // per-finding suggested fix (review-only dev handoff)
   audit: 15, // single-file audit (two model passes)
   coldAudit: 15,
   intelligence: 40, // full workspace scan, scales with project size

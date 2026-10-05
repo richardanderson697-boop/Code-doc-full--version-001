@@ -79,6 +79,107 @@ ${code}`;
   }
 }));
 
+// 3.6. Suggested fix for a single audit finding. REVIEW ONLY: the model
+// proposes a remediation as a dev-handoff packet; nothing is applied to the
+// user's code. Follows the /api/heal pattern, including the rule that an
+// empty or unusable model response throws BEFORE chargeForCall runs.
+router.post("/api/suggest-fix", requireAuth, requireCredits("suggestFix"), asyncRoute(async (req: AuthedRequest, res) => {
+  const { file, line, message, severity, type, suggestion, codeContext } = req.body || {};
+  if (!message || !file) {
+    return res.status(400).json({ error: "A finding message and file are required to suggest a fix" });
+  }
+
+  try {
+    const systemInstruction = `You are a senior code-remediation specialist writing a developer handoff packet.
+A static analyzer flagged one finding in a codebase. Your job is to explain it in plain English and propose a concrete code fix for a developer to REVIEW. You do not apply the fix; you only suggest it.
+
+You must return ONLY a JSON object with exactly these keys:
+{
+  "plainEnglishIssue": "1-3 sentences a non-engineer could understand: what is wrong and what could go wrong if it is ignored.",
+  "evidence": "The file:line reference plus the relevant code snippet showing the problem.",
+  "remediationDiff": "A unified diff, or clearly labeled BEFORE and AFTER code blocks, showing the suggested fix. Show the smallest change that addresses the finding — do not rewrite the whole file.",
+  "verificationSteps": ["Ordered, concrete steps a developer can run to confirm the fix works (commands, tests, or manual checks)."]
+}
+
+Hard rules:
+- Output raw JSON only. No markdown fences, no prose before or after the JSON.
+- NEVER include effort estimates: no hours, no story points, no t-shirt sizes, no "easy", "hard", or "trivial", no timelines.
+- If the finding looks like a false positive or cannot be fixed in code, say so in plainEnglishIssue and explain why instead of inventing a diff.
+- The audience is a developer who will review this suggestion, not a machine applying it.`;
+
+    const fixPrompt = `Finding type: "${type || "unknown"}"
+Severity: ${severity || "unknown"}
+File: ${file}${line != null ? `, line ${line}` : ""}
+Finding message: "${message}"${suggestion ? `\nScanner's own recommendation: "${suggestion}"` : ""}
+Code context:
+${codeContext || "(no snippet provided)"}`;
+
+    const { response: fixResponse, modelName } = await generateWithFallback({
+      contents: fixPrompt,
+      config: {
+        systemInstruction,
+        temperature: 0.3, // Low temperature for precise, grounded remediation
+      },
+    });
+    let raw = fixResponse.text || "";
+
+    // Clean up code fencing if the model ignored the raw-JSON instruction
+    if (raw.trimStart().startsWith("```")) {
+      const lines = raw.split("\n");
+      if (lines[0].trimStart().startsWith("```")) {
+        lines.shift();
+      }
+      while (lines.length && lines[lines.length - 1].trim() === "```") {
+        lines.pop();
+      }
+      if (lines.length && lines[lines.length - 1].trimStart().startsWith("```")) {
+        lines.pop();
+      }
+      raw = lines.join("\n");
+    }
+    raw = raw.trim();
+
+    if (!raw) {
+      const finishReason = (fixResponse as any)?.candidates?.[0]?.finishReason;
+      if (finishReason === "SAFETY") {
+        throw new Error("The AI's safety filters blocked this content, so no suggested fix could be returned. No credits were charged.");
+      }
+      throw new Error("The AI returned an empty response, so no suggested fix could be produced. No credits were charged — please try again.");
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("The AI returned a response that could not be read as a fix suggestion. No credits were charged — please try again.");
+    }
+
+    const stepsRaw = parsed.verificationSteps;
+    const verificationSteps = Array.isArray(stepsRaw)
+      ? stepsRaw.map((s: any) => String(s)).filter((s: string) => s.trim())
+      : typeof stepsRaw === "string" && stepsRaw.trim()
+        ? [stepsRaw.trim()]
+        : [];
+    const fix = {
+      plainEnglishIssue: String(parsed.plainEnglishIssue || "").trim(),
+      evidence: String(parsed.evidence || "").trim(),
+      remediationDiff: String(parsed.remediationDiff || "").trim(),
+      verificationSteps,
+    };
+    if (!fix.plainEnglishIssue || !fix.remediationDiff) {
+      throw new Error("The AI returned an incomplete fix suggestion (missing explanation or remediation). No credits were charged — please try again.");
+    }
+
+    const fixBalance = await chargeForCall(req.user!.id, extractUsage(fixResponse), modelName, "ai suggest-fix");
+    if (fixBalance != null) res.set("X-Credits-Balance", String(fixBalance));
+
+    res.json({ suggestion: fix });
+  } catch (error: any) {
+    log.error("Suggest-fix API Error:", error);
+    res.status(500).json({ error: formatGeminiError(error) });
+  }
+}));
+
 // 3.8. Objective post-generation code auditor (Cold, Unbiased Review)
 router.post("/api/audit", requireAuth, requireCredits("audit"), asyncRoute(async (req: AuthedRequest, res) => {
   const { code } = req.body;
