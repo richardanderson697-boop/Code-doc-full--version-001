@@ -444,6 +444,21 @@ export function probeWeakRandomness(files) {
       if (!lhsSecurity && LHS_BENIGN_NAME_RE.test(line)) return; // label/slug/suffix LHS; suppress.
 
       if (!lhsSecurity) {
+        // The developer's own string literal declares non-secret intent:
+        // last_session_id: 'RESET_SYSTEM_' + Date.now() + '_' + Math.random()
+        // is a reset marker / unique label, not a credential. Without this,
+        // the window check below matches the word "reset" in the marker
+        // against itself. This only softens the weak window heuristic —
+        // a security-named LHS (const resetToken = 'reset_' + Math.random())
+        // still fires above. (Custom boundaries: \b treats _ as a word
+        // char, so \breset\b would never match RESET_SYSTEM_.)
+        const declaresNonSecret =
+          /\+/.test(line) &&
+          /['"`][^'"`]*(?<![A-Za-z0-9])(?:reset|test|mock|dummy|sample|example|placeholder|label|demo|fake)(?![A-Za-z0-9])[^'"`]*['"`]/i.test(
+            line
+          );
+        if (declaresNonSecret) return;
+
         // Fall back to the original window check.
         const ctx = lines.slice(Math.max(0, i - 3), Math.min(lines.length, i + 4)).join(' ');
         if (UI_CONTEXT_RE.test(ctx)) return; // animation / preview use; fine

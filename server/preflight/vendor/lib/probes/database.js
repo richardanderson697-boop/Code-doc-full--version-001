@@ -281,8 +281,11 @@ export function probeSupabaseServiceRole(files) {
     const path = file?.path || '';
     const content = file?.content || '';
     if (!/\.[jt]sx?$/i.test(path) || isTestFile(path)) continue;
+    // Match both declarations (const admin = createClient(...)) and bare
+    // assignments (supabaseAdminInstance = createClient(...)) — lazy
+    // singletons assign without a declaration keyword.
     for (const m of content.matchAll(
-      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:createClient|createServerClient|createRouteHandlerClient|createMiddlewareClient)\s*\(([^)]{0,500})\)/g
+      /(?:(?:const|let|var)\s+)?([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:createClient|createServerClient|createRouteHandlerClient|createMiddlewareClient)\s*\(([^)]{0,500})\)/g
     )) {
       const handle = m[1];
       const args = m[2];
@@ -293,13 +296,36 @@ export function probeSupabaseServiceRole(files) {
       if (seen.has(key)) continue;
       seen.add(key);
       const line = content.slice(0, m.index).split('\n').length;
+
+      // Severity calibration: service_role on a backend server via a
+      // server-side env var is the standard pattern — the risk is that it
+      // bypasses RLS, so every route using it must authenticate the caller
+      // (medium, verify). The key leaking toward the browser is the real
+      // emergency: a hardcoded JWT, a public env prefix (VITE_/NEXT_PUBLIC_/…),
+      // or service_role referenced from frontend code (high).
+      const hardcodedJwt = /eyJ[A-Za-z0-9_-]{10,}/.test(args);
+      const publicEnv =
+        /\b(?:VITE_|NEXT_PUBLIC_|REACT_APP_|EXPO_PUBLIC|GATSBY_)\w*SERVICE_ROLE/i.test(args) ||
+        /process\.env\.(?:VITE_|NEXT_PUBLIC_|REACT_APP_|EXPO_PUBLIC|GATSBY_)/i.test(args);
+      const frontendFile = /(^|\/)(src|client|frontend|public|components|app|pages)\//i.test(path);
+      let severity;
+      let title;
+      if (!usesServiceRole) {
+        severity = 'medium';
+        title = `Supabase client "${handle}" is named as an admin client — verify it does not use the service_role key`;
+      } else if (hardcodedJwt || publicEnv || frontendFile) {
+        severity = 'high';
+        title = `Supabase service_role key exposed toward the browser via "${handle}"`;
+      } else {
+        severity = 'medium';
+        title = `Supabase client "${handle}" uses the service_role key — bypasses Row Level Security`;
+      }
+
       findings.push({
         id: `supabase-service-role-${path}-${line}`,
         probe: 'Supabase Service Role',
-        title: usesServiceRole
-          ? `Supabase client "${handle}" is initialized with the service_role key — bypasses Row Level Security`
-          : `Supabase client "${handle}" is named as an admin client — verify it does not use the service_role key`,
-        severity: usesServiceRole ? 'high' : 'medium',
+        title,
+        severity,
         category: 'Data Breach',
         cwe: 'CWE-284',
         file: path,
@@ -307,8 +333,9 @@ export function probeSupabaseServiceRole(files) {
         evidence: m[0].replace(/\s+/g, ' ').slice(0, 180),
         remediation: [
           'The service_role key skips every RLS policy on every table: any query through this client reads and writes as a superuser, regardless of what the migrations enable.',
-          'If this client serves browser traffic (directly or through an API route that forwards user input), every table it touches is effectively public to anyone who can reach that route.',
-          'Use the anon key with RLS policies for anything user-reachable, and confine the service_role client to trusted server-side code paths (migrations, admin jobs) that never take unsanitized user input as a table or filter.',
+          severity === 'high'
+            ? 'This key must never reach the browser. A hardcoded JWT or a public env prefix means it ships in the frontend bundle — anyone can extract it and get full database access. Move it to server-only env and rotate it immediately.'
+            : 'Server-side service_role use is normal, but it means RLS will not save you: verify that every API route touching this client authenticates the caller first (see the API Route Auth findings for this file). Scope each query with explicit .eq("user_id", <authenticated user>) filters.',
           namedAdmin && !usesServiceRole
             ? `This finding fired on the handle name "${handle}" — if it actually uses the anon key, rename it to stop tripping the scanner.`
             : 'Rotate the service_role key if it has ever appeared in client-side code, logs, or error messages.',

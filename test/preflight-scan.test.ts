@@ -310,12 +310,38 @@ describe("probeWeakRandomness: benign identifiers are not secrets", () => {
     expect(hits.length).toBeGreaterThan(0);
     expect(hits[0].severity).toBe("high");
   });
+
+  it("suppresses Math.random() when the literal declares a reset marker", () => {
+    // SecureToken case: last_session_id: 'RESET_SYSTEM_' + Date.now() + '_' +
+    // Math.random() — a reset tombstone, not a secret. The window check would
+    // otherwise match the word "reset" in the marker against itself.
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `app.post('/api/reset-credits', async (req, res) => {\n  const q = db.update({ last_session_id: 'RESET_SYSTEM_' + Date.now() + '_' + Math.random().toString(36).substring(7) });\n  res.json({ ok: true });\n});\n`,
+      },
+    ]);
+    expect(r.findings.filter((f) => f.probe === "Weak Randomness")).toHaveLength(0);
+  });
+
+  it("still fires when a security-named LHS uses a marker literal", () => {
+    // The marker suppression never overrides the strong LHS signal:
+    // const resetToken = 'reset_' + Math.random() is a predictable credential.
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const resetToken = 'reset_' + Math.random().toString(36).slice(2);\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "Weak Randomness");
+    expect(hits.length).toBeGreaterThan(0);
+  });
 });
 
 describe("probeSupabaseServiceRole: admin client bypasses RLS", () => {
   const PKG = `{ "dependencies": { "@supabase/supabase-js": "^2.0.0" } }`;
 
-  it("flags a client created with the service_role key as high", () => {
+  it("flags a backend service_role client as medium (verify route auth)", () => {
     const r = runPreFlightScan([
       { path: "package.json", content: PKG },
       {
@@ -325,8 +351,35 @@ describe("probeSupabaseServiceRole: admin client bypasses RLS", () => {
     ]);
     const hits = r.findings.filter((f) => f.probe === "Supabase Service Role");
     expect(hits).toHaveLength(1);
-    expect(hits[0].severity).toBe("high");
+    expect(hits[0].severity).toBe("medium");
     expect(hits[0].title).toMatch(/bypasses Row Level Security/i);
+  });
+
+  it("flags browser-exposed service_role keys as high", () => {
+    const r = runPreFlightScan([
+      { path: "package.json", content: PKG },
+      {
+        path: "src/lib/supabase.ts",
+        content: `import { createClient } from '@supabase/supabase-js';\nconst admin = createClient(url, import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY);\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "Supabase Service Role");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].severity).toBe("high");
+  });
+
+  it("catches bare assignments (lazy singletons without const/let/var)", () => {
+    const r = runPreFlightScan([
+      { path: "package.json", content: PKG },
+      {
+        path: "server.ts",
+        content: `import { createClient } from '@supabase/supabase-js';\nlet inst = null;\nconst getAdmin = () => {\n  inst = createClient(url, process.env.SUPABASE_SERVICE_ROLE_KEY);\n  return inst;\n};\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "Supabase Service Role");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].line).toBe(4);
+    expect(hits[0].severity).toBe("medium");
   });
 
   it("flags an admin-named handle as medium when the key is not service_role", () => {
