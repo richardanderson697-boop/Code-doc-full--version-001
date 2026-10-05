@@ -15,7 +15,7 @@
 // is identical; only the provenance of the numbers changes.
 
 import { runDeterministicScan, type DeterministicAnalysis } from "./deterministic-scan";
-import type { PreFlightReport } from "../shared/preflight-types";
+import type { PreFlightReport, PreFlightFinding } from "../shared/preflight-types";
 import type { WorkspaceFile } from "./workspace";
 
 export const CATEGORY_KEYS = [
@@ -671,6 +671,81 @@ function computeMissingFeatures(
 }
 
 // ---------------------------------------------------------------------------
+// Finding↔category reconciliation ("both checks" rule).
+//
+// A critical/high security finding must be reflected in every rubric
+// category it touches: "Authentication implemented 10/10" can never sit
+// next to a critical "no auth check" finding. The security category already
+// reflects all findings through the PreFlight score mapping; the other
+// categories are scored from implementation signals alone, so without this
+// pass they can contradict the findings. A mapped finding caps its
+// category: critical → at most 4/10, high → at most 6/10. Runs after CAP C
+// and before the CAP A/B total scaling, so the scaled total respects the
+// reconciled categories.
+// ---------------------------------------------------------------------------
+
+/** Rubric categories (other than security) that one finding touches. */
+function findingCategories(f: PreFlightFinding): CategoryKey[] {
+  const cats = new Set<CategoryKey>();
+  // Structured signals beat keywords when the engine provides them.
+  const owasp = (f.owasp ?? []).join(" ").toUpperCase();
+  const cwe = f.cwe ?? "";
+  // A07 identification/authentication failures; CWE-287/306/862/863 auth*;
+  // A01 broken access control lands in the closest rubric bucket.
+  if (/A0?7/.test(owasp) || /\b(287|306|862|863)\b/.test(cwe) || /A0?1/.test(owasp)) {
+    cats.add("authentication");
+  }
+  const text = `${f.title} ${f.probe} ${f.file}`.toLowerCase();
+  if (
+    /auth|login|log-?in|sign-?in|session|jwt|password|credential|unauthenticated|missing auth|without auth|no auth/.test(
+      text
+    )
+  ) {
+    cats.add("authentication");
+  }
+  if (/stripe|payment|billing|checkout|webhook/.test(text)) cats.add("externalIntegrations");
+  if (/sql injection|\bprisma\b|\bdrizzle\b|mongodb|postgres/.test(text)) cats.add("databaseLayer");
+  return [...cats];
+}
+
+function reconcileFindingCaps(
+  categories: Record<CategoryKey, CategoryResult>,
+  preflight: PreFlightReport,
+  capsApplied: string[]
+): void {
+  // Findings from a failed or partial scan are unreliable; scoreSecurity
+  // already withholds at neutral in that case.
+  if (preflight.failed || preflight.probeFailures.length > 0) return;
+  const worst = new Map<CategoryKey, { severity: "critical" | "high"; title: string }>();
+  for (const f of preflight.findings) {
+    if (f.severity !== "critical" && f.severity !== "high") continue;
+    for (const k of findingCategories(f)) {
+      const prev = worst.get(k);
+      if (!prev || (f.severity === "critical" && prev.severity === "high")) {
+        worst.set(k, { severity: f.severity, title: f.title });
+      }
+    }
+  }
+  for (const [k, hit] of [...worst.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+    const cap = hit.severity === "critical" ? 4 : 6;
+    const before = categories[k].score;
+    if (before > cap) {
+      categories[k] = {
+        ...categories[k],
+        score: cap,
+        evidence: [
+          ...categories[k].evidence,
+          `Reconciled: ${hit.severity} finding "${hit.title}" caps ${CATEGORY_LABELS[k]} at ${cap}/10`,
+        ],
+      };
+      capsApplied.push(
+        `Finding/category reconciliation: ${hit.severity} finding "${hit.title}" caps ${CATEGORY_LABELS[k]} at ${cap}/10`
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main entry point
 // ---------------------------------------------------------------------------
 
@@ -706,6 +781,11 @@ export function computeDeterministicAssessment(
     }
     capsApplied.push("CAP C (Stripe without webhook: −4 externalIntegrations, −4 databaseLayer)");
   }
+
+  // Finding↔category reconciliation: a critical/high finding caps every
+  // rubric category it touches, so a 10/10 can never sit next to a
+  // critical finding in the same category.
+  reconcileFindingCaps(categories, preflight, capsApplied);
 
   // CAP A / CAP B scale the total; largest-remainder keeps ints exact.
   let scores: Record<CategoryKey, number> = Object.fromEntries(

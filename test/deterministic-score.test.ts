@@ -309,3 +309,111 @@ export async function saveManuscript(id: string, text: string) {
     expect(a.missingFeatures.some((m) => /database persistence layer/i.test(m.feature))).toBe(false);
   });
 });
+
+describe("finding/category reconciliation (both checks rule)", () => {
+  const AUTH_FILES = [wf("server/auth.ts", AUTH_CODE)];
+
+  function finding(overrides: Record<string, unknown>) {
+    return {
+      severity: "critical",
+      probe: "test-probe",
+      title: "Sensitive API route without auth check",
+      file: "server/index.ts",
+      line: 12,
+      evidence: "app.post('/api/manual-add-credits', handler)",
+      remediation: "Add auth middleware",
+      ...overrides,
+    };
+  }
+
+  function preflightWith(findings: unknown[]): PreFlightReport {
+    return { ...emptyPreflight(60), findings: findings as PreFlightReport["findings"] };
+  }
+
+  it("scores 10/10 authentication with no findings (baseline)", () => {
+    const a = computeDeterministicAssessment(AUTH_FILES, emptyPreflight());
+    expect(a.categories.authentication.score).toBe(10);
+  });
+
+  it("caps authentication at 4 on a critical auth finding", () => {
+    const a = computeDeterministicAssessment(AUTH_FILES, preflightWith([finding({})]));
+    expect(a.categories.authentication.score).toBe(4);
+    expect(a.categories.authentication.evidence.join(" ")).toMatch(/Reconciled/);
+    expect(a.capsApplied.join(" ")).toMatch(/reconciliation/i);
+  });
+
+  it("caps at 6 on a high (not critical) finding", () => {
+    const a = computeDeterministicAssessment(
+      AUTH_FILES,
+      preflightWith([finding({ severity: "high" })])
+    );
+    expect(a.categories.authentication.score).toBe(6);
+  });
+
+  it("does not cap on medium findings", () => {
+    const a = computeDeterministicAssessment(
+      AUTH_FILES,
+      preflightWith([finding({ severity: "medium" })])
+    );
+    expect(a.categories.authentication.score).toBe(10);
+    expect(a.capsApplied.join(" ")).not.toMatch(/reconciliation/i);
+  });
+
+  it("leaves unrelated categories alone", () => {
+    const a = computeDeterministicAssessment(
+      AUTH_FILES,
+      preflightWith([
+        finding({
+          title: "Exposed debug route dumps process.env",
+          file: "server/index.ts",
+          probe: "debug-route",
+        }),
+      ])
+    );
+    expect(a.categories.authentication.score).toBe(10);
+    expect(a.capsApplied.join(" ")).not.toMatch(/reconciliation/i);
+  });
+
+  it("maps CWE-306 to authentication even without auth keywords", () => {
+    const a = computeDeterministicAssessment(
+      AUTH_FILES,
+      preflightWith([
+        finding({ title: "Sensitive function lacks protection", cwe: "CWE-306" }),
+      ])
+    );
+    expect(a.categories.authentication.score).toBe(4);
+  });
+
+  it("caps externalIntegrations on a critical webhook finding", () => {
+    const files = [
+      wf("server/index.ts", `import Stripe from 'stripe';\nconst stripe = new Stripe('sk');\napp.post('/api/webhook', handler);`),
+    ];
+    const a = computeDeterministicAssessment(
+      files,
+      preflightWith([
+        finding({
+          title: "Stripe webhook missing signature verification",
+          file: "server/index.ts",
+          probe: "stripe-webhook",
+        }),
+      ])
+    );
+    expect(a.categories.externalIntegrations.score).toBeLessThanOrEqual(4);
+    expect(a.capsApplied.join(" ")).toMatch(/reconciliation/i);
+  });
+
+  it("skips reconciliation when the scan failed", () => {
+    const report = preflightWith([finding({})]);
+    report.failed = "scanner crashed";
+    const a = computeDeterministicAssessment(AUTH_FILES, report);
+    expect(a.categories.authentication.score).toBe(10);
+    expect(a.capsApplied.join(" ")).not.toMatch(/reconciliation/i);
+  });
+
+  it("keeps the total as the exact sum after reconciliation", () => {
+    const a = computeDeterministicAssessment(AUTH_FILES, preflightWith([finding({})]));
+    let sum = 0;
+    for (const k of CATEGORY_KEYS) sum += a.categories[k].score;
+    expect(a.completenessScore).toBe(sum);
+  });
+});
