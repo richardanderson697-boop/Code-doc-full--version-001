@@ -43,12 +43,14 @@ function downloadMarkdown(filename: string, markdown: string) {
 export default function SuggestFixPanel({ finding, codeContext }: SuggestFixPanelProps) {
   const [phase, setPhase] = useState<Phase>("idle");
   const [fix, setFix] = useState<SuggestedFix | null>(null);
+  const [insufficientNote, setInsufficientNote] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   const handleSuggest = async () => {
     if (phase === "loading") return;
     setPhase("loading");
     setError("");
+    setInsufficientNote(null);
     try {
       const res = await apiFetch("/api/suggest-fix", {
         method: "POST",
@@ -68,6 +70,17 @@ export default function SuggestFixPanel({ finding, codeContext }: SuggestFixPane
         throw new Error(errData.error || "Could not generate a suggested fix.");
       }
       const data = await res.json();
+      if (data.insufficientContext) {
+        // The model honestly declined: the flagged code wasn't visible, so it
+        // refused to invent a fix. No credits were charged.
+        setFix(null);
+        setInsufficientNote(
+          data.suggestion?.plainEnglishIssue ||
+            "Not enough of the flagged code was available to suggest a safe fix, so none was written."
+        );
+        setPhase("done");
+        return;
+      }
       if (!data.suggestion?.remediationDiff) {
         throw new Error("The server returned an unusable suggestion. No credits were charged.");
       }
@@ -120,6 +133,28 @@ export default function SuggestFixPanel({ finding, codeContext }: SuggestFixPane
         <p className="text-[10px] text-rose-400/90 font-mono bg-slate-950/80 border border-rose-500/10 p-2 rounded-lg select-text flex items-center gap-1.5">
           <XCircle className="w-3 h-3 shrink-0" />
           {error}
+        </p>
+        <button
+          type="button"
+          onClick={handleSuggest}
+          className="px-2 py-1 text-[10px] text-slate-400 hover:text-slate-200 underline shrink-0"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  if (phase === "done" && insufficientNote) {
+    return (
+      <div className="mt-1 space-y-2 bg-slate-950/60 border border-amber-500/25 rounded-xl p-3">
+        <p className="text-[10px] font-bold uppercase tracking-wider text-amber-300">
+          No fix suggested — not enough context
+        </p>
+        <p className="text-[11px] text-slate-300 leading-relaxed select-text">{insufficientNote}</p>
+        <p className="text-[10px] text-slate-500 leading-relaxed">
+          Rather than invent a fix against code it couldn't see, the model declined. No credits were charged.
+          Re-run this on the finding with its file present in the workspace for a concrete suggestion.
         </p>
         <button
           type="button"

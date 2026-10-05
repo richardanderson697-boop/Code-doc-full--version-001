@@ -155,6 +155,61 @@ describe("POST /api/suggest-fix", () => {
     expect(res.body.error).toMatch(/could not be read/i);
     expect(await balanceOf(app, cookie)).toBe(startBalance);
   });
+
+  it("returns insufficientContext instead of an invented fix, without charging", async () => {
+    const app = buildApp();
+    const { cookie, startBalance } = await authedCookie(app, "suggest-fix-insufficient");
+    nextText = JSON.stringify({
+      plainEnglishIssue:
+        "Insufficient context: the finding points at server.ts line 1 (the whole file) and no route code was provided, so a safe fix cannot be written.",
+      evidence: "",
+      remediationDiff: "",
+      verificationSteps: [],
+      insufficientContext: true,
+    });
+    nextFinishReason = undefined;
+
+    const res = await request(app).post("/api/suggest-fix").set("Cookie", cookie).send(FINDING);
+
+    expect(res.status).toBe(200);
+    expect(res.body.insufficientContext).toBe(true);
+    expect(res.body.suggestion.plainEnglishIssue).toMatch(/insufficient context/i);
+    expect(res.body.suggestion.remediationDiff).toBe("");
+    expect(await balanceOf(app, cookie)).toBe(startBalance);
+  });
+
+  it("feeds the model the real workspace file around the flagged line", async () => {
+    const app = buildApp();
+    const { cookie } = await authedCookie(app, "suggest-fix-workspace");
+    const me = await request(app).get("/api/auth/me").set("Cookie", cookie);
+    const userId = me.body.user.id;
+    const { saveWorkspaceFile } = await import("../server/workspace-store");
+    const realCode = [
+      "import express from 'express';",
+      "const app = express();",
+      "app.post('/api/manual-add-credits', (req, res) => {",
+      "  addCredits(req.body.userId, req.body.amount);",
+      "  res.json({ ok: true });",
+      "});",
+    ].join("\n");
+    await saveWorkspaceFile(userId, "wp-server.ts", realCode);
+    nextText = JSON.stringify(MODEL_FIX);
+    nextFinishReason = undefined;
+
+    const { generateWithFallback } = await import("../server/gemini");
+    const callsBefore = vi.mocked(generateWithFallback).mock.calls.length;
+
+    const res = await request(app)
+      .post("/api/suggest-fix")
+      .set("Cookie", cookie)
+      .send({ ...FINDING, file: "wp-server.ts", line: 3, codeContext: "stale scanner snippet" });
+
+    expect(res.status).toBe(200);
+    const sentParams = vi.mocked(generateWithFallback).mock.calls[callsBefore][0] as any;
+    const contents = String(sentParams.contents);
+    expect(contents).toContain("Actual file content of wp-server.ts");
+    expect(contents).toContain(">>> 3: app.post('/api/manual-add-credits'");
+  });
 });
 
 describe("dev handoff packet renderer", () => {

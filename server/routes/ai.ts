@@ -13,6 +13,7 @@ import {
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
+import { getWorkspaceFile } from "../workspace-store";
 
 const router = Router();
 
@@ -98,22 +99,52 @@ You must return ONLY a JSON object with exactly these keys:
   "plainEnglishIssue": "1-3 sentences a non-engineer could understand: what is wrong and what could go wrong if it is ignored.",
   "evidence": "The file:line reference plus the relevant code snippet showing the problem.",
   "remediationDiff": "A unified diff, or clearly labeled BEFORE and AFTER code blocks, showing the suggested fix. Show the smallest change that addresses the finding — do not rewrite the whole file.",
-  "verificationSteps": ["Ordered, concrete steps a developer can run to confirm the fix works (commands, tests, or manual checks)."]
+  "verificationSteps": ["Ordered, concrete steps a developer can run to confirm the fix works (commands, tests, or manual checks)."],
+  "insufficientContext": false
 }
 
 Hard rules:
 - Output raw JSON only. No markdown fences, no prose before or after the JSON.
 - NEVER include effort estimates: no hours, no story points, no t-shirt sizes, no "easy", "hard", or "trivial", no timelines.
 - If the finding looks like a false positive or cannot be fixed in code, say so in plainEnglishIssue and explain why instead of inventing a diff.
+- NEVER invent code you have not seen: no made-up route paths, handler names, file names, imports, or middleware. If the provided code context does not show the actual flagged code — for example the finding points at a whole file, or at line 1, or no snippet is shown — do NOT write a diff. Set "insufficientContext" to true, leave "remediationDiff" empty, and use "plainEnglishIssue" to state exactly what context is missing.
 - If the fix references a symbol, import, or middleware that is not visible in the provided code context, say so explicitly in the remediation (e.g. "assumes requireAuth is already imported in this file — add the import if it is not") instead of silently assuming it exists.
 - The audience is a developer who will review this suggestion, not a machine applying it.`;
+
+    // Prefer the real file from the user's workspace over the scanner's snippet,
+    // so the model patches actual code instead of inventing routes/handlers.
+    // Falls back to the scanner-provided snippet when the file isn't stored.
+    let effectiveContext = codeContext || "";
+    try {
+      const row = await getWorkspaceFile(req.user!.id, String(file));
+      const content = row?.content || "";
+      if (content) {
+        const allLines = content.split("\n");
+        const flagged = Number(line);
+        if (line != null && Number.isFinite(flagged) && flagged >= 1) {
+          const idx = Math.min(flagged, allLines.length) - 1;
+          const start = Math.max(0, idx - 40);
+          const end = Math.min(allLines.length, idx + 41);
+          const numbered = allLines
+            .slice(start, end)
+            .map((l, i) => `${start + i + 1 === flagged ? ">>> " : "    "}${start + i + 1}: ${l}`)
+            .join("\n");
+          effectiveContext =
+            `Actual file content of ${file} (lines ${start + 1}-${end} of ${allLines.length}; flagged line marked >>>):\n${numbered}`;
+        } else {
+          effectiveContext = `Actual file content of ${file} (first 8000 characters):\n${content.slice(0, 8000)}`;
+        }
+      }
+    } catch {
+      // Fall back to the scanner-provided snippet.
+    }
 
     const fixPrompt = `Finding type: "${type || "unknown"}"
 Severity: ${severity || "unknown"}
 File: ${file}${line != null ? `, line ${line}` : ""}
 Finding message: "${message}"${suggestion ? `\nScanner's own recommendation: "${suggestion}"` : ""}
 Code context:
-${codeContext || "(no snippet provided)"}`;
+${effectiveContext || "(no code context available)"}`;
 
     const { response: fixResponse, modelName } = await generateWithFallback({
       contents: fixPrompt,
@@ -161,14 +192,20 @@ ${codeContext || "(no snippet provided)"}`;
       : typeof stepsRaw === "string" && stepsRaw.trim()
         ? [stepsRaw.trim()]
         : [];
+    const insufficient = parsed.insufficientContext === true;
     const fix = {
       plainEnglishIssue: String(parsed.plainEnglishIssue || "").trim(),
       evidence: String(parsed.evidence || "").trim(),
-      remediationDiff: String(parsed.remediationDiff || "").trim(),
+      remediationDiff: insufficient ? "" : String(parsed.remediationDiff || "").trim(),
       verificationSteps,
     };
-    if (!fix.plainEnglishIssue || !fix.remediationDiff) {
+    if (!fix.plainEnglishIssue || (!insufficient && !fix.remediationDiff)) {
       throw new Error("The AI returned an incomplete fix suggestion (missing explanation or remediation). No credits were charged — please try again.");
+    }
+
+    if (insufficient) {
+      // An honest "I can't see the code" is not a delivered fix: no charge.
+      return res.json({ suggestion: fix, insufficientContext: true });
     }
 
     const fixBalance = await chargeForCall(req.user!.id, extractUsage(fixResponse), modelName, "ai suggest-fix");
