@@ -382,6 +382,23 @@ describe("probeSupabaseServiceRole: admin client bypasses RLS", () => {
     expect(hits[0].severity).toBe("medium");
   });
 
+  it("treats a camelCase serviceRole variable as a definite service_role key", () => {
+    // SecureToken case: supabaseAdminInstance = createClient(supabaseUrl,
+    // supabaseServiceRoleKey, ...) — the variable holds the key, so the
+    // title must be definite, not "verify it does not use service_role".
+    const r = runPreFlightScan([
+      { path: "package.json", content: PKG },
+      {
+        path: "server.ts",
+        content: `import { createClient } from '@supabase/supabase-js';\nlet supabaseAdminInstance = null;\nsupabaseAdminInstance = createClient(supabaseUrl, supabaseServiceRoleKey, { auth: { persistSession: false } });\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "Supabase Service Role");
+    expect(hits).toHaveLength(1);
+    expect(hits[0].title).toMatch(/bypasses Row Level Security/i);
+    expect(hits[0].title).not.toMatch(/verify it does not use/i);
+  });
+
   it("flags an admin-named handle as medium when the key is not service_role", () => {
     const r = runPreFlightScan([
       { path: "package.json", content: PKG },
@@ -463,5 +480,20 @@ describe("probeAPIRouteAuth: per-route anchoring", () => {
       },
     ]);
     expect(r.findings.filter((f) => f.probe === "API Route Auth")).toHaveLength(0);
+  });
+
+  it("flags financial routes without auth (spend/reset-credits, generate)", () => {
+    // SecureToken case: /api/reset-credits and /api/spend-credits let anyone
+    // zero or drain any user's balance; /api/generate is the paid endpoint.
+    const r = runPreFlightScan([
+      {
+        path: "server.ts",
+        content: `const app = express();\napp.post('/api/reset-credits', async (req, res) => {\n  const { userId } = req.body;\n  if (!userId) return res.status(401).json({ error: 'User ID required' });\n  res.json({ ok: true });\n});\napp.post('/api/spend-credits', (req, res) => res.send('x'));\napp.post('/api/generate', (req, res) => res.send('y'));\n`,
+      },
+    ]);
+    const hits = r.findings.filter((f) => f.probe === "API Route Auth");
+    expect(hits).toHaveLength(3);
+    expect(hits.map((h) => h.line).sort()).toEqual([2, 7, 8]);
+    expect(hits[0].title).toMatch(/POST \/api\/reset-credits/);
   });
 });

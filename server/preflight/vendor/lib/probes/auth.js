@@ -1397,13 +1397,16 @@ export function probeAPIRouteAuth(files) {
 
     // Sensitivity heuristics. Path patterns first. For Express-style routes
     // the path lives in the route string (`app.post('/api/admin/...')`), not
-    // the file path — check BOTH.
+    // the file path — check BOTH. Financial and session routes are sensitive
+    // even without an admin keyword: /api/spend-credits and /api/reset-credits
+    // let anyone drain or zero any user's balance; /api/generate is the paid
+    // core endpoint.
     const sensitiveKw =
-      /(admin|internal|delete|update|create|user|payment|checkout|billing|dashboard|invoice|impersonate|promote|refund|settings|moderate)/i;
+      /(admin|internal|delete|update|create|user|payment|checkout|billing|dashboard|invoice|impersonate|promote|refund|settings|moderate|credit|spend|reset|generate|session|purchase|order|subscription)/i;
     const isSensitivePath =
       sensitiveKw.test(file.path) ||
       (isExpressLike &&
-        /\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete|use|all)\s*\(\s*['"`][^'"`]*(?:admin|internal|delete|update|user|payment|checkout|billing|dashboard|invoice|impersonate|promote|refund|settings|moderate)/i.test(
+        /\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete|use|all)\s*\(\s*['"`][^'"`]*(?:admin|internal|delete|update|user|payment|checkout|billing|dashboard|invoice|impersonate|promote|refund|settings|moderate|credit|spend|reset|generate|session|purchase|order|subscription)/i.test(
           c
         ));
     const hasDestructiveVerb =

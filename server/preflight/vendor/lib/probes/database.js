@@ -289,7 +289,9 @@ export function probeSupabaseServiceRole(files) {
     )) {
       const handle = m[1];
       const args = m[2];
-      const usesServiceRole = /service_role/i.test(args);
+      // service_role, service-role, or camelCase serviceRole (e.g. a
+      // variable named supabaseServiceRoleKey holding the key).
+      const usesServiceRole = /service[_-]?role/i.test(args);
       const namedAdmin = /admin/i.test(handle);
       if (!usesServiceRole && !namedAdmin) continue;
       const key = `${path}:${handle}`;
