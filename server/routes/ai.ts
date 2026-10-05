@@ -14,6 +14,7 @@ import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
 import { getWorkspaceFile, listWorkspaceFiles } from "../workspace-store";
+import { verifySuggestedFix } from "../fix-verify";
 
 const router = Router();
 
@@ -230,7 +231,16 @@ ${effectiveContext || "(no code context available)"}`;
     const fixBalance = await chargeForCall(req.user!.id, extractUsage(fixResponse), modelName, "ai suggest-fix");
     if (fixBalance != null) res.set("X-Credits-Balance", String(fixBalance));
 
-    res.json({ suggestion: fix });
+    // Deterministic post-check: verify the suggested AFTER code actually
+    // addresses the finding. Prompt rules alone produced a fix that added
+    // requireAuth while still trusting req.body userId — this catches that
+    // class of failure and surfaces it to the reviewer.
+    const fixVerification = verifySuggestedFix(fix.remediationDiff, {
+      probe: String(req.body?.type || ""),
+      title: String(message || ""),
+    });
+
+    res.json({ suggestion: fix, fixVerification });
   } catch (error: any) {
     log.error("Suggest-fix API Error:", error);
     res.status(500).json({ error: formatGeminiError(error) });

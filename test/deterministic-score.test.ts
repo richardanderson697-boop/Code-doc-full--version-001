@@ -528,6 +528,21 @@ describe("backgroundAutomation N/A (rule-based, never model judgment)", () => {
     expect(cat.score).toBe(10);
   });
 
+  it("scores webhook-only automation as partial credit (6), not full marks", () => {
+    // A Stripe webhook handler is event-driven automation, but it runs in the
+    // request path — it is not a scheduler, queue, or worker, and there is no
+    // retry/reconciliation around it. 10/10 would imply nothing is missing.
+    const files = [
+      wf("server/index.ts", `const app = express();\napp.post('/api/webhook', (req, res) => res.json({ ok: true }));\n`),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    const cat = a.categories.backgroundAutomation;
+    expect(cat.applicable).not.toBe(false);
+    expect(cat.score).toBe(6);
+    expect(cat.evidence.join(" ")).toMatch(/webhook handler found/);
+    expect(cat.evidence.join(" ")).toMatch(/no scheduled jobs/);
+  });
+
   it("renders N/A in the prompt ground truth", () => {
     const a = computeDeterministicAssessment(BARE_FILES, emptyPreflight());
     const prompt = formatAssessmentForPrompt(a);

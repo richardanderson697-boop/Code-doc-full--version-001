@@ -424,21 +424,25 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
   const impl = anyFile(sig, (f) => isCodeFile(f.path) && hasWord(f.content, AUTOMATION_IMPL));
   if (impl) {
-    // Name the actual signal so the score is explainable: a Stripe webhook
-    // handler is event-driven automation (the app processes payments without
-    // human intervention), which is what this category measures.
+    // Name the actual signal so the score is explainable. A webhook handler
+    // is event-driven automation, but it runs in the request path — it is not
+    // a scheduler, queue, or worker, and there is no retry/reconciliation
+    // around it. Full marks require scheduled, queued, or worker-based
+    // processing; a webhook alone is partial credit with the gaps cited.
     const c = impl.content;
-    const what = /webhook/i.test(c)
-      ? "webhook handler (event-driven automation)"
-      : /node-cron|cron\.schedule/i.test(c)
+    const hasRealAutomation = /node-cron|cron\.schedule|bullmq|inngest|agenda|new\s+Worker|setInterval\s*\(/i.test(c);
+    if (hasRealAutomation) {
+      const what = /node-cron|cron\.schedule/i.test(c)
         ? "cron scheduler"
         : /bullmq|inngest|agenda|queue/i.test(c)
           ? "job queue"
-          : /new\s+Worker/i.test(c)
-            ? "background worker"
-            : "scheduler/worker/webhook implementation";
-    evidence.push(`${impl.path}: ${what} found`);
-    return { score: 10, max: 10, evidence };
+          : "background worker";
+      evidence.push(`${impl.path}: ${what} found`);
+      return { score: 10, max: 10, evidence };
+    }
+    evidence.push(`${impl.path}: webhook handler found (event-driven automation)`);
+    evidence.push("no scheduled jobs, queues, workers, or webhook retry/reconciliation logic");
+    return { score: 6, max: 10, evidence };
   }
   const referenced = anyFile(sig, (f) => hasWord(f.content, AUTOMATION_REF) || hasWord(f.content, PAYMENT_REF));
   // A scheduler/queue/worker dependency with no code usage yet still counts
