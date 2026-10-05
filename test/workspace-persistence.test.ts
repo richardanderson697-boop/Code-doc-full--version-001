@@ -9,7 +9,7 @@ import AdmZip from "adm-zip";
 import authRouter from "../server/routes/auth";
 import workspaceRouter from "../server/routes/workspace";
 import { initStore } from "../server/store";
-import { cleanWorkspacePath } from "../server/workspace";
+import { cleanWorkspacePath, isWorkspaceFileExt } from "../server/workspace";
 
 function buildApp() {
   const app = express();
@@ -62,6 +62,14 @@ describe("cleanWorkspacePath", () => {
     expect(cleanWorkspacePath("   ")).toBeNull();
     expect(cleanWorkspacePath(null)).toBeNull();
     expect(cleanWorkspacePath("nul\0byte")).toBeNull();
+  });
+});
+
+describe("isWorkspaceFileExt", () => {
+  it("tracks SQL schema files so the model sees them instead of guessing", () => {
+    expect(isWorkspaceFileExt("migrations/001_init.sql")).toBe(true);
+    expect(isWorkspaceFileExt("src/App.tsx")).toBe(true);
+    expect(isWorkspaceFileExt("assets/logo.png")).toBe(false);
   });
 });
 

@@ -62,8 +62,10 @@ export function resolveInsideDir(baseDir: string, userPath: unknown): string | n
 }
 
 // Source-code extensions the workspace tracks. Mirrors the old on-disk
-// scanner: only these are listed, scored, or zipped.
-export const WORKSPACE_FILE_EXTS = [".ts", ".tsx", ".json", ".js", ".jsx", ".css", ".html", ".md"];
+// scanner: only these are listed, scored, or zipped. .sql is included so
+// schema/migration files (e.g. RLS policies) reach the model instead of
+// being guessed from missing input.
+export const WORKSPACE_FILE_EXTS = [".ts", ".tsx", ".json", ".js", ".jsx", ".css", ".html", ".md", ".sql"];
 
 export function isWorkspaceFileExt(relPath: string): boolean {
   const dot = relPath.lastIndexOf(".");

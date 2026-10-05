@@ -11,7 +11,9 @@ import {
   fallbackReason,
   fallbackMissingReason,
   CATEGORY_KEYS,
+  type CategoryKey,
 } from "../deterministic-score";
+import { verifyReportCitations, repairImportMap } from "../citation-verify";
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
@@ -399,6 +401,22 @@ The total completenessScore must be exactly the sum of these 10 category scores.
       evidence: Object.fromEntries(
         CATEGORY_KEYS.map((k) => [k, assessment.categories[k].evidence])
       ),
+    };
+    // Citation grounding: verify every `file:line` citation in the model's
+    // free-text reasons against the actual workspace files and drop what
+    // cannot be verified, so unsupported claims never reach the report.
+    // Dropped applicationMap imports are repaired from the deterministic
+    // import map (ground truth).
+    const citationResult = verifyReportCitations(parsedIntel, files, {
+      categoryReason: (key) => fallbackReason(key as CategoryKey, assessment),
+      missingReason: (feature) => `Flagged by deterministic scan: ${feature}`,
+    });
+    const importsRepaired = repairImportMap(parsedIntel, assessment.importMap);
+    parsedIntel.verification = {
+      citationsChecked: citationResult.citationsChecked,
+      citationsDropped: citationResult.citationsDropped,
+      droppedCitations: citationResult.droppedCitations,
+      importsRepaired,
     };
     res.json(parsedIntel);
   } catch (error: any) {

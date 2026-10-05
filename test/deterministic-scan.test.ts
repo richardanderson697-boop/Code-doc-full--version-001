@@ -57,4 +57,22 @@ describe("runDeterministicScan", () => {
     const s = runDeterministicScan(`const a = 1;\nconst b = 2;\napp.get("/x", h);`);
     expect(s.endpoints[0].lines).toBe("3");
   });
+
+  it("does not flag bare mock/simulated keywords in comments as stubs", () => {
+    const s = runDeterministicScan(
+      `// Returns simulated data for the preview pane\n// mock response shape documented here\nconst data = await fetchReal();`,
+      "src/api.ts"
+    );
+    expect(s.stubCount).toBe(0);
+  });
+
+  it("still flags an explicit TODO: implement comment as a stub", () => {
+    const s = runDeterministicScan(`// TODO: implement the real handler\nconst ok = true;`, "src/api.ts");
+    expect(s.stubCount).toBe(1);
+  });
+
+  it("still flags mock data declarations in non-mock files", () => {
+    const s = runDeterministicScan(`const mockUsers = [{ id: 1 }];`, "src/App.tsx");
+    expect(s.stubCount).toBe(1);
+  });
 });

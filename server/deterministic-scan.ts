@@ -100,15 +100,18 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     }
 
     // 5. Stubs / Mocks
-    const stubKeywords = /\b(stub|mock|placeholder|temporary|simulated|hardcoded)\b/i;
     // A file whose whole job is mock/fixture/seed data is not "unfinished"
     // because it declares const MOCK_*: flagging it is pure noise.
+    // NOTE: bare keywords ("mock", "simulated", ...) in *comments* are not
+    // stubs — a comment describing simulated data is documentation, not
+    // unfinished code. Only an explicit TODO: implement marker in a comment
+    // counts as a stub signal.
     const isMockDataFile = /(^|\/)(mock|mocks|fixture|fixtures|seed|seeds|stub|stubs)[^/]*\.(ts|tsx|js|jsx)$/i.test(filePath);
     const isMockDeclaration = !isMockDataFile && (/\b(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock/i.test(line) || /\bconst\s+temp/i.test(line));
     const isEmptyFunction = /=>\s*\{\s*\}/.test(line) || /function\s*\w*\s*\(\s*\)\s*\{\s*\}/.test(line);
     const isTodoImplement = /TODO:\s*implement/i.test(line);
-    
-    if ((isComment && (stubKeywords.test(line) || isTodoImplement)) || isMockDeclaration || (isEmptyFunction && !line.includes("export") && line.toLowerCase().includes("handler"))) {
+
+    if ((isComment && isTodoImplement) || isMockDeclaration || (isEmptyFunction && !line.includes("export") && line.toLowerCase().includes("handler"))) {
       stubs.push({ lines: String(lineNum), code: line });
     }
 

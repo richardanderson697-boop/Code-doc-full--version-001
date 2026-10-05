@@ -52,8 +52,14 @@ describe("mock-declaration noise", () => {
     const s = runDeterministicScan("const mockUsers = [];\n", "src/data.ts");
     expect(s.stubs.length).toBeGreaterThan(0);
   });
-  it("still flags simulated comments in mock data files", () => {
+  it("does not flag simulated/mock keywords in comments as stubs", () => {
+    // A comment describing simulated data is documentation, not unfinished
+    // code — flagging it was a bad rule, not a real stub signal.
     const s = runDeterministicScan("// Simulated payout ledger\nconst x = 1;\n", "src/utils/mockData.ts");
+    expect(s.stubs).toHaveLength(0);
+  });
+  it("still flags an explicit TODO: implement comment as a stub", () => {
+    const s = runDeterministicScan("// TODO: implement the payout ledger\nconst x = 1;\n", "src/utils/mockData.ts");
     expect(s.stubs.length).toBeGreaterThan(0);
   });
 });
