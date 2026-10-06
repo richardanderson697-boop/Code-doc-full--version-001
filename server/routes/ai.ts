@@ -128,7 +128,7 @@ Hard rules:
 - Output raw JSON only. No markdown fences, no prose before or after the JSON.
 - NEVER include effort estimates: no hours, no story points, no t-shirt sizes, no "easy", "hard", or "trivial", no timelines.
 - If the finding looks like a false positive or cannot be fixed in code, say so in plainEnglishIssue and explain why instead of inventing a diff.
-- NEVER invent code you have not seen: no made-up route paths, handler names, file names, imports, or middleware. If the provided code context does not show the actual flagged code — for example the finding points at a whole file, or at line 1, or no snippet is shown — do NOT write a diff. Set "insufficientContext" to true, leave "remediationDiff" empty, and use "plainEnglishIssue" to state exactly what context is missing.
+- NEVER invent code you have not seen: no made-up route paths, handler names, file names, imports, or middleware. If the provided code context does not show the actual flagged code — for example no snippet is shown — do NOT write a diff. Set "insufficientContext" to true, leave "remediationDiff" empty, and use "plainEnglishIssue" to state exactly what context is missing. When the finding is file-level (flagged at line 1) and the full file content is provided, locate the flagged construct yourself by matching the finding's description (e.g. a DELETE/PUT/PATCH handler missing auth) against the file before deciding context is insufficient.
 - If the fix references a symbol, import, or middleware that is not visible in the provided code context, say so explicitly in the remediation (e.g. "assumes requireAuth is already imported in this file — add the import if it is not") instead of silently assuming it exists.
 - For missing-authentication findings: adding an auth middleware is NOT enough if the handler still reads the user identity from the request body or query string. A userId taken from req.body / req.query is untrusted input — any logged-in user could pass someone else's ID (broken object-level authorization). The fix must derive the caller's identity from the verified token or session (e.g. req.user, supabase.auth.getUser(), the decoded JWT subject) and ignore any userId in the body. If the code context does not show how identity is established, say so instead of guessing.
 - If the fix changes the API contract (new required header, removed body param), add one explicit line naming what frontend callers must change (e.g. "Callers in Dashboard.tsx must now send Authorization: Bearer <token>; remove userId from the request body").
@@ -160,11 +160,25 @@ Hard rules:
         const flagged = Number(line);
         if (line != null && Number.isFinite(flagged) && flagged >= 1) {
           const idx = Math.min(flagged, allLines.length) - 1;
-          const start = Math.max(0, idx - 40);
-          const end = Math.min(allLines.length, idx + 41);
+          let start: number, end: number, markedLine: number;
+          if (flagged === 1 && allLines.length <= 300) {
+            // File-level finding (flagged at line 1): the offending
+            // construct can be anywhere in the file — e.g. a destructive
+            // handler at line 120 of a 164-line route file. An 81-line
+            // window anchored at line 1 misses it and the model declines
+            // for lack of context. Send the whole file so the model can
+            // locate the flagged code itself.
+            start = 0;
+            end = allLines.length;
+            markedLine = 1;
+          } else {
+            start = Math.max(0, idx - 40);
+            end = Math.min(allLines.length, idx + 41);
+            markedLine = flagged;
+          }
           const numbered = allLines
             .slice(start, end)
-            .map((l, i) => `${start + i + 1 === flagged ? ">>> " : "    "}${start + i + 1}: ${l}`)
+            .map((l, i) => `${start + i + 1 === markedLine ? ">>> " : "    "}${start + i + 1}: ${l}`)
             .join("\n");
           effectiveContext =
             `Actual file content of ${file} (lines ${start + 1}-${end} of ${allLines.length}; flagged line marked >>>):\n${numbered}`;
