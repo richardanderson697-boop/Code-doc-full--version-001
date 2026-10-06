@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractAddedCode, verifySuggestedFix } from "../server/fix-verify";
+import { extractAddedCode, verifySuggestedFix, verifyHealedCode } from "../server/fix-verify";
 
 describe("extractAddedCode", () => {
   it("pulls + lines from a unified diff", () => {
@@ -42,5 +42,21 @@ describe("verifySuggestedFix", () => {
   it("ignores non-auth findings", () => {
     const v = verifySuggestedFix(BAD_FIX, { probe: "Secret Scanner", title: "hardcoded key" });
     expect(v.passed).toBe(true);
+  });
+});
+
+describe("verifyHealedCode", () => {
+  it("passes when the healed output preserves the input", () => {
+    const input = `import React from 'react';\nconst x = 1;\nfunction App() {\n  return <div>{x}</div>;\n`;
+    const healed = input + `}\nexport default App;\n`;
+    expect(verifyHealedCode(input, healed).passed).toBe(true);
+  });
+
+  it("rejects a hallucinated demo app that ignores the input", () => {
+    const input = `import React from 'react';\nfunction MyWidget() {\n  const [count, setCount] = useState(0);\n  return <button onClick={() => setCount(count + 1)}>{count}</button>;\n`;
+    const hallucinated = `import React from 'react';\n// VibeCoder Codebase Auditor\nconst MOCK_FILES = [];\nexport default function App() { return <div>Auditor</div>; }`;
+    const v = verifyHealedCode(input, hallucinated);
+    expect(v.passed).toBe(false);
+    expect(v.reason).toMatch(/doesn't contain the submitted code/);
   });
 });

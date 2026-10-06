@@ -12,6 +12,32 @@ export interface FixVerification {
   issues: string[];
 }
 
+// Verifies healed code actually heals the input instead of hallucinating a
+// new app. The healer once returned a branded demo app ("VibeCoder Codebase
+// Auditor") instead of the user's truncated code — the prompt identity leaked.
+// This samples lines from the input and requires most of them to appear in
+// the output; a genuine healing preserves the input, a hallucination doesn't.
+export function verifyHealedCode(inputCode: string, healedCode: string): { passed: boolean; reason?: string } {
+  const inputLines = String(inputCode || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 12);
+  if (inputLines.length === 0) return { passed: true };
+  const sample: string[] = [];
+  const step = Math.max(1, Math.floor(inputLines.length / 10));
+  for (let i = 0; i < inputLines.length && sample.length < 10; i += step) {
+    sample.push(inputLines[i]);
+  }
+  const hits = sample.filter((line) => healedCode.includes(line)).length;
+  if (hits / sample.length < 0.5) {
+    return {
+      passed: false,
+      reason: `The healed output doesn't contain the submitted code (${hits}/${sample.length} sampled lines found) — the model generated new code instead of healing. No credits were charged.`,
+    };
+  }
+  return { passed: true };
+}
+
 // Pull the added code out of a unified diff (+ lines) or a BEFORE/AFTER
 // block pair (text after the AFTER: marker).
 export function extractAddedCode(remediationDiff: string): string {

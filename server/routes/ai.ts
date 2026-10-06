@@ -15,6 +15,7 @@ import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requir
 import { chargeForCall } from "../credits";
 import { getWorkspaceFile, listWorkspaceFiles } from "../workspace-store";
 import { verifySuggestedFix } from "../fix-verify";
+import { verifyHealedCode } from "../fix-verify";
 
 const router = Router();
 
@@ -26,15 +27,17 @@ router.post("/api/heal", requireAuth, requireCredits("heal"), asyncRoute(async (
   }
 
   try {
-    const systemInstruction = `You are VibeCoder Healing System, an expert React and TypeScript compilation specialist. 
-Your sole task is to inspect a React component that was suddenly truncated or cut-off mid-stream during generation due to an API error, rate limit, or service timeout.
+    const systemInstruction = `You are a code completion specialist. Your sole task is to complete truncated React TypeScript code.
+
+CRITICAL: Your output MUST be the input code below, healed and completed. Do NOT generate a new application. Do NOT output example, template, demo, or mockup code. Do NOT invent a different app, even one with a similar name or purpose. Complete the EXACT code provided.
+
 You will receive the partial/truncated code, and the original prompt describing the app.
 You must:
 1. Read the incomplete code carefully.
 2. Analyze the unclosed curly braces, brackets, imports, or statements.
 3. Complete and heal the code, ensuring all open structures are properly closed and any missing elements (like returning JSX elements or adding 'export default function App()') are appended correctly.
-4. Keep all existing variables and logic intact. Do not rewrite from scratch unless it is completely corrupt.
-5. Return ONLY the fully-compiled, 100% syntactically correct, healed React TypeScript TSX code. 
+4. Keep all existing variables, components, names, and logic intact. Do not rewrite from scratch. Do not rename anything. Do not change what the app does.
+5. Return ONLY the fully-compiled, 100% syntactically correct, healed React TypeScript TSX code.
 6. Do NOT wrap the response in markdown code blocks like \`\`\`tsx. Return only the raw text of the complete, valid React file.`;
 
     const healingPrompt = `Original App Goal: "${prompt || "Simple functional React widget"}"
@@ -69,6 +72,16 @@ ${code}`;
         throw new Error("The AI's safety filters blocked this content, so no healed code could be returned. No credits were charged.");
       }
       throw new Error("The AI returned an empty response, so the heal could not complete. No credits were charged — please try again.");
+    }
+
+    // Deterministic guard: the healed output must actually contain the input
+    // code. Without this, the model can return a brand-new demo app instead
+    // of healing (seen once: a "VibeCoder Codebase Auditor" mockup). Reject
+    // before charging — a hallucinated heal is not a delivered heal.
+    const healCheck = verifyHealedCode(code, healedCode);
+    if (!healCheck.passed) {
+      log.warn(`Heal verification failed: ${healCheck.reason} (input ${code.length} chars, output ${healedCode.length} chars)`);
+      throw new Error(healCheck.reason);
     }
 
     const chargedBalance = await chargeForCall(req.user!.id, extractUsage(healedResponse), modelName, "ai heal");
