@@ -111,6 +111,7 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                     <span className={`text-lg font-bold font-mono mt-0.5 block ${
                       intelResult.completenessScore >= 80 ? "text-emerald-400" : intelResult.completenessScore >= 50 ? "text-amber-400" : "text-rose-400"
                     }`}>{intelResult.completenessScore}/100</span>
+                    <span className="block text-[9px] text-slate-600 font-mono mt-0.5">Completeness (10-category rubric)</span>
                   </div>
                 </div>
 

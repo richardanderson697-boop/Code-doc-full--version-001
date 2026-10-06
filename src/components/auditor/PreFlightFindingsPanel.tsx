@@ -49,11 +49,14 @@ export default function PreFlightFindingsPanel({ report }: PreFlightFindingsPane
           </div>
           <div>
             <h5 className="text-[10px] uppercase font-bold tracking-wider text-slate-200">
-              PreFlight Deterministic Scan
+              PreFlight Security Scan
             </h5>
             <p className="text-[9px] text-slate-500 font-mono">
               {report.probeCount} probes · {report.filesScanned} file{report.filesScanned === 1 ? "" : "s"} scanned
               {severitySummary ? ` · ${severitySummary}` : incomplete ? "" : " · no findings"}
+            </p>
+            <p className="text-[9px] text-slate-600 font-mono">
+              Security score only — not the completeness grade below
             </p>
           </div>
         </div>
@@ -75,7 +78,7 @@ export default function PreFlightFindingsPanel({ report }: PreFlightFindingsPane
                 ? "bg-amber-500/10 border-amber-500/20 text-amber-400"
                 : "bg-rose-500/10 border-rose-500/20 text-rose-400"
             }`}
-            title="PreFlight security score (deterministic, 0-100)"
+            title="Security score: 100 means no security findings. This is separate from the completeness grade."
           >
             {report.score}/100
           </span>

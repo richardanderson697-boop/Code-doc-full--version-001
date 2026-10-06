@@ -163,43 +163,86 @@ Finding message: "${message}"${suggestion ? `\nScanner's own recommendation: "${
 Code context:
 ${effectiveContext || "(no code context available)"}`;
 
-    const { response: fixResponse, modelName } = await generateWithFallback({
-      contents: fixPrompt,
-      config: {
-        systemInstruction,
-        temperature: 0.3, // Low temperature for precise, grounded remediation
-      },
-    });
-    let raw = fixResponse.text || "";
+    // Generate + parse with server-side retry. A malformed model response is
+    // retried automatically (up to 3 attempts) before the user ever sees an
+    // error — failed attempts are never charged, so the retry costs nothing.
+    // With responseSchema the JSON should always parse; the retry covers
+    // truncation and transient model issues.
+    let parsed: any = null;
+    let fixResponse: any = null;
+    let modelName = "";
+    let lastRaw = "";
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const gen = await generateWithFallback({
+        contents: fixPrompt,
+        config: {
+          systemInstruction,
+          temperature: 0.3,
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: "object",
+            properties: {
+              plainEnglishIssue: { type: "string" },
+              evidence: { type: "string" },
+              remediationDiff: { type: "string" },
+              verificationSteps: { type: "array", items: { type: "string" } },
+              insufficientContext: { type: "boolean" },
+            },
+            required: [
+              "plainEnglishIssue",
+              "evidence",
+              "remediationDiff",
+              "verificationSteps",
+              "insufficientContext",
+            ],
+          } as any,
+        },
+      });
+      fixResponse = gen.response;
+      modelName = gen.modelName;
+      let raw = fixResponse.text || "";
+      lastRaw = raw;
 
-    // Clean up code fencing if the model ignored the raw-JSON instruction
-    if (raw.trimStart().startsWith("```")) {
-      const lines = raw.split("\n");
-      if (lines[0].trimStart().startsWith("```")) {
-        lines.shift();
+      // Clean up code fencing if the model ignored the raw-JSON instruction
+      if (raw.trimStart().startsWith("```")) {
+        const lines = raw.split("\n");
+        if (lines[0].trimStart().startsWith("```")) {
+          lines.shift();
+        }
+        while (lines.length && lines[lines.length - 1].trim() === "```") {
+          lines.pop();
+        }
+        if (lines.length && lines[lines.length - 1].trimStart().startsWith("```")) {
+          lines.pop();
+        }
+        raw = lines.join("\n");
       }
-      while (lines.length && lines[lines.length - 1].trim() === "```") {
-        lines.pop();
+      raw = raw.trim();
+
+      if (!raw) {
+        const finishReason = (fixResponse as any)?.candidates?.[0]?.finishReason;
+        if (finishReason === "SAFETY") {
+          throw new Error("The AI's safety filters blocked this content, so no suggested fix could be returned. No credits were charged.");
+        }
+        log.warn(`Suggest-fix attempt ${attempt}: empty response (finishReason=${finishReason || "unknown"})`);
+        continue;
       }
-      if (lines.length && lines[lines.length - 1].trimStart().startsWith("```")) {
-        lines.pop();
+
+      try {
+        parsed = JSON.parse(raw);
+        break;
+      } catch {
+        const finishReason = (fixResponse as any)?.candidates?.[0]?.finishReason;
+        // Log the raw response and stop reason so a parse failure becomes a
+        // fact (truncation vs formatting) instead of a guess.
+        log.warn(
+          `Suggest-fix attempt ${attempt}: JSON parse failed (finishReason=${finishReason || "unknown"}, ` +
+            `len=${raw.length}, tail=${JSON.stringify(raw.slice(-120))})`
+        );
       }
-      raw = lines.join("\n");
     }
-    raw = raw.trim();
 
-    if (!raw) {
-      const finishReason = (fixResponse as any)?.candidates?.[0]?.finishReason;
-      if (finishReason === "SAFETY") {
-        throw new Error("The AI's safety filters blocked this content, so no suggested fix could be returned. No credits were charged.");
-      }
-      throw new Error("The AI returned an empty response, so no suggested fix could be produced. No credits were charged — please try again.");
-    }
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
+    if (!parsed) {
       throw new Error("The AI returned a response that could not be read as a fix suggestion. No credits were charged — please try again.");
     }
 
