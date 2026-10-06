@@ -45,6 +45,13 @@ export default function AnatomyInspector({
   const streamInfo = useMemo(() => {
     if (!code || !code.trim()) return { isInterrupted: false, reason: "" };
 
+    // The ZIP-upload flow leaves a status message (not code) in the editor.
+    // Never offer healing for it — the model would treat the message as a
+    // prompt and generate a new app instead of healing.
+    if (code.includes("Custom ZIP Codebase Loaded Successfully!")) {
+      return { isInterrupted: false, reason: "" };
+    }
+
     let openBraces = 0;
     let closeBraces = 0;
     for (const char of code) {

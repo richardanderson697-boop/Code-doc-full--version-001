@@ -15,7 +15,7 @@ import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requir
 import { chargeForCall } from "../credits";
 import { getWorkspaceFile, listWorkspaceFiles } from "../workspace-store";
 import { verifySuggestedFix } from "../fix-verify";
-import { verifyHealedCode } from "../fix-verify";
+import { verifyHealedCode, hasActualCode } from "../fix-verify";
 
 const router = Router();
 
@@ -24,6 +24,13 @@ router.post("/api/heal", requireAuth, requireCredits("heal"), asyncRoute(async (
   const { code, prompt } = req.body;
   if (!code) {
     return res.status(400).json({ error: "Code content is required for healing" });
+  }
+  // Refuse comment-only input before any model call or charge. The ZIP-upload
+  // flow leaves a status message in the editor ("Custom ZIP Codebase Loaded
+  // Successfully!..."); there is no code to heal, and the model would treat
+  // the message as a prompt to generate a new app.
+  if (!hasActualCode(code)) {
+    return res.status(400).json({ error: "There's no code to heal — the editor holds a status message, not source code. No credits were charged." });
   }
 
   try {

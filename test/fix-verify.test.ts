@@ -1,5 +1,24 @@
 import { describe, it, expect } from "vitest";
-import { extractAddedCode, verifySuggestedFix, verifyHealedCode } from "../server/fix-verify";
+import { extractAddedCode, verifySuggestedFix, verifyHealedCode, hasActualCode } from "../server/fix-verify";
+
+describe("hasActualCode", () => {
+  it("rejects the ZIP-upload status message (comment-only)", () => {
+    const placeholder = `// Custom ZIP Codebase Loaded Successfully!\n//\n// Extracted 64 file(s) from your archive.\n// Click the "Scan Uploaded Codebase" button on the right to map and evaluate completeness.`;
+    expect(hasActualCode(placeholder)).toBe(false);
+  });
+
+  it("rejects block-comment-only input", () => {
+    expect(hasActualCode(`/* just a note */\n/* another */`)).toBe(false);
+  });
+
+  it("accepts real code", () => {
+    expect(hasActualCode(`import React from 'react';\n// a comment\nexport default function App() { return null; }`)).toBe(true);
+  });
+
+  it("rejects empty/whitespace", () => {
+    expect(hasActualCode("   \n  ")).toBe(false);
+  });
+});
 
 describe("extractAddedCode", () => {
   it("pulls + lines from a unified diff", () => {

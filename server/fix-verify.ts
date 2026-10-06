@@ -12,6 +12,23 @@ export interface FixVerification {
   issues: string[];
 }
 
+// Returns true if the input contains actual code (not just comments and
+// whitespace). The healer must refuse comment-only input: the ZIP-upload flow
+// sets the editor to a status message ("Custom ZIP Codebase Loaded
+// Successfully!..."), and the model reads that as a prompt to generate a
+// codebase-auditor UI instead of healing.
+export function hasActualCode(inputCode: string): boolean {
+  let s = String(inputCode || "");
+  // Strip block comments, then line comments, then string literals are kept
+  // (a string literal alone isn't healable code either, but that's rare).
+  s = s.replace(/\/\*[\s\S]*?\*\//g, "");
+  s = s
+    .split("\n")
+    .map((line) => line.replace(/\/\/.*$/, ""))
+    .join("\n");
+  return s.trim().length > 0;
+}
+
 // Verifies healed code actually heals the input instead of hallucinating a
 // new app. The healer once returned a branded demo app ("VibeCoder Codebase
 // Auditor") instead of the user's truncated code — the prompt identity leaked.
