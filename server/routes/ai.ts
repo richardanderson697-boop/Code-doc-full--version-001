@@ -264,7 +264,6 @@ ${effectiveContext || "(no code context available)"}`;
 
       try {
         parsed = JSON.parse(raw);
-        break;
       } catch {
         const finishReason = (fixResponse as any)?.candidates?.[0]?.finishReason;
         // Log the raw response and stop reason so a parse failure becomes a
@@ -273,7 +272,30 @@ ${effectiveContext || "(no code context available)"}`;
           `Suggest-fix attempt ${attempt}: JSON parse failed (finishReason=${finishReason || "unknown"}, ` +
             `len=${raw.length}, tail=${JSON.stringify(raw.slice(-120))})`
         );
+        continue;
       }
+
+      // Validate completeness inside the retry loop: a valid-JSON response
+      // with empty fields (no explanation, or no diff without a decline) is
+      // a transient model failure like any other — retry it, don't surface
+      // it. Log which fields were empty so the failure mode stays visible.
+      const insufficientRaw = (parsed as any).insufficientContext;
+      const insufficientCheck =
+        insufficientRaw === true || insufficientRaw === "true" || insufficientRaw === 1;
+      const issueCheck = String((parsed as any).plainEnglishIssue || "").trim();
+      const diffCheck = insufficientCheck
+        ? "n/a (declined)"
+        : String((parsed as any).remediationDiff || "").trim();
+      if (!issueCheck || (!insufficientCheck && !diffCheck)) {
+        log.warn(
+          `Suggest-fix attempt ${attempt}: incomplete JSON (insufficientContext=${JSON.stringify(insufficientRaw)}, ` +
+            `hasIssue=${!!issueCheck}, hasDiff=${!!diffCheck && diffCheck !== "n/a (declined)"}, ` +
+            `len=${raw.length}, tail=${JSON.stringify(raw.slice(-120))})`
+        );
+        parsed = null;
+        continue;
+      }
+      break;
     }
 
     if (!parsed) {
@@ -286,16 +308,20 @@ ${effectiveContext || "(no code context available)"}`;
       : typeof stepsRaw === "string" && stepsRaw.trim()
         ? [stepsRaw.trim()]
         : [];
-    const insufficient = parsed.insufficientContext === true;
+    // Lenient coercion: the schema says boolean, but a truthy string/"1"
+    // from the model is still a decline, not a broken response.
+    const insufficientRaw = parsed.insufficientContext;
+    const insufficient =
+      insufficientRaw === true || insufficientRaw === "true" || insufficientRaw === 1;
     const fix = {
       plainEnglishIssue: String(parsed.plainEnglishIssue || "").trim(),
       evidence: String(parsed.evidence || "").trim(),
       remediationDiff: insufficient ? "" : String(parsed.remediationDiff || "").trim(),
       verificationSteps,
     };
-    if (!fix.plainEnglishIssue || (!insufficient && !fix.remediationDiff)) {
-      throw new Error("The AI returned an incomplete fix suggestion (missing explanation or remediation). No credits were charged — please try again.");
-    }
+    // Completeness was already validated inside the retry loop; a parsed
+    // response reaching here has an explanation and (unless it declined) a
+    // diff. This is a final invariant, not a user-facing branch.
 
     if (insufficient) {
       // An honest "I can't see the code" is not a delivered fix: no charge.
