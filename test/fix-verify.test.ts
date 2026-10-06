@@ -54,9 +54,18 @@ describe("verifyHealedCode", () => {
 
   it("rejects a hallucinated demo app that ignores the input", () => {
     const input = `import React from 'react';\nfunction MyWidget() {\n  const [count, setCount] = useState(0);\n  return <button onClick={() => setCount(count + 1)}>{count}</button>;\n`;
-    const hallucinated = `import React from 'react';\n// VibeCoder Codebase Auditor\nconst MOCK_FILES = [];\nexport default function App() { return <div>Auditor</div>; }`;
+    const hallucinated = `// Custom ZIP Codebase Loaded Successfully!\nimport React, { useState, useMemo, useEffect } from 'react';\nconst generateMockCodebase = () => { return []; };\nexport default function App() {\n  const [files, setFiles] = useState(() => generateMockCodebase());\n  return <div>Auditor</div>;\n}`;
     const v = verifyHealedCode(input, hallucinated);
     expect(v.passed).toBe(false);
     expect(v.reason).toMatch(/doesn't contain the submitted code/);
+  });
+
+  it("rejects a mockup that shares only generic import lines with the input", () => {
+    // Regression: the first version sampled generic lines like
+    // `import React from 'react';` which appear in any React output,
+    // so mockups slipped through. Distinctive identifiers must match.
+    const input = `import React from 'react';\nfunction Dashboard() {\n  const [metrics, setMetrics] = useState(null);\n  return <div>{metrics}</div>;\n`;
+    const mockup = `import React from 'react';\nconst MOCK_FILES = [];\nexport default function App() { return <div>Mock</div>; }`;
+    expect(verifyHealedCode(input, mockup).passed).toBe(false);
   });
 });

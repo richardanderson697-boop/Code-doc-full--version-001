@@ -15,24 +15,41 @@ export interface FixVerification {
 // Verifies healed code actually heals the input instead of hallucinating a
 // new app. The healer once returned a branded demo app ("VibeCoder Codebase
 // Auditor") instead of the user's truncated code — the prompt identity leaked.
-// This samples lines from the input and requires most of them to appear in
-// the output; a genuine healing preserves the input, a hallucination doesn't.
+// A genuine healing = the input (minus the truncated tail) appearing as a
+// contiguous block in the output, plus the input's distinctive identifiers.
+// Scattered generic lines (like `import React from 'react';`) don't count.
 export function verifyHealedCode(inputCode: string, healedCode: string): { passed: boolean; reason?: string } {
-  const inputLines = String(inputCode || "")
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length > 12);
-  if (inputLines.length === 0) return { passed: true };
-  const sample: string[] = [];
-  const step = Math.max(1, Math.floor(inputLines.length / 10));
-  for (let i = 0; i < inputLines.length && sample.length < 10; i += step) {
-    sample.push(inputLines[i]);
+  const input = String(inputCode || "").trim();
+  const healed = String(healedCode || "").trim();
+  if (!input) return { passed: true };
+  if (!healed) return { passed: false, reason: "The heal returned empty output. No credits were charged." };
+
+  const norm = (s: string) => s.replace(/\s+/g, " ").trim();
+
+  // Primary check: the stable part of the input (dropping the last 2 lines,
+  // which may be cut mid-truncation) must appear verbatim in the output.
+  const inputLines = input.split("\n");
+  const stableLines = inputLines.slice(0, Math.max(1, inputLines.length - 2));
+  const stableBlock = norm(stableLines.join("\n"));
+  if (stableBlock.length > 40 && norm(healed).includes(stableBlock)) {
+    return { passed: true };
   }
-  const hits = sample.filter((line) => healedCode.includes(line)).length;
-  if (hits / sample.length < 0.5) {
+
+  // Fallback: distinctive identifiers (6+ chars, not keywords) from the input
+  // must mostly appear in the output. Generic imports don't count.
+  const stopwords = new Set([
+    "import", "export", "return", "const", "function", "default", "React",
+    "useState", "useEffect", "useMemo", "from", "require",
+  ]);
+  const identifiers = [...new Set(input.match(/\b[A-Za-z_][A-Za-z0-9_]{5,}\b/g) || [])].filter(
+    (w) => !stopwords.has(w)
+  );
+  if (identifiers.length === 0) return { passed: true };
+  const hits = identifiers.filter((id) => healed.includes(id)).length;
+  if (hits / identifiers.length < 0.5) {
     return {
       passed: false,
-      reason: `The healed output doesn't contain the submitted code (${hits}/${sample.length} sampled lines found) — the model generated new code instead of healing. No credits were charged.`,
+      reason: `The healed output doesn't contain the submitted code (${hits}/${identifiers.length} distinctive identifiers found) — the model generated new code instead of healing. No credits were charged.`,
     };
   }
   return { passed: true };
