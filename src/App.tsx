@@ -11,6 +11,8 @@ import AIDebugger from "./components/AIDebugger";
 import CodeAuditor from "./components/CodeAuditor";
 import AuthModal from "./components/AuthModal";
 import PricingModal from "./components/PricingModal";
+import Footer from "./components/Footer";
+import LegalModal, { LegalDoc } from "./components/LegalModal";
 import { parseReactAnatomy } from "./utils/anatomyParser";
 import { logError } from "./utils/logger";
 import { apiFetch, fetchMe, notifyBalance, AuthRequiredError, CreditsRequiredError } from "./utils/apiFetch";
@@ -57,6 +59,24 @@ export default function App() {
   const [user, setUser] = useState<{ id: string; email: string; credits: number } | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [pricingOpen, setPricingOpen] = useState(false);
+  // Legal docs via URL hash (#privacy / #terms) — stable, linkable URLs
+  // without a router. Footer links set the hash; closing clears it.
+  const [legalDoc, setLegalDoc] = useState<LegalDoc | null>(() => {
+    const h = window.location.hash.replace("#", "");
+    return h === "privacy" || h === "terms" ? h : null;
+  });
+  useEffect(() => {
+    const onHash = () => {
+      const h = window.location.hash.replace("#", "");
+      setLegalDoc(h === "privacy" || h === "terms" ? h : null);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const closeLegal = () => {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    setLegalDoc(null);
+  };
   const [pricingNotice, setPricingNotice] = useState("");
 
   useEffect(() => {
@@ -999,6 +1019,10 @@ export default function App() {
         notice={pricingNotice}
         onClose={() => { setPricingOpen(false); void fetchMe().then(setUser); }}
       />
+      {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
+
+      {/* Site footer with legal links */}
+      <Footer />
     </div>
   );
 }

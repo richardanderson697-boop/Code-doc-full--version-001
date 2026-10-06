@@ -109,6 +109,23 @@ export default function PricingModal({ open, onClose, notice }: Props) {
           <Check className="w-3 h-3 mt-0.5 shrink-0" />
           Secure checkout by Stripe. The free deterministic PreFlight security scan always costs 0 credits.
         </p>
+        <p className="text-[11px] text-slate-600 mt-2 text-center">
+          Purchases are subject to our{" "}
+          <button
+            onClick={() => { window.location.hash = "terms"; }}
+            className="text-slate-500 hover:text-slate-300 underline underline-offset-2"
+          >
+            Terms of Service
+          </button>{" "}
+          and{" "}
+          <button
+            onClick={() => { window.location.hash = "privacy"; }}
+            className="text-slate-500 hover:text-slate-300 underline underline-offset-2"
+          >
+            Privacy Policy
+          </button>
+          .
+        </p>
       </div>
     </div>
   );

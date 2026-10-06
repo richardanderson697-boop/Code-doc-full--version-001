@@ -108,6 +108,27 @@ export default function AuthModal({ open, onClose, onAuthed }: Props) {
           >
             {busy ? "Please wait…" : mode === "signup" ? "Create account" : "Sign in"}
           </button>
+          {mode === "signup" && (
+            <p className="text-[11px] text-slate-500 text-center leading-relaxed">
+              By creating an account, you agree to our{" "}
+              <button
+                type="button"
+                onClick={() => { window.location.hash = "terms"; }}
+                className="text-slate-400 hover:text-slate-200 underline underline-offset-2"
+              >
+                Terms of Service
+              </button>{" "}
+              and{" "}
+              <button
+                type="button"
+                onClick={() => { window.location.hash = "privacy"; }}
+                className="text-slate-400 hover:text-slate-200 underline underline-offset-2"
+              >
+                Privacy Policy
+              </button>
+              .
+            </p>
+          )}
         </form>
       </div>
     </div>
