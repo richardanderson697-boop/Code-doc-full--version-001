@@ -1354,6 +1354,11 @@ export function probeAPIRouteAuth(files) {
       ) ||
       /(?<!\w)auth\s*\(\s*\)/.test(c) ||
       /verifyToken\s*\(/.test(c) ||
+      // Custom authenticate* helpers (e.g. authenticatePlatformKey(),
+      // authenticateUser()): a real auth gate the allowlist would otherwise
+      // miss, producing a false "no auth call" finding. \b keeps this safe
+      // from substring matches inside longer identifiers.
+      /\bauthenticate\w*\s*\(/i.test(c) ||
       hasJwtVerifyWithSecret ||
       // Common framework auth signals:
       /\blocals\.(?:user|session|auth)\b/.test(c) || // SvelteKit / Astro locals
