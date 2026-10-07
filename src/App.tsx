@@ -58,6 +58,33 @@ export default function App() {
   // Auth + credits
   const [user, setUser] = useState<{ id: string; email: string; credits: number } | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
+  // Password-reset deep link: the reset email points at
+  // /#reset-password?token=... — opening the auth modal in reset mode.
+  const parseResetToken = () => {
+    const m = window.location.hash.match(/^#reset-password\?token=([A-Za-z0-9]+)/);
+    return m ? m[1] : null;
+  };
+  const [resetToken, setResetToken] = useState<string | null>(() => parseResetToken());
+  const [authInitialMode, setAuthInitialMode] = useState<"login" | "signup" | "forgot" | "reset">("signup");
+  useEffect(() => {
+    const onHash = () => {
+      const t = parseResetToken();
+      if (t) {
+        setResetToken(t);
+        setAuthInitialMode("reset");
+        setAuthOpen(true);
+      }
+    };
+    window.addEventListener("hashchange", onHash);
+    // Handle the case where the page loaded directly on the reset hash.
+    onHash();
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const clearResetToken = () => {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    setResetToken(null);
+    setAuthInitialMode("signup");
+  };
   const [pricingOpen, setPricingOpen] = useState(false);
   // Legal docs via URL hash (#privacy / #terms) — stable, linkable URLs
   // without a router. Footer links set the hash; closing clears it.
@@ -1013,6 +1040,9 @@ export default function App() {
         open={authOpen}
         onClose={() => setAuthOpen(false)}
         onAuthed={(u) => { setUser(u); setAuthOpen(false); }}
+        initialMode={authInitialMode}
+        resetToken={resetToken}
+        onResetComplete={clearResetToken}
       />
       <PricingModal
         open={pricingOpen}

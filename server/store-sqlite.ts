@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS workspace_files (
   PRIMARY KEY (user_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_files_user ON workspace_files(user_id);
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  token_hash TEXT NOT NULL UNIQUE,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash ON password_reset_tokens(token_hash);
 `;
 
 function toSqlite(sql: string): string {
