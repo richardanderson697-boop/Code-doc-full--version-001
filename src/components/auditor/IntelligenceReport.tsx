@@ -52,7 +52,7 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
 
   return (
     <>
-              intelResult.notEnoughFiles ? (
+      {intelResult.notEnoughFiles ? (
                 <div className="flex flex-col items-center justify-center p-8 text-center bg-slate-950/40 border border-amber-500/15 rounded-xl space-y-4 select-text animate-fadeIn">
                   <div className="p-3 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-full">
                     <FileWarning className="w-8 h-8" />
@@ -423,7 +423,7 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                 </div>
 
               </div>
-              )
+              )}
       {finalreadOpen && (
         <FinalReadOverlay
           audit={intelResultToFinalReadInput(intelResult)}
