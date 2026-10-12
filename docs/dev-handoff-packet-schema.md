@@ -1,10 +1,19 @@
-# Developer Handoff Packet — schema v1
+# Developer Handoff Packet — schema v1.1
 
 The **developer handoff packet** is the shared Markdown format both GradeVibes
-(consumer) and FinalRead (investor) emit when an audit finding gets a
-*suggested* fix. It is the first concrete artifact of the investor-Q&A
+(consumer) and FinalRead (investor) emit for *suggested* fixes. It is the first concrete artifact of the investor-Q&A
 developer handoff: portable, review-only, and shaped so a developer can act on
 it without ever seeing the product UI.
+
+## v1.1: multi-finding packets
+
+v1 packets cover one finding. v1.1 packets may cover N findings selected by
+checkbox: one header (with a required "**Findings included:** N of M" line),
+one self-contained section per finding, and the runtime disclaimer + scope
+notice exactly once at the end. Findings without a generated AI suggestion
+fall back to the scanner's own wording with an explicit notice — nothing is
+invented to fill the gap. Exporting a packet is free; it only renders
+suggestions that were already generated.
 
 ## Design rules
 

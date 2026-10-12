@@ -150,6 +150,7 @@ export const MIN_CREDITS = {
   generate: 25, // SSE code generation
   workspaceFile: 15,
   manifest: 5, // multi-file project planning (small JSON response)
+  finalreadAsk: 3, // FinalRead stakeholder Q&A (grounded answers only; declines free)
 } as const;
 
 export type CreditTier = keyof typeof MIN_CREDITS;

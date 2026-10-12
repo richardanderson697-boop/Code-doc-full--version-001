@@ -6,6 +6,7 @@ import { Activity, AlertCircle, Brain, Check, CheckCircle2, CheckSquare, Copy, F
 import PreFlightFindingsPanel from "./PreFlightFindingsPanel";
 import AstVoiceSummaryCard from "../AstVoiceSummaryCard";
 import VoiceReadoutButton from "../VoiceReadoutButton";
+import FinalReadOverlay, { intelResultToFinalReadInput } from "./FinalReadOverlay";
 
 interface IntelligenceReportProps {
   intelResult: any;
@@ -16,6 +17,7 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
   const [intelReportCopied, setIntelReportCopied] = useState(false);
   const [fileLedgerSearch, setFileLedgerSearch] = useState("");
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
+  const [finalreadOpen, setFinalreadOpen] = useState(false);
 
   const handleCopyIntelReport = () => {
     if (!intelResult) return;
@@ -49,6 +51,7 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
   };
 
   return (
+    <>
               intelResult.notEnoughFiles ? (
                 <div className="flex flex-col items-center justify-center p-8 text-center bg-slate-950/40 border border-amber-500/15 rounded-xl space-y-4 select-text animate-fadeIn">
                   <div className="p-3 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-full">
@@ -93,6 +96,14 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                         <span className="font-mono text-[10px]">Copy Workspace Ledger</span>
                       </>
                     )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setFinalreadOpen(true)}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-lg text-xs font-medium border border-indigo-500/30 transition duration-150 cursor-pointer"
+                  >
+                    <Brain className="w-3.5 h-3.5" />
+                    <span className="font-mono text-[10px]">FinalRead stakeholder view</span>
                   </button>
                 </div>
 
@@ -413,5 +424,12 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
 
               </div>
               )
+      {finalreadOpen && (
+        <FinalReadOverlay
+          audit={intelResultToFinalReadInput(intelResult)}
+          onClose={() => setFinalreadOpen(false)}
+        />
+      )}
+    </>
   );
 }
