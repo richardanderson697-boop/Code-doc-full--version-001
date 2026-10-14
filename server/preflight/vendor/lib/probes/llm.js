@@ -187,8 +187,8 @@ export function probeLLMSecurity(files) {
     const hasLLMCall =
       /(openai|anthropic|cohere|together|replicate|groq)\.(?:chat|completions|messages|generate|complete)/i.test(
         content
-      );
-    if (hasLLMCall && !/max_tokens|maxTokens|max_output_tokens/i.test(content)) {
+      ) || /models\.generateContent/i.test(content); // @google/genai
+    if (hasLLMCall && !/max_tokens|maxTokens|max_output_tokens|maxOutputTokens/i.test(content)) {
       findings.push({
         id: `llm-unbounded-${file.path}`,
         probe: 'LLM Security',
