@@ -53,6 +53,35 @@ export default function WelcomeView({
   const [zipError, setZipError] = useState("");
   const [dragActive, setDragActive] = useState(false);
 
+  // GitHub repo URL import states
+  const [repoUrl, setRepoUrl] = useState("");
+  const [repoLoading, setRepoLoading] = useState(false);
+
+  const handleRepoImport = async () => {
+    const url = repoUrl.trim();
+    if (!url || repoLoading || zipLoading) return;
+    setRepoLoading(true);
+    setZipError("");
+    try {
+      const response = await apiFetch("/api/import-repo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoUrl: url })
+      });
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || "Failed to import repository.");
+      }
+      const parsed = await response.json();
+      setRepoUrl("");
+      onUploadZipCodebase(parsed.files || []);
+    } catch (e: any) {
+      setZipError(e.message || "An error occurred during repo import.");
+    } finally {
+      setRepoLoading(false);
+    }
+  };
+
   const templates = [
     {
       title: "Task Matrix",
@@ -439,6 +468,35 @@ export default function WelcomeView({
               </p>
             )}
           </div>
+
+          <div className="flex items-center gap-2 px-1">
+            <div className="h-px flex-1 bg-slate-800/60" />
+            <span className="text-[9px] uppercase tracking-widest text-slate-500 font-mono">or</span>
+            <div className="h-px flex-1 bg-slate-800/60" />
+          </div>
+          <div className="flex gap-2">
+            <input
+              type="url"
+              value={repoUrl}
+              onChange={(e) => setRepoUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void handleRepoImport(); }}
+              placeholder="Paste a GitHub repo URL — https://github.com/owner/repo"
+              spellCheck={false}
+              disabled={repoLoading || zipLoading}
+              className="flex-1 min-w-0 bg-slate-950/80 border border-slate-800 rounded-xl px-3 py-2.5 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/60 disabled:opacity-50"
+            />
+            <button
+              type="button"
+              onClick={() => void handleRepoImport()}
+              disabled={repoLoading || zipLoading || !repoUrl.trim()}
+              className="px-4 py-2.5 bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-200 border border-indigo-500/25 rounded-xl text-[10px] font-bold uppercase tracking-wider transition duration-150 cursor-pointer whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {repoLoading ? "Importing…" : "Import repo"}
+            </button>
+          </div>
+          <p className="text-[9px] text-slate-600 font-mono text-center -mt-1">
+            Public repositories only — fetched as a ZIP straight from GitHub, no upload needed.
+          </p>
 
           <div className="bg-indigo-950/15 border border-indigo-500/10 rounded-xl p-4 flex items-start gap-3">
             <FolderArchive className="w-5 h-5 text-indigo-400 mt-0.5 shrink-0" />
