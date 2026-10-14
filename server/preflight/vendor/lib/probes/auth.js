@@ -1258,6 +1258,123 @@ export function probeCookieFlags(files) {
   return findings;
 }
 
+// --- Delegated-handler detection (option b) ---
+//
+// The auth probe is per-file: it cannot see a handler whose implementation
+// lives in another file. Asserting "without auth check" at CRITICAL from
+// per-file evidence over-claims — the check may exist where the probe can't
+// see it (e.g. server.ts registers POST /api/billing/webhook and delegates
+// to handleStripeWebhook, whose HMAC verification lives in billing.ts).
+// When the route's handler is delegated out of this file, report honestly
+// ("could not verify", low) instead of asserting a negative (CRITICAL).
+
+function isDefinedInFile(name, content) {
+  const esc = name.replace(/\$/g, '\\$');
+  // A real implementation in this file: function NAME(, const NAME = function,
+  // const NAME = (, NAME = (...) =>, NAME = x =>. Import/require bindings do
+  // NOT count — their bodies are invisible to the per-file probe.
+  return new RegExp(
+    `\\bfunction\\s+${esc}\\s*\\(` +
+      `|\\b(?:const|let|var)\\s+${esc}\\s*=\\s*(?:async\\s+)?function\\b` +
+      `|\\b(?:const|let|var)\\s+${esc}\\s*=\\s*(?:async\\s*)?\\(` +
+      `|\\b${esc}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>` +
+      `|\\b${esc}\\s*=\\s*(?:async\\s*)?[A-Za-z_$][\\w$]*\\s*=>`
+  ).test(content);
+}
+
+function extractCallArgs(content, fromIndex) {
+  const openIdx = content.indexOf('(', fromIndex);
+  if (openIdx === -1) return null;
+  let depth = 0;
+  let inStr = null;
+  for (let i = openIdx; i < content.length; i++) {
+    const ch = content[i];
+    if (inStr) {
+      if (ch === inStr && content[i - 1] !== '\\') inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch;
+      continue;
+    }
+    if (ch === '/' && content[i + 1] === '/') {
+      const nl = content.indexOf('\n', i);
+      i = nl === -1 ? content.length : nl;
+      continue;
+    }
+    if (ch === '/' && content[i + 1] === '*') {
+      const ec = content.indexOf('*/', i + 2);
+      i = ec === -1 ? content.length : ec + 1;
+      continue;
+    }
+    // Note: `${}` inside template literals is not tracked; a route call
+    // whose args contain one degrades to null and keeps today's behavior.
+    if (ch === '(') depth++;
+    else if (ch === ')') {
+      depth--;
+      if (depth === 0) return content.slice(openIdx + 1, i);
+    }
+  }
+  return null;
+}
+
+function splitTopLevelArgs(argsText) {
+  const args = [];
+  let depth = 0;
+  let cur = '';
+  let inStr = null;
+  for (let i = 0; i < argsText.length; i++) {
+    const ch = argsText[i];
+    if (inStr) {
+      cur += ch;
+      if (ch === inStr && argsText[i - 1] !== '\\') inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      inStr = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') depth--;
+    if (ch === ',' && depth === 0) {
+      args.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  args.push(cur);
+  return args;
+}
+
+function isDelegatedRouteHandler(argsText, fileContent) {
+  if (!argsText) return false;
+  const args = splitTopLevelArgs(argsText);
+  const handler = args[args.length - 1].trim();
+  // Case 1: bare identifier handler, e.g. app.post('/x', myHandler).
+  // Delegated when the implementation is not visible in this file.
+  const bare = handler.match(/^([A-Za-z_$][\w$]*)$/);
+  if (bare) return !isDefinedInFile(bare[1], fileContent);
+  // Case 2: inline function whose body opens with a bare call to an
+  // out-of-file function, e.g. (req, res) => { handleStripeWebhook(req, res).catch(...); }.
+  // Method calls (db.run(...)) don't count: the call site — and usually the
+  // SQL — is visible right here.
+  let body = null;
+  const arrowIdx = handler.indexOf('=>');
+  if (arrowIdx !== -1) {
+    body = handler.slice(arrowIdx + 2).trim();
+  } else {
+    const fnMatch = handler.match(/^function\s*[A-Za-z_$][\w$]*\s*\([^)]*\)\s*\{([\s\S]*)\}\s*$/);
+    if (fnMatch) body = fnMatch[1].trim();
+  }
+  if (body == null) return false;
+  if (body.startsWith('{') && body.endsWith('}')) body = body.slice(1, -1).trim();
+  const callMatch = body.match(/^(?:return\s+)?([A-Za-z_$][\w$]*)\s*\(/);
+  if (!callMatch) return false;
+  return !isDefinedInFile(callMatch[1], fileContent);
+}
+
 // --- API Route Auth ---
 
 export function probeAPIRouteAuth(files) {
@@ -1497,23 +1614,33 @@ export function probeAPIRouteAuth(files) {
         const routeDestructive = method === 'DELETE' || method === 'PUT' || method === 'PATCH';
         if (!routeSensitive && !routeDestructive) continue;
         const routeLine = c.slice(0, rm.index).split('\n').length;
-        const sev = routeSensitive ? sensitiveSeverity : destructiveSeverity;
+        // Delegated handler: the implementation lives outside this file, so
+        // the per-file probe cannot establish whether auth happens. Report
+        // the honest "could not verify" at low instead of asserting
+        // "without auth check" at CRITICAL.
+        const delegated = isDelegatedRouteHandler(extractCallArgs(c, rm.index), c);
+        const sev = delegated ? 'low' : routeSensitive ? sensitiveSeverity : destructiveSeverity;
         emittedPerRoute = true;
         findings.push({
           id: `api-noauth-${file.path}-${routeLine}`,
           probe: 'API Route Auth',
-          title: hasAuthAcknowledgmentComment
-            ? `${method} ${routePath} without static auth check (TODO/FIXME/CDN-gated)`
-            : `${method} ${routePath} without auth check`,
+          title: delegated
+            ? `${method} ${routePath} — handler delegated out of this file, auth could not be verified`
+            : hasAuthAcknowledgmentComment
+              ? `${method} ${routePath} without static auth check (TODO/FIXME/CDN-gated)`
+              : `${method} ${routePath} without auth check`,
           severity: sev,
           category: 'Auth & Access',
           cwe: 'CWE-306',
           file: file.path,
           line: routeLine,
-          evidence: `${method} ${routePath} — no auth middleware or auth call detected in this file`,
-          remediation:
-            `API routes are reachable by direct fetch from anywhere. Add authentication to ${method} ${routePath}: ${authRemediation} ` +
-            'Manual review recommended if auth lives in middleware not visible here.',
+          evidence: delegated
+            ? `${method} ${routePath} — handler implementation is not visible in this file; authentication could not be verified from static source`
+            : `${method} ${routePath} — no auth middleware or auth call detected in this file`,
+          remediation: delegated
+            ? `Confirm the delegated handler authenticates the caller (auth middleware or signature verification in the handler's own file), or inline the check so it is statically visible.`
+            : `API routes are reachable by direct fetch from anywhere. Add authentication to ${method} ${routePath}: ${authRemediation} ` +
+              'Manual review recommended if auth lives in middleware not visible here.',
         });
       }
     }
