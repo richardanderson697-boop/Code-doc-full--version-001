@@ -101,6 +101,8 @@ export default function CodeAuditor({
   const [zipLoading, setZipLoading] = useState(false);
   const [zipError, setZipError] = useState("");
   const [dragActive, setDragActive] = useState(false);
+  // GitHub repo-URL import (paste-a-URL onboarding; public repos only)
+  const [repoUrl, setRepoUrl] = useState("");
 
   // Stale-workspace banner: the uploaded workspace is per-user, not
   // per-project, so files from an earlier upload survive into a new project.
@@ -299,6 +301,46 @@ export default function CodeAuditor({
       };
     } catch (e: any) {
       setZipError(e.message || "An unexpected error occurred.");
+      setZipLoading(false);
+    }
+  };
+
+  const handleRepoImport = async () => {
+    const url = repoUrl.trim();
+    if (!url) {
+      setZipError("Paste a GitHub repository URL first.");
+      return;
+    }
+    setZipLoading(true);
+    setZipError("");
+    try {
+      const response = await apiFetch("/api/import-repo", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repoUrl: url })
+      });
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        const text = await response.text();
+        throw new Error(`Server returned an unexpected response. The backend might still be initializing. Details: ${text.slice(0, 150)}...`);
+      }
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || "Failed to import repository.");
+      }
+
+      const parsed = await response.json();
+      setZipFiles(parsed.files || []);
+      setZipUploaded(true);
+      setRepoUrl("");
+      setAuditMode("project-intelligence");
+      setIntelResult(null);
+      setIntelStatus("idle");
+    } catch (e: any) {
+      setZipError(e.message || "An error occurred during repository import.");
+    } finally {
       setZipLoading(false);
     }
   };
@@ -1247,6 +1289,7 @@ export default function CodeAuditor({
                       </div>
                     </div>
                   ) : (
+                    <div>
                     <label className="flex flex-col items-center justify-center cursor-pointer py-3 space-y-2">
                       <div className="p-2 bg-slate-900 border border-slate-800 rounded-xl text-slate-400 hover:text-indigo-400 transition-colors">
                         <Upload className="w-5 h-5" />
@@ -1270,6 +1313,33 @@ export default function CodeAuditor({
                         className="hidden" 
                       />
                     </label>
+                    <div className="flex items-center gap-2 px-1 pt-1">
+                      <div className="h-px flex-1 bg-slate-800/60" />
+                      <span className="text-[9px] uppercase tracking-widest text-slate-500 font-mono">or</span>
+                      <div className="h-px flex-1 bg-slate-800/60" />
+                    </div>
+                    <div className="flex gap-2 pt-2">
+                      <input
+                        type="url"
+                        value={repoUrl}
+                        onChange={(e) => setRepoUrl(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === "Enter") void handleRepoImport(); }}
+                        placeholder="Paste a GitHub repo URL — https://github.com/owner/repo"
+                        spellCheck={false}
+                        className="flex-1 min-w-0 bg-slate-950/80 border border-slate-800 rounded-xl px-3 py-2 text-xs font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/60"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleRepoImport()}
+                        className="px-3 py-2 bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 hover:text-indigo-200 border border-indigo-500/25 rounded-xl text-[10px] font-bold uppercase tracking-wider transition duration-150 cursor-pointer whitespace-nowrap"
+                      >
+                        Import repo
+                      </button>
+                    </div>
+                    <p className="text-[9px] text-slate-600 mt-1.5 font-mono text-center">
+                      Public repositories only — fetched as a ZIP straight from GitHub, no upload needed.
+                    </p>
+                    </div>
                   )}
 
                   {zipError && (

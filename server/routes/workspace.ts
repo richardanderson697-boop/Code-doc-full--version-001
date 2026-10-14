@@ -23,6 +23,12 @@ import {
   replaceWorkspaceFiles,
 } from "../workspace-store";
 import { readZipHeader, hasUnsafeEntryName } from "../zip-guard";
+import {
+  parseGitHubRepoUrl,
+  isValidRef,
+  buildArchiveUrl,
+  isAllowedFetchHost,
+} from "../repo-import";
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
@@ -37,21 +43,95 @@ export const MAX_UNCOMPRESSED_BYTES = 200 * 1024 * 1024;
 
 const EMPTY_WORKSPACE_ERROR = "Workspace is empty \u2014 nothing to download.";
 
+// Shared ZIP ingestion: validates a ZIP buffer and atomically replaces the
+// user's workspace files. Used by manual uploads and repo-URL imports.
+// Throws { status, message } on validation failure so routes can map it.
+export async function ingestZipBuffer(
+  userId: string,
+  buffer: Buffer,
+  opts: { stripTopLevelDir?: boolean } = {}
+): Promise<{ fileCount: number }> {
+  const fail = (status: number, message: string): never => {
+    throw { status, message };
+  };
+  if (buffer.length > MAX_ARCHIVE_BYTES) {
+    fail(
+      400,
+      `ZIP archive is ${Math.round(buffer.length / 1024 / 1024)}MB (limit ${MAX_ARCHIVE_BYTES / 1024 / 1024}MB).`
+    );
+  }
+
+  // Entry count comes from the archive's own directory record. Reading it
+  // here is O(1); asking a ZIP library for the entries allocates ~8.7KB of
+  // heap each, so the limit has to be checked before that call, not after.
+  const header = readZipHeader(buffer);
+  if (!header) {
+    fail(400, "File is not a valid ZIP archive.");
+  }
+  if (header.entryCount > MAX_ZIP_ENTRIES) {
+    fail(
+      400,
+      `ZIP declares ${header.entryCount} entries (limit ${MAX_ZIP_ENTRIES}). Please upload a smaller codebase.`
+    );
+  }
+
+  const zip = new AdmZip(buffer);
+  const entries = zip.getEntries();
+  // The declared count is attacker-controlled; re-check the real one.
+  if (entries.length > MAX_ZIP_ENTRIES) {
+    fail(
+      400,
+      `ZIP contains ${entries.length} entries (limit ${MAX_ZIP_ENTRIES}). Please upload a smaller codebase.`
+    );
+  }
+  let totalUncompressed = 0;
+  for (const entry of entries) {
+    if (hasUnsafeEntryName(entry.entryName)) {
+      fail(400, "ZIP contains unsafe file paths and was rejected.");
+    }
+    totalUncompressed += entry.header.size;
+  }
+  if (totalUncompressed > MAX_UNCOMPRESSED_BYTES) {
+    fail(400, "ZIP expands beyond the 200MB limit and was rejected.");
+  }
+
+  // GitHub archive zips wrap everything in a single "<repo>-<branch>/" dir.
+  // Strip it so finding paths stay clean — only when EVERY file entry shares
+  // the same single top-level segment.
+  let prefix = "";
+  if (opts.stripTopLevelDir) {
+    const tops = new Set<string>();
+    for (const entry of entries) {
+      if (entry.isDirectory) continue;
+      const first = entry.entryName.split("/")[0];
+      if (first) tops.add(first);
+    }
+    if (tops.size === 1) prefix = [...tops][0] + "/";
+  }
+
+  // Validation passed: only now replace the existing workspace, atomically.
+  const ingest: { path: string; content: string }[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory) continue;
+    let name = entry.entryName;
+    if (prefix && name.startsWith(prefix)) name = name.slice(prefix.length);
+    const relPath = cleanWorkspacePath(name);
+    if (!relPath || isIgnorableWorkspacePath(relPath) || !isWorkspaceFileExt(relPath)) continue;
+    ingest.push({ path: relPath, content: entry.getData().toString("utf8") });
+  }
+  await replaceWorkspaceFiles(userId, ingest);
+  return { fileCount: ingest.length };
+}
+
 // ZIP Codebase Upload, Status, and Clear Endpoints
 router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const { zipBase64 } = req.body;
-  if (!zipBase64) {
+  if (typeof zipBase64 !== "string" || !zipBase64) {
     return res.status(400).json({ error: "No ZIP file data provided." });
   }
 
   try {
     const userId = req.user!.id;
-
-    // Validate the archive completely before touching the existing workspace:
-    // a malformed upload used to delete the user's files and then fail.
-    if (typeof zipBase64 !== "string") {
-      return res.status(400).json({ error: "No ZIP file data provided." });
-    }
 
     // Reject on the encoded length, before decoding. Checking buffer.length
     // afterwards still performed the ~75MB allocation it was meant to prevent.
@@ -63,55 +143,7 @@ router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest
       });
     }
     const buffer = Buffer.from(zipBase64, "base64");
-    if (buffer.length > MAX_ARCHIVE_BYTES) {
-      return res.status(400).json({
-        error: `ZIP archive is ${Math.round(buffer.length / 1024 / 1024)}MB (limit ${MAX_ARCHIVE_BYTES / 1024 / 1024}MB).`
-      });
-    }
-
-    // Entry count comes from the archive's own directory record. Reading it
-    // here is O(1); asking a ZIP library for the entries allocates ~8.7KB of
-    // heap each, so the limit has to be checked before that call, not after.
-    const header = readZipHeader(buffer);
-    if (!header) {
-      return res.status(400).json({ error: "File is not a valid ZIP archive." });
-    }
-    if (header.entryCount > MAX_ZIP_ENTRIES) {
-      return res.status(400).json({
-        error: `ZIP declares ${header.entryCount} entries (limit ${MAX_ZIP_ENTRIES}). Please upload a smaller codebase.`
-      });
-    }
-
-    const zip = new AdmZip(buffer);
-    const entries = zip.getEntries();
-    // The declared count is attacker-controlled; re-check the real one.
-    if (entries.length > MAX_ZIP_ENTRIES) {
-      return res.status(400).json({
-        error: `ZIP contains ${entries.length} entries (limit ${MAX_ZIP_ENTRIES}). Please upload a smaller codebase.`
-      });
-    }
-    let totalUncompressed = 0;
-    for (const entry of entries) {
-      if (hasUnsafeEntryName(entry.entryName)) {
-        return res.status(400).json({ error: "ZIP contains unsafe file paths and was rejected." });
-      }
-      totalUncompressed += entry.header.size;
-    }
-    if (totalUncompressed > MAX_UNCOMPRESSED_BYTES) {
-      return res.status(400).json({
-        error: "ZIP expands beyond the 200MB limit and was rejected."
-      });
-    }
-
-    // Validation passed: only now replace the existing workspace, atomically.
-    const ingest: { path: string; content: string }[] = [];
-    for (const entry of entries) {
-      if (entry.isDirectory) continue;
-      const relPath = cleanWorkspacePath(entry.entryName);
-      if (!relPath || isIgnorableWorkspacePath(relPath) || !isWorkspaceFileExt(relPath)) continue;
-      ingest.push({ path: relPath, content: entry.getData().toString("utf8") });
-    }
-    await replaceWorkspaceFiles(userId, ingest);
+    await ingestZipBuffer(userId, buffer);
 
     const files = await listWorkspaceFiles(userId);
     res.json({
@@ -120,8 +152,117 @@ router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest
       files: files.map(f => ({ path: f.path, lineCount: f.lineCount }))
     });
   } catch (error: any) {
+    if (error?.status) {
+      return res.status(error.status).json({ error: error.message });
+    }
     log.error("ZIP Extraction Error:", error);
     res.status(500).json({ error: "Failed to extract ZIP file. Check that the archive is a valid ZIP." });
+  }
+}));
+
+// GitHub repo import: paste-a-URL onboarding. Fetches the repo's ZIP archive
+// server-side and ingests it through the same validated pipeline as manual
+// uploads. Public repos only in v1.
+const REPO_FETCH_TIMEOUT_MS = 60000;
+const REPO_FETCH_MAX_REDIRECTS = 5;
+
+async function fetchRepoArchive(owner: string, repo: string, branch: string): Promise<Buffer> {
+  // The URL is built from validated components only — never from raw user
+  // input (see server/repo-import.ts).
+  let current = buildArchiveUrl(owner, repo, branch);
+  for (let hops = 0; hops < REPO_FETCH_MAX_REDIRECTS; hops++) {
+    const res = await fetch(current, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(REPO_FETCH_TIMEOUT_MS),
+      headers: { "User-Agent": "GradeVibes-repo-import" },
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get("location");
+      if (!loc) throw { status: 502, message: "GitHub returned a redirect with no location." };
+      const next = new URL(loc, current);
+      if (next.protocol !== "https:" || !isAllowedFetchHost(next.hostname)) {
+        throw { status: 502, message: "GitHub redirected to an unexpected host; fetch aborted." };
+      }
+      current = next.toString();
+      continue;
+    }
+    if (res.status === 404) throw { status: 404, message: `Branch "${branch}" not found.` };
+    if (!res.ok || !res.body) throw { status: 502, message: `GitHub fetch failed (HTTP ${res.status}).` };
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_ARCHIVE_BYTES) {
+      throw {
+        status: 400,
+        message: `Repository archive is larger than the ${MAX_ARCHIVE_BYTES / 1024 / 1024}MB limit.`
+      };
+    }
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const reader = res.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_ARCHIVE_BYTES) {
+          await reader.cancel();
+          throw {
+            status: 400,
+            message: `Repository archive exceeds the ${MAX_ARCHIVE_BYTES / 1024 / 1024}MB limit.`
+          };
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    return Buffer.concat(chunks);
+  }
+  throw { status: 502, message: "Too many redirects fetching the repository." };
+}
+
+router.post("/api/import-repo", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
+  const userId = req.user!.id;
+  const parsed = parseGitHubRepoUrl(req.body?.repoUrl);
+  if (!parsed) {
+    return res.status(400).json({
+      error: "Please paste a valid GitHub repository URL, e.g. https://github.com/owner/repo."
+    });
+  }
+  const ref = req.body?.ref;
+  if (ref !== undefined && !isValidRef(ref)) {
+    return res.status(400).json({ error: "Invalid branch name." });
+  }
+  const branches = ref ? [ref] : ["main", "master"];
+  let buffer: Buffer | null = null;
+  for (const branch of branches) {
+    try {
+      buffer = await fetchRepoArchive(parsed.owner, parsed.repo, branch);
+      break;
+    } catch (err: any) {
+      if (err?.status === 404) continue; // try the next candidate branch
+      if (err?.status) return res.status(err.status).json({ error: err.message });
+      throw err;
+    }
+  }
+  if (!buffer) {
+    return res.status(404).json({
+      error: `Could not fetch the repository (tried branches ${branches.join(", ")}). Check the URL and that the repo is public.`
+    });
+  }
+  try {
+    await ingestZipBuffer(userId, buffer, { stripTopLevelDir: true });
+    const files = await listWorkspaceFiles(userId);
+    res.json({
+      success: true,
+      message: `Imported ${files.length} files from github.com/${parsed.owner}/${parsed.repo}.`,
+      files: files.map(f => ({ path: f.path, lineCount: f.lineCount }))
+    });
+  } catch (error: any) {
+    if (error?.status) {
+      return res.status(error.status).json({ error: error.message });
+    }
+    log.error("Repo Import Error:", error);
+    res.status(500).json({ error: "Failed to import the repository." });
   }
 }));
 
