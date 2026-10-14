@@ -16,18 +16,23 @@ export interface ParsedRepo {
  *  accepted in v1 (public repos). Returns null for anything else. */
 export function parseGitHubRepoUrl(input: unknown): ParsedRepo | null {
   if (typeof input !== "string") return null;
+  let raw = input.trim();
+  // Mobile pastes and typed URLs often omit the scheme — assume https.
+  if (raw && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(raw)) {
+    raw = "https://" + raw;
+  }
   let url: URL;
   try {
-    url = new URL(input.trim());
+    url = new URL(raw);
   } catch {
     return null;
   }
   if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com") {
     return null;
   }
-  const match = url.pathname
-    .replace(/\/+$/, "")
-    .match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(\.git)?$/);
+  // Accept /owner/repo plus any trailing path (e.g. /tree/main, /issues) —
+  // only the first two segments are used to build the archive URL.
+  const match = url.pathname.match(/^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?(?:\/|$)/);
   if (!match) return null;
   const [, owner, repo] = match;
   if (!owner || !repo) return null;

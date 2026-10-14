@@ -17,6 +17,20 @@ describe("parseGitHubRepoUrl", () => {
     });
   });
 
+  it("assumes https when the scheme is omitted (mobile pastes)", () => {
+    expect(parseGitHubRepoUrl("github.com/octocat/hello-world")).toEqual({
+      owner: "octocat",
+      repo: "hello-world",
+    });
+  });
+
+  it("ignores extra path segments beyond owner/repo", () => {
+    expect(parseGitHubRepoUrl("https://github.com/octocat/hello-world/tree/main")).toEqual({
+      owner: "octocat",
+      repo: "hello-world",
+    });
+  });
+
   it("accepts trailing slash and .git suffix", () => {
     expect(parseGitHubRepoUrl("https://github.com/octocat/hello-world/")).toEqual({
       owner: "octocat",
@@ -43,10 +57,16 @@ describe("parseGitHubRepoUrl", () => {
   it("rejects malformed paths", () => {
     expect(parseGitHubRepoUrl("https://github.com/octocat")).toBeNull();
     expect(parseGitHubRepoUrl("https://github.com/")).toBeNull();
-    expect(parseGitHubRepoUrl("https://github.com/o/r/extra/path")).toBeNull();
     expect(parseGitHubRepoUrl("not a url")).toBeNull();
     expect(parseGitHubRepoUrl(null)).toBeNull();
     expect(parseGitHubRepoUrl(42)).toBeNull();
+  });
+
+  it("uses only owner/repo when extra path segments are pasted", () => {
+    expect(parseGitHubRepoUrl("https://github.com/o/r/extra/path")).toEqual({
+      owner: "o",
+      repo: "r",
+    });
   });
 });
 
