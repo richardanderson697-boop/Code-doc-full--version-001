@@ -43,6 +43,9 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
 export function buildQaContext(report: FinalReadReport): string {
   const lines: string[] = [];
   lines.push(`PROJECT: ${report.projectTitle}`);
+  if (report.applicationSummary) {
+    lines.push(`WHAT THIS APP IS: ${report.applicationSummary}`);
+  }
   lines.push(`COMPLETENESS: ${report.completenessScore}/100`);
   lines.push(`VERDICT: ${report.verdict}`);
   const section = (name: string, items: { title: string; businessImplication: string; file: string; line: number | null }[]) => {

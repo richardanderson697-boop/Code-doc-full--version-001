@@ -78,4 +78,19 @@ describe("buildQaContext", () => {
     expect(ctx).toMatch(/COULD NOT ESTABLISH/);
     expect(ctx).toMatch(/Hardcoded secret/);
   });
+
+  it("includes the application summary when the audit provides one", () => {
+    const withSummary = buildFinalReadReport({
+      projectTitle: "Test App",
+      completenessScore: 60,
+      applicationSummary: "A cleaning booking platform.",
+      categoryScores: {},
+      findings: [],
+    });
+    expect(buildQaContext(withSummary)).toMatch(/WHAT THIS APP IS: A cleaning booking platform\./);
+  });
+
+  it("omits the application line when the audit has none", () => {
+    expect(buildQaContext(sampleReport())).not.toMatch(/WHAT THIS APP IS/);
+  });
 });

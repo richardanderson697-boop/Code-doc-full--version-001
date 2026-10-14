@@ -36,6 +36,10 @@ export interface FinalReadAuditInput {
   projectTitle?: string;
   /** 0-100 completeness score. */
   completenessScore: number;
+  /** Plain-English description of what the app is/does (the workspace
+   *  intelligence "overall summary"). Lets the Q&A answer in terms of the
+   *  app's actual function instead of generic bucket contents. */
+  applicationSummary?: string;
   categoryScores?: Record<string, FinalReadCategoryInput>;
   findings?: FinalReadFindingInput[];
   missingFeatures?: Array<{ category?: string; feature: string; reason?: string }>;
@@ -56,6 +60,8 @@ export interface FinalReadReport {
   projectTitle: string;
   verdict: string;
   completenessScore: number;
+  /** What the app is/does, when the audit provided it. */
+  applicationSummary?: string;
   working: FinalReadBucketItem[];
   halfBuilt: FinalReadBucketItem[];
   liabilities: FinalReadBucketItem[];
@@ -233,6 +239,7 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     projectTitle: (input.projectTitle || "").trim() || "Reviewed project",
     verdict: verdictFor(completenessScore, liabilities.length),
     completenessScore,
+    applicationSummary: (input.applicationSummary || "").trim() || undefined,
     working,
     halfBuilt,
     liabilities,

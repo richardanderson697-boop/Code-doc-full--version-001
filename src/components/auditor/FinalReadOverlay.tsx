@@ -39,6 +39,7 @@ export function intelResultToFinalReadInput(
   return {
     projectTitle,
     completenessScore: Number(intelResult?.completenessScore) || 0,
+    applicationSummary: intelResult?.overallSummary || undefined,
     categoryScores: intelResult?.categoryScores || {},
     findings: (preflight?.findings || []).map((f: any) => ({
       severity: f.severity,
