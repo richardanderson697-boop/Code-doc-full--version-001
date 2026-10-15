@@ -36,6 +36,7 @@ import {
   normalizeDeclineTier,
   PARTIAL_DECLINE_PREFIX,
   RUNTIME_DECLINE_REPLY,
+  starterAnswer,
 } from "../../shared/finalread-qa";
 
 const router = Router();
@@ -126,6 +127,18 @@ router.post(
       report = buildFinalReadReport(audit as FinalReadAuditInput);
     } catch {
       return res.status(400).json({ error: "The audit result could not be read" });
+    }
+
+    // 2b. Starter pills: deterministic from the report — no model call,
+    // no charge, and they can never decline.
+    const starter = starterAnswer(question, report);
+    if (starter) {
+      return res.json({
+        answer: starter.answer,
+        citedFindings: starter.citedFindings,
+        declined: false,
+        starter: true,
+      });
     }
 
     // 3. Grounded model call with retries. Failed attempts are never charged.

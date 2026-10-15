@@ -9,6 +9,7 @@ import {
   normalizeDeclineTier,
   PARTIAL_DECLINE_PREFIX,
   RUNTIME_DECLINE_REPLY,
+  starterAnswer,
 } from "../shared/finalread-qa";
 import { buildFinalReadReport } from "../shared/finalread-report";
 
@@ -117,6 +118,43 @@ describe("decline tiers", () => {
   it("the partial prefix frames the review's limits before the grounded content", () => {
     expect(PARTIAL_DECLINE_PREFIX).toMatch(/didn't analyze that specifically/);
     expect(PARTIAL_DECLINE_PREFIX).toMatch(/What it did establish/);
+  });
+});
+
+describe("starterAnswer", () => {
+  it("answers the four starter pills deterministically, never declining", () => {
+    const report = sampleReport();
+
+    const finished = starterAnswer("Is this app actually finished?", report)!;
+    expect(finished.answer).toMatch(/60\/100/);
+
+    const risk = starterAnswer("What's the biggest risk?", report)!;
+    expect(risk.answer).toMatch(/biggest risk is/i);
+    expect(risk.citedFindings.length).toBeGreaterThan(0);
+
+    const auth = starterAnswer("Is the login and authentication real?", report)!;
+    expect(auth.answer).toMatch(/Authentication:/);
+    expect(auth.answer).toMatch(/8\/10/);
+
+    const fix = starterAnswer("What should be fixed first?", report)!;
+    expect(fix.answer).toMatch(/Fix in this order:/);
+    expect(fix.citedFindings.length).toBeGreaterThan(0);
+  });
+
+  it("returns null for non-starter questions", () => {
+    expect(starterAnswer("What does the app do?", sampleReport())).toBeNull();
+    expect(starterAnswer("How much will it cost?", sampleReport())).toBeNull();
+  });
+
+  it("handles a clean report without liabilities", () => {
+    const clean = buildFinalReadReport({
+      projectTitle: "Clean",
+      completenessScore: 95,
+      categoryScores: { authentication: { score: 9 } },
+      findings: [],
+    });
+    const risk = starterAnswer("What's the biggest risk?", clean)!;
+    expect(risk.answer).toMatch(/no liabilities/i);
   });
 });
 

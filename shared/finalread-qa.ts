@@ -22,6 +22,84 @@ export const NO_ESTIMATES_REPLY =
   "What I can tell you is what needs fixing and in what order: start with the liabilities, " +
   "then the half-built areas. Your developer can scope the work from the handoff packet.";
 
+/** The four starter pills: answered deterministically from the report —
+ *  no model call, no charge, and they can never decline. A model asked
+ *  "what's the biggest risk?" can talk itself into declining; the report
+ *  already knows the answer, so we don't ask. */
+export function starterAnswer(
+  question: string,
+  report: FinalReadReport
+): { answer: string; citedFindings: string[] } | null {
+  const q = (question || "").trim().toLowerCase().replace(/\?+$/, "");
+  const sevRank = (s: string) =>
+    ({ critical: 0, high: 1, medium: 2 }[(s || "").toLowerCase()] ?? 3);
+  const bySeverity = [...report.liabilities].sort(
+    (a, b) => sevRank(a.severity) - sevRank(b.severity)
+  );
+
+  if (q === "is this app actually finished") {
+    return {
+      answer:
+        `${report.verdict} The review scored completeness ` +
+        `${report.completenessScore}/100.`,
+      citedFindings: [],
+    };
+  }
+
+  if (q === "what's the biggest risk" || q === "what is the biggest risk") {
+    const top = bySeverity[0];
+    if (!top) {
+      const hb = report.halfBuilt[0];
+      return {
+        answer: hb
+          ? `The review found no liabilities. The biggest open area is ${hb.title}: ${hb.businessImplication}`
+          : "The review found no liabilities or half-built areas.",
+        citedFindings: hb ? [hb.title] : [],
+      };
+    }
+    return {
+      answer: `The biggest risk is ${top.title}: ${top.businessImplication}`,
+      citedFindings: [top.title],
+    };
+  }
+
+  if (q === "is the login and authentication real") {
+    const auth = [...report.liabilities, ...report.halfBuilt, ...report.working].find(
+      (i) => /authentication/i.test(i.title)
+    );
+    if (!auth) {
+      return {
+        answer: "The review did not assess authentication.",
+        citedFindings: [],
+      };
+    }
+    return {
+      answer: `Authentication: ${auth.businessImplication}`,
+      citedFindings: [auth.title],
+    };
+  }
+
+  if (q === "what should be fixed first") {
+    const ordered = bySeverity.slice(0, 3);
+    if (ordered.length === 0) {
+      return {
+        answer: "The review found no liabilities to fix.",
+        citedFindings: [],
+      };
+    }
+    return {
+      answer:
+        "Fix in this order: " +
+        ordered
+          .map((l, i) => `${i + 1}. ${l.title} — ${l.businessImplication}`)
+          .join(" "),
+      citedFindings: ordered.map((l) => l.title),
+    };
+  }
+
+  return null;
+}
+
 /** A grounded answer must cite real finding titles from the report. Returns
  *  the cited titles that do NOT match anything the report contains. */
 export function unknownCitations(citedTitles: string[], report: FinalReadReport): string[] {
