@@ -144,6 +144,9 @@ router.post("/api/billing/checkout", requireAuth, asyncRoute(async (req: AuthedR
       mode: "payment",
       "line_items[0][price]": pack.priceId,
       "line_items[0][quantity]": "1",
+      // Lets buyers redeem Stripe promotion codes (e.g. 100%-off test
+      // coupons, marketing discounts) at checkout.
+      allow_promotion_codes: "true",
       success_url: `${base}/?checkout=success&pack=${pack.id}`,
       cancel_url: `${base}/?checkout=cancelled`,
       client_reference_id: req.user!.id,
