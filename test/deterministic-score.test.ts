@@ -242,8 +242,7 @@ describe("deterministic scoring", () => {
     expect(a.missingFeatures.some((m) => /webhook/i.test(m.feature))).toBe(true);
   });
 
-  it("turns stubs and TODOs into missing features with anchors", () => {
-    const files = [
+  it("turns stubs and TODOs into missing features with anchors", () => {    const files = [
       wf("package.json", JSON.stringify({ dependencies: { next: "14.0.0" } })),
       wf("app/layout.tsx", "export default function L({c}) { return c; }"),
       wf("app/page.tsx", "export default function P() { return <div/>; }"),
@@ -254,6 +253,21 @@ describe("deterministic scoring", () => {
     expect(feats.some((f) => /TODO.*lib\/worker\.ts/i.test(f))).toBe(true);
     const anchored = a.missingFeatures.find((m) => /worker\.ts/.test(m.feature));
     expect(anchored?.evidence.some((e) => e.includes("lib/worker.ts:"))).toBe(true);
+  });
+
+  it("anchors signal evidence with file:line numbers", () => {
+    const files = [
+      wf("package.json", JSON.stringify({ dependencies: { express: "4.0.0" } })),
+      wf(
+        "server.ts",
+        `import express from "express";\nconst app = express();\napp.listen(3000);`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    const ev = a.categories.serverStarts.evidence.join(" ");
+    // .listen() is on line 3 — the evidence must say so, not just name the file.
+    expect(ev).toMatch(/server\.ts:3\b/);
+    expect(ev).toMatch(/calls \.listen\(\)/);
   });
 
   it("formats a ground-truth prompt block", () => {

@@ -258,6 +258,19 @@ function anchor(path: string, lines: string): string {
   return `${path}:${lines}`;
 }
 
+/** 1-based line number of the first line matching `re` in `content`, or null.
+ *  Callers must pass non-global regexes (all module patterns are `/i`-only). */
+function findLine(content: string, re: RegExp): number | null {
+  const idx = content.split("\n").findIndex((l) => re.test(l));
+  return idx >= 0 ? idx + 1 : null;
+}
+
+/** Evidence anchor with a line number when the signal's line is known:
+ *  "path:line description", falling back to "path description". */
+function ev(path: string, line: number | null, desc: string): string {
+  return line != null ? `${path}:${line} ${desc}` : `${path} ${desc}`;
+}
+
 // ---------------------------------------------------------------------------
 // Per-category deterministic rubrics. Each returns an integer 0-10 plus the
 // evidence anchors that justify it. Bands are fixed; there is no sampling.
@@ -271,9 +284,9 @@ function scoreServerStarts(sig: WorkspaceSignals): CategoryResult {
   const hasMain = fileExists(sig, "src/main.tsx", "src/main.jsx", "src/index.tsx");
   const hasAppTsx = fileExists(sig, "src/App.tsx", "app/page.tsx", "pages/index.tsx");
   const serverTs = fileExists(sig, "server.ts", "server/index.ts", "src/server.ts");
-  const listens = serverTs
-    ? sig.files.some((f) => f.path === serverTs && /\.listen\s*\(/.test(f.content))
-    : false;
+  const serverFile = serverTs ? sig.files.find((f) => f.path === serverTs) : undefined;
+  const listenLine = serverFile ? findLine(serverFile.content, /\.listen\s*\(/) : null;
+  const listens = listenLine != null;
 
   if (isNext) {
     const layout = fileExists(sig, "app/layout.tsx", "pages/_app.tsx");
@@ -298,7 +311,7 @@ function scoreServerStarts(sig: WorkspaceSignals): CategoryResult {
 
   if (serverTs) {
     if (listens) {
-      evidence.push(`${serverTs} calls .listen() (server entrypoint wired)`);
+      evidence.push(ev(serverTs, listenLine, "calls .listen() (server entrypoint wired)"));
       return { score: 10, max: 10, evidence };
     }
     evidence.push(`${serverTs} present but no .listen() call found`);
@@ -322,7 +335,9 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
 
   if (implemented) {
     const names = implFiles.slice(0, 4).map((f) => f.path);
-    evidence.push(`${names.join(", ")} (auth implementation signals)`);
+    const firstLine = strong.length > 0 ? findLine(strong[0].content, AUTH_IMPL) : null;
+    const anchoredNames = names.map((n, i) => (i === 0 && firstLine != null ? `${n}:${firstLine}` : n));
+    evidence.push(`${anchoredNames.join(", ")} (auth implementation signals)`);
     const stubbed = implFiles.some((f) => f.analysis.stubCount > 0 || f.analysis.todoCount > 0);
     if (stubbed) {
       evidence.push("auth code contains stubs/TODOs");
@@ -333,7 +348,7 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
 
   const referenced = anyFile(sig, (f) => isUiFile(f.path) && hasWord(f.content, AUTH_REF));
   if (referenced) {
-    evidence.push(`${referenced.path} references sign-in/up with no auth backend (dangling)`);
+    evidence.push(ev(referenced.path, findLine(referenced.content, AUTH_REF), "references sign-in/up with no auth backend (dangling)"));
     return { score: 2, max: 10, evidence, note: "dangling-auth" };
   }
   evidence.push("no auth code and no auth references — not in scope by design");
@@ -353,7 +368,10 @@ function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
 
   if (implFiles.length > 0) {
     const names = implFiles.slice(0, 4).map((f) => f.path);
-    evidence.push(`${names.join(", ")} (${baasCode ? "BaaS" : "database"} client usage)`);
+    const firstLine =
+      findLine(implFiles[0].content, DB_IMPL) ?? findLine(implFiles[0].content, BAAS_IMPL);
+    const anchoredNames = names.map((n, i) => (i === 0 && firstLine != null ? `${n}:${firstLine}` : n));
+    evidence.push(`${anchoredNames.join(", ")} (${baasCode ? "BaaS" : "database"} client usage)`);
     if (baasCode) {
       evidence.push("document/BaaS store — schema files not expected");
     } else if (schemaFiles.length > 0) {
@@ -376,7 +394,7 @@ function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
 
   const referenced = anyFile(sig, (f) => hasWord(f.content, DB_REF));
   if (referenced) {
-    evidence.push(`${referenced.path} references persistence with no database code (dangling)`);
+    evidence.push(ev(referenced.path, findLine(referenced.content, DB_REF), "references persistence with no database code (dangling)"));
     return { score: 2, max: 10, evidence, note: "dangling-db" };
   }
   evidence.push("no database code and no persistence references — not in scope by design");
@@ -391,7 +409,12 @@ function scoreErrorHandling(sig: WorkspaceSignals): CategoryResult {
     (f) => /ErrorBoundary|error\.tsx|onError/i.test(f.path) || /app\.use\(\s*\(err/i.test(f.content)
   );
   evidence.push(`${sig.tryCatchCount} try/catch blocks across ${sig.totalCodeLines} code lines`);
-  if (boundary) evidence.push(`${boundary.path} (error boundary/middleware)`);
+  if (boundary) {
+    const bLine = /app\.use\(\s*\(err/i.test(boundary.content)
+      ? findLine(boundary.content, /app\.use\(\s*\(err/i)
+      : null;
+    evidence.push(ev(boundary.path, bLine, "(error boundary/middleware)"));
+  }
 
   let score: number;
   if (boundary && density >= 3) score = 10;
@@ -432,15 +455,24 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
     const c = impl.content;
     const hasRealAutomation = /node-cron|cron\.schedule|bullmq|inngest|agenda|new\s+Worker|setInterval\s*\(/i.test(c);
     if (hasRealAutomation) {
-      const what = /node-cron|cron\.schedule/i.test(c)
-        ? "cron scheduler"
+      const kind: "cron" | "queue" | "worker" = /node-cron|cron\.schedule/i.test(c)
+        ? "cron"
         : /bullmq|inngest|agenda|queue/i.test(c)
-          ? "job queue"
-          : "background worker";
-      evidence.push(`${impl.path}: ${what} found`);
+          ? "queue"
+          : "worker";
+      const whatPat =
+        kind === "cron"
+          ? /node-cron|cron\.schedule/i
+          : kind === "queue"
+            ? /bullmq|inngest|agenda|queue/i
+            : /new\s+Worker|setInterval\s*\(/i;
+      const what = kind === "cron" ? "cron scheduler" : kind === "queue" ? "job queue" : "background worker";
+      const wLine = findLine(c, whatPat);
+      evidence.push(`${impl.path}${wLine != null ? `:${wLine}` : ""}: ${what} found`);
       return { score: 10, max: 10, evidence };
     }
-    evidence.push(`${impl.path}: webhook handler found (event-driven automation)`);
+    const whLine = findLine(c, /webhook/i);
+    evidence.push(`${impl.path}${whLine != null ? `:${whLine}` : ""}: webhook handler found (event-driven automation)`);
     evidence.push("no scheduled jobs, queues, workers, or webhook retry/reconciliation logic");
     return { score: 6, max: 10, evidence };
   }
@@ -450,7 +482,11 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
   const automationDep = depNames(sig).some((d) => /(cron|bull|queue|worker|schedule|inngest|agenda)/i.test(d));
   if (referenced || automationDep) {
     if (automationDep && !referenced) evidence.push(`package.json depends on automation (${depNames(sig).filter((d) => /(cron|bull|queue|worker|schedule|inngest|agenda)/i.test(d)).join(", ")}) with no implementation`);
-    else evidence.push(`${referenced!.path} references automation/webhooks with no implementation`);
+    else {
+      const rLine =
+        findLine(referenced!.content, AUTOMATION_REF) ?? findLine(referenced!.content, PAYMENT_REF);
+      evidence.push(ev(referenced!.path, rLine, "references automation/webhooks with no implementation"));
+    }
     return { score: 3, max: 10, evidence, note: "dangling-automation" };
   }
   // Rule-based N/A (never model judgment): no scheduler/queue/worker/cron
@@ -468,8 +504,14 @@ function scoreExternalIntegrations(sig: WorkspaceSignals): CategoryResult {
   const externalFetches = sig.files.filter((f) => /fetch\(\s*[`'"]https?:\/\//i.test(f.content));
 
   if (sdkFiles.length > 0 || externalFetches.length > 0) {
-    const names = [...sdkFiles, ...externalFetches].slice(0, 4).map((f) => f.path);
-    evidence.push(`${names.join(", ")} (external integration usage)`);
+    const ordered = [...sdkFiles, ...externalFetches];
+    const names = ordered.slice(0, 4).map((f) => f.path);
+    const first = ordered[0];
+    const firstLine =
+      findLine(first.content, EXT_SDK_USE) ??
+      findLine(first.content, /fetch\(\s*[`'"]https?:\/\//i);
+    const anchoredNames = names.map((n, i) => (i === 0 && firstLine != null ? `${n}:${firstLine}` : n));
+    evidence.push(`${anchoredNames.join(", ")} (external integration usage)`);
     const stubbed = sdkFiles.some((f) => f.analysis.stubCount > 0 || f.analysis.todoCount > 0);
     if (stubbed) {
       evidence.push("integration code contains stubs/TODOs");
@@ -480,7 +522,7 @@ function scoreExternalIntegrations(sig: WorkspaceSignals): CategoryResult {
 
   const referenced = anyFile(sig, (f) => hasWord(f.content, PAYMENT_REF));
   if (referenced) {
-    evidence.push(`${referenced.path} references payments/integrations with no implementation`);
+    evidence.push(ev(referenced.path, findLine(referenced.content, PAYMENT_REF), "references payments/integrations with no implementation"));
     return { score: 3, max: 10, evidence, note: "dangling-integration" };
   }
   evidence.push("no external integrations referenced — not in scope by design");
@@ -519,7 +561,7 @@ function scorePerformance(sig: WorkspaceSignals): CategoryResult {
   const splitting = anyFile(sig, (f) => /React\.lazy|Suspense|import\s*\(/.test(f.content));
   if (splitting) {
     score += 1;
-    evidence.push(`${splitting.path} (code-splitting/lazy loading)`);
+    evidence.push(ev(splitting.path, findLine(splitting.content, /React\.lazy|Suspense|import\s*\(/), "(code-splitting/lazy loading)"));
   }
   const huge = sig.files.find((f) => f.lineCount > 5000);
   if (huge) {
