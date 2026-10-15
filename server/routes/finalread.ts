@@ -4,6 +4,12 @@
 // tier). Everything else is free:
 //
 // - cost/time/effort questions → fixed "no estimates" reply, no model call
+// - tiered declines (resilience brief):
+//     partial → the review flags the area but lacks the detail; the model
+//               names what WAS established from cited findings. Grounded and
+//               usable, so it charges like an answer.
+//     runtime → needs live runtime observation; fixed server-side reply.
+//     unknown → nothing in the review bears on it; the old flat decline.
 // - out-of-scope or uncited answers → declined, no charge
 // - unusable model output after retries → 502, no charge
 //
@@ -27,6 +33,9 @@ import {
   NO_ESTIMATES_REPLY,
   unknownCitations,
   buildQaContext,
+  normalizeDeclineTier,
+  PARTIAL_DECLINE_PREFIX,
+  RUNTIME_DECLINE_REPLY,
 } from "../../shared/finalread-qa";
 
 const router = Router();
@@ -48,6 +57,12 @@ const ANSWER_SCHEMA = {
       type: "BOOLEAN",
       description: "True when the question cannot be answered from the report without guessing.",
     },
+    declineTier: {
+      type: "STRING",
+      description:
+        "When insufficientContext is true, one of: 'partial' (the review flags the area but lacks the specific detail — write what it DID establish using ONLY related cited findings, never invent the missing analysis), 'runtime' (the question can only be answered by watching the app run), or 'unknown' (nothing in the review bears on the question). Omit when answered.",
+      enum: ["partial", "runtime", "unknown"],
+    },
   },
   required: ["answer", "citedFindings", "insufficientContext"],
 };
@@ -59,7 +74,13 @@ function systemPrompt(context: string): string {
     `HARD RULES:\n` +
     `- Answer ONLY from the review below. Every claim must trace to a finding, bucket, or verdict in it.\n` +
     `- Cite the exact finding titles you relied on in citedFindings.\n` +
-    `- If the question cannot be answered from the review without guessing, set insufficientContext to true and say so briefly.\n` +
+    `- The "scan evidence" lines under each bucket item are the raw scan signals for your precision — use them to ` +
+    `name specifics in plain words (e.g. "the payments code"), but NEVER quote raw file paths or line numbers to the stakeholder.\n` +
+    `- If the review flags the area but lacks the specific detail asked for, set insufficientContext to true and ` +
+    `declineTier to "partial": write what the review DID establish using ONLY related cited findings — never invent the missing analysis.\n` +
+    `- If the question can only be answered by watching the app run (load, real users, production data, third-party outages), ` +
+    `set insufficientContext to true and declineTier to "runtime".\n` +
+    `- If nothing in the review bears on the question, set insufficientContext to true and declineTier to "unknown".\n` +
     `- NEVER give cost, time, or effort estimates — no hours, prices, timelines, or t-shirt sizes.\n` +
     `- NEVER invent findings, files, or numbers that are not in the review.\n\n` +
     `THE REVIEW:\n${context}`
@@ -128,7 +149,12 @@ router.post(
           log.warn(`finalread/ask attempt ${attempt}: empty answer without decline, retrying`);
           continue;
         }
-        parsed = { answer, citedFindings: cited, insufficientContext: declined };
+        parsed = {
+          answer,
+          citedFindings: cited,
+          insufficientContext: declined,
+          declineTier: normalizeDeclineTier(candidate.declineTier),
+        };
       } catch (err: any) {
         log.warn(`finalread/ask attempt ${attempt} failed: ${err?.message || err}`);
       }
@@ -140,15 +166,37 @@ router.post(
       });
     }
 
-    // 4a. Honest decline: out of scope for this review. Free.
+    // 4a. Tiered declines.
+    // - partial: the review flags the area but lacks the detail. Grounded in
+    //   cited findings and usable, so it charges like an answer (with a
+    //   deterministic prefix). Uncited partials fall back to the flat decline.
+    // - runtime: needs live runtime observation. Fixed reply, free.
+    // - unknown: nothing in the review bears on it. The old flat decline, free.
+    const FLAT_DECLINE_REPLY =
+      "That question can't be answered from this review without guessing, so I won't guess. " +
+      "It covers what the scan found — ask about the verdict, the liabilities, or what's half-built.";
     if (parsed.insufficientContext) {
-      return res.json({
-        declined: true,
-        answer:
-          "That question can't be answered from this review without guessing, so I won't guess. " +
-          "It covers what the scan found — ask about the verdict, the liabilities, or what's half-built.",
-        citedFindings: [],
-      });
+      const partialGrounded =
+        parsed.declineTier === "partial" &&
+        !!parsed.answer &&
+        unknownCitations(parsed.citedFindings, report).length === 0;
+      if (partialGrounded) {
+        parsed.answer = PARTIAL_DECLINE_PREFIX + parsed.answer;
+        // Falls through to 4b (citation check, already satisfied) and 5 (charge).
+      } else if (parsed.declineTier === "runtime") {
+        return res.json({
+          declined: true,
+          answer: RUNTIME_DECLINE_REPLY,
+          citedFindings: [],
+          runtime: true,
+        });
+      } else {
+        return res.json({
+          declined: true,
+          answer: FLAT_DECLINE_REPLY,
+          citedFindings: [],
+        });
+      }
     }
 
     // 4b. Invented citations are a decline, not an answer. Free.

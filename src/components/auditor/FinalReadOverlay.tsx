@@ -36,11 +36,20 @@ export function intelResultToFinalReadInput(
   projectTitle?: string
 ): FinalReadAuditInput {
   const preflight = intelResult?.preflight;
+  // Deterministic per-category evidence lines (already persisted by the
+  // intelligence route as deterministicAssessment.evidence). Guarded: only
+  // a plain object of string arrays passes through.
+  const rawEvidence = intelResult?.deterministicAssessment?.evidence;
+  const categoryEvidence: Record<string, string[]> | undefined =
+    rawEvidence && typeof rawEvidence === "object" && !Array.isArray(rawEvidence)
+      ? rawEvidence
+      : undefined;
   return {
     projectTitle,
     completenessScore: Number(intelResult?.completenessScore) || 0,
     applicationSummary: intelResult?.overallSummary || undefined,
     categoryScores: intelResult?.categoryScores || {},
+    categoryEvidence,
     findings: (preflight?.findings || []).map((f: any) => ({
       severity: f.severity,
       title: f.title,

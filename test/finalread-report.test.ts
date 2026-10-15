@@ -111,3 +111,56 @@ describe("buildFinalReadReport couldNotEstablish", () => {
     expect(r.projectTitle).toBe("Reviewed project");
   });
 });
+
+describe("buildFinalReadReport category evidence", () => {
+  it("attaches condensed evidence lines to category bucket items", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryEvidence: {
+          security: [
+            "server/routes/billing.ts: Stripe client usage",
+            "no webhook handler found",
+          ],
+          authentication: ["better-auth session calls"],
+        },
+      })
+    );
+    const sec = r.halfBuilt.find((i) => i.title === "Security");
+    expect(sec?.evidence).toEqual([
+      "server/routes/billing.ts: Stripe client usage",
+      "no webhook handler found",
+    ]);
+    const auth = r.working.find((i) => i.title === "Authentication");
+    expect(auth?.evidence).toEqual(["better-auth session calls"]);
+  });
+
+  it("caps evidence at 6 lines and trims long lines", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryEvidence: {
+          security: ["x".repeat(300)].concat(
+            Array.from({ length: 10 }, (_, i) => `line ${i}`)
+          ),
+        },
+      })
+    );
+    const sec = r.halfBuilt.find((i) => i.title === "Security");
+    expect(sec?.evidence?.length).toBe(6);
+    expect(sec?.evidence?.[0]).toMatch(/…$/);
+    expect(sec?.evidence?.every((l) => l.length <= 180)).toBe(true);
+  });
+
+  it("leaves evidence undefined when the audit carries none", () => {
+    const r = buildFinalReadReport(baseInput());
+    const all = [...r.working, ...r.halfBuilt, ...r.liabilities];
+    expect(all.every((i) => i.evidence === undefined)).toBe(true);
+  });
+
+  it("ignores evidence keys with no matching category score", () => {
+    const r = buildFinalReadReport(
+      baseInput({ categoryEvidence: { notACategory: ["something"] } })
+    );
+    const all = [...r.working, ...r.halfBuilt, ...r.liabilities];
+    expect(all.every((i) => i.evidence === undefined)).toBe(true);
+  });
+});

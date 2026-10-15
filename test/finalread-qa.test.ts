@@ -6,6 +6,9 @@ import {
   NO_ESTIMATES_REPLY,
   unknownCitations,
   buildQaContext,
+  normalizeDeclineTier,
+  PARTIAL_DECLINE_PREFIX,
+  RUNTIME_DECLINE_REPLY,
 } from "../shared/finalread-qa";
 import { buildFinalReadReport } from "../shared/finalread-report";
 
@@ -92,5 +95,50 @@ describe("buildQaContext", () => {
 
   it("omits the application line when the audit has none", () => {
     expect(buildQaContext(sampleReport())).not.toMatch(/WHAT THIS APP IS/);
+  });
+});
+
+describe("decline tiers", () => {
+  it("normalizes tier values, defaulting to unknown", () => {
+    expect(normalizeDeclineTier("partial")).toBe("partial");
+    expect(normalizeDeclineTier("runtime")).toBe("runtime");
+    expect(normalizeDeclineTier("unknown")).toBe("unknown");
+    expect(normalizeDeclineTier("PARTIAL")).toBe("partial");
+    expect(normalizeDeclineTier(undefined)).toBe("unknown");
+    expect(normalizeDeclineTier("maybe")).toBe("unknown");
+    expect(normalizeDeclineTier(null)).toBe("unknown");
+  });
+
+  it("the runtime reply names what would answer it and charges nothing new", () => {
+    expect(RUNTIME_DECLINE_REPLY).toMatch(/never executes it/);
+    expect(RUNTIME_DECLINE_REPLY).toMatch(/run it under load/);
+  });
+
+  it("the partial prefix frames the review's limits before the grounded content", () => {
+    expect(PARTIAL_DECLINE_PREFIX).toMatch(/didn't analyze that specifically/);
+    expect(PARTIAL_DECLINE_PREFIX).toMatch(/What it did establish/);
+  });
+});
+
+describe("buildQaContext evidence", () => {
+  it("includes scan evidence lines under category items", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "Test App",
+      completenessScore: 60,
+      categoryScores: { security: { score: 3, reason: "Gaps." } },
+      categoryEvidence: {
+        security: ["server/routes/billing.ts: Stripe client usage", "no webhook handler found"],
+      },
+      findings: [],
+    });
+    const ctx = buildQaContext(report);
+    expect(ctx).toMatch(/scan evidence:/);
+    expect(ctx).toMatch(/Stripe client usage/);
+    expect(ctx).toMatch(/no webhook handler found/);
+  });
+
+  it("omits the evidence line when a category has none", () => {
+    const ctx = buildQaContext(sampleReport());
+    expect(ctx).not.toMatch(/scan evidence:/);
   });
 });

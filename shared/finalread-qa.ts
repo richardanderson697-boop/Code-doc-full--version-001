@@ -37,9 +37,39 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
   return unknown;
 }
 
+/** Tiered declines (from the resilience dimension brief):
+ *  - "partial": the review flags the area but lacks the specific detail.
+ *    Never a flat "I don't know" — say what WAS established instead.
+ *  - "runtime": the question needs live runtime observation to answer.
+ *  - "unknown": nothing in the review bears on the question (the old flat
+ *    decline). */
+export type DeclineTier = "partial" | "runtime" | "unknown";
+
+export function normalizeDeclineTier(value: unknown): DeclineTier {
+  const v = String(value ?? "").trim().toLowerCase();
+  if (v === "partial" || v === "runtime" || v === "unknown") return v;
+  return "unknown";
+}
+
+/** Tier-2 decline framing: prefixed (server-side) to a model answer that is
+ *  still grounded in cited findings — it names what the review DID establish
+ *  instead of flat-declining. Charged like a grounded answer. */
+export const PARTIAL_DECLINE_PREFIX =
+  "The review didn't analyze that specifically. What it did establish: ";
+
+/** Tier-3 decline: fixed server-side reply, no model wording, no charge.
+ *  The review reads code; it never executes it. */
+export const RUNTIME_DECLINE_REPLY =
+  "That needs the app actually running to answer — real traffic, real data, real failures. " +
+  "This review reads the code; it never executes it. What would answer it: run it under load, " +
+  "crash-test it, or watch it in production for a while.";
+
 /** Compact, citable context for the model prompt: verdict, bucket titles,
  *  and the liability details. Deliberately excludes code, file contents,
- *  and anything the stakeholder UI never shows. */
+ *  and anything the stakeholder UI never shows. Category items carry
+ *  condensed deterministic scan evidence so "which?" questions have
+ *  specifics to stand on — the prompt tells the model to use the anchors
+ *  for precision but never quote raw file paths to the stakeholder. */
 export function buildQaContext(report: FinalReadReport): string {
   const lines: string[] = [];
   lines.push(`PROJECT: ${report.projectTitle}`);
@@ -48,11 +78,23 @@ export function buildQaContext(report: FinalReadReport): string {
   }
   lines.push(`COMPLETENESS: ${report.completenessScore}/100`);
   lines.push(`VERDICT: ${report.verdict}`);
-  const section = (name: string, items: { title: string; businessImplication: string; file: string; line: number | null }[]) => {
+  const section = (
+    name: string,
+    items: {
+      title: string;
+      businessImplication: string;
+      file: string;
+      line: number | null;
+      evidence?: string[];
+    }[]
+  ) => {
     lines.push(`${name.toUpperCase()} (${items.length}):`);
     for (const it of items) {
       const loc = it.file ? ` [${it.file}${it.line != null ? ":" + it.line : ""}]` : "";
       lines.push(`- ${it.title}${loc}: ${it.businessImplication}`);
+      if (it.evidence && it.evidence.length > 0) {
+        lines.push(`  scan evidence: ${it.evidence.join(" | ")}`);
+      }
     }
   };
   section("liabilities", report.liabilities);

@@ -41,6 +41,11 @@ export interface FinalReadAuditInput {
    *  app's actual function instead of generic bucket contents. */
   applicationSummary?: string;
   categoryScores?: Record<string, FinalReadCategoryInput>;
+  /** Deterministic per-category evidence lines (file:line anchors and signal
+   *  descriptions, from the intelligence route's deterministic assessment).
+   *  Plumbs the scan's raw signals through to Q&A context so "which?"
+   *  questions have something to stand on. */
+  categoryEvidence?: Record<string, string[]>;
   findings?: FinalReadFindingInput[];
   missingFeatures?: Array<{ category?: string; feature: string; reason?: string }>;
   scanGaps?: FinalReadScanGaps;
@@ -52,6 +57,8 @@ export interface FinalReadBucketItem {
   severity: string;
   file: string;
   line: number | null;
+  /** Condensed deterministic evidence lines (category items only). */
+  evidence?: string[];
   /** The scanner's own remediation text, when the item came from a finding. */
   remediation?: string;
 }
@@ -180,6 +187,24 @@ function couldNotEstablishFor(input: FinalReadAuditInput): string[] {
   return out;
 }
 
+// Condense raw deterministic evidence lines for the report and Q&A
+// context: cap count, trim length, drop empties. The raw arrays can be
+// long; the model prompt must stay bounded.
+const MAX_EVIDENCE_LINES = 6;
+const MAX_EVIDENCE_CHARS = 180;
+
+function condenseEvidence(lines: unknown): string[] | undefined {
+  if (!Array.isArray(lines)) return undefined;
+  const out: string[] = [];
+  for (const l of lines) {
+    const s = String(l ?? "").trim();
+    if (!s) continue;
+    out.push(s.length > MAX_EVIDENCE_CHARS ? s.slice(0, MAX_EVIDENCE_CHARS - 1) + "…" : s);
+    if (out.length >= MAX_EVIDENCE_LINES) break;
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadReport {
   const working: FinalReadBucketItem[] = [];
   const halfBuilt: FinalReadBucketItem[] = [];
@@ -195,6 +220,7 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
       severity: score >= 7 ? "info" : score >= 4 ? "medium" : "high",
       file: "",
       line: null,
+      evidence: condenseEvidence(input.categoryEvidence?.[key]),
     };
     const bucket = bucketForScore(score);
     if (bucket === "working") working.push(item);
