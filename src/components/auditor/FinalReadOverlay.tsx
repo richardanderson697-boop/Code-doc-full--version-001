@@ -183,7 +183,10 @@ export default function FinalReadOverlay({
 
   // Handoff state: liability findings with a file location, all checked.
   const handoffItems = useMemo(
-    () => report.liabilities.filter((i) => i.file),
+    // Liabilities plus half-built items: a 50/100 app's value to a developer
+    // is mostly in what's half-built or missing, not just file-anchored
+    // security findings. File-less items render without an anchor.
+    () => [...report.liabilities, ...report.halfBuilt],
     [report]
   );
   const [checked, setChecked] = useState<Set<string>>(
@@ -288,7 +291,9 @@ export default function FinalReadOverlay({
           title: item.title,
           message: item.businessImplication,
           severity: item.severity,
-          type: "FinalRead liability",
+          type: report.liabilities.includes(item)
+            ? "FinalRead liability"
+            : "FinalRead half-built",
           file: item.file,
           line: item.line,
           suggestion: item.remediation,
@@ -479,12 +484,13 @@ export default function FinalReadOverlay({
               <FileText className="w-4 h-4" /> Developer handoff
             </p>
             <p className="text-xs text-slate-500 mb-3">
-              Select the liabilities to hand to a developer. Exports as a free
+              Select the items to hand to a developer. Exports as a free
               Markdown packet — no code is changed.
             </p>
             {handoffItems.length === 0 && (
               <p className="text-xs text-slate-500">
-                No file-anchored liabilities to hand off.
+                Nothing to hand off — this review found no liabilities or
+                half-built items.
               </p>
             )}
             <div className="space-y-1.5 mb-3">

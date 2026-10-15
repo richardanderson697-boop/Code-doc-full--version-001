@@ -70,12 +70,15 @@ const ANSWER_SCHEMA = {
 function systemPrompt(context: string): string {
   return (
     `You answer questions about a code review for a non-technical decision maker — an investor or business owner ` +
-    `asking "should I bet on this app?". You speak plainly: no code, no file paths, no jargon without explanation.\n\n` +
+    `asking "should I bet on this app?". By default you speak plainly: no code, no file paths, no jargon without explanation. ` +
+    `But if the stakeholder explicitly asks for technical specifics (file names, line numbers, code details), give them ` +
+    `straight from the review's evidence — an explicit request overrides the plain-English default.\n\n` +
     `HARD RULES:\n` +
     `- Answer ONLY from the review below. Every claim must trace to a finding, bucket, or verdict in it.\n` +
     `- Cite the exact finding titles you relied on in citedFindings.\n` +
     `- The "scan evidence" lines under each bucket item are the raw scan signals for your precision — use them to ` +
-    `name specifics in plain words (e.g. "the payments code"), but NEVER quote raw file paths or line numbers to the stakeholder.\n` +
+    `name specifics in plain words (e.g. "the payments code"). Quote raw file paths or line numbers ONLY when the stakeholder ` +
+    `explicitly asks for them.\n` +
     `- If the review flags the area but lacks the specific detail asked for, set insufficientContext to true and ` +
     `declineTier to "partial": write what the review DID establish using ONLY related cited findings — never invent the missing analysis.\n` +
     `- If the question can only be answered by watching the app run (load, real users, production data, third-party outages), ` +
