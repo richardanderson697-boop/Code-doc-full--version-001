@@ -86,6 +86,117 @@ router.get("/api/billing/packs", (req, res) => {
   });
 });
 
+// Owner-only billing diagnostics. Validates the Stripe wiring without making
+// a purchase: key presence, webhook secret presence, the effective checkout
+// base URL (same appUrl() checkout uses), and a live lookup of every
+// configured price ID — which also catches test/live mode mismatches, since
+// a live key cannot see test-mode prices and vice versa. Secret values are
+// never returned, only presence/validity. Renders HTML in a browser, JSON
+// for API clients.
+router.get(
+  "/api/billing/debug",
+  requireAuth,
+  asyncRoute(async (req: AuthedRequest, res) => {
+    const diag: any = {
+      stripeKey: { configured: Boolean(process.env.STRIPE_SECRET_KEY) },
+      webhookSecret: { configured: Boolean(process.env.STRIPE_WEBHOOK_SECRET) },
+      appUrl: {
+        raw: process.env.APP_URL || null,
+        effective: null as string | null,
+        valid: false,
+        reason: null as string | null,
+      },
+      packs: [] as any[],
+    };
+
+    // Validate the exact base URL checkout will send to Stripe.
+    try {
+      const effective = appUrl(req);
+      diag.appUrl.effective = effective;
+      const u = new URL(effective);
+      // Stripe's URL check is case-sensitive about the scheme: it must be
+      // literally lowercase "http://" or "https://".
+      if (
+        (u.protocol === "http:" || u.protocol === "https:") &&
+        effective.startsWith(u.protocol + "//")
+      ) {
+        diag.appUrl.valid = true;
+      } else {
+        diag.appUrl.reason =
+          'scheme must be lowercase "http://" or "https://" (Stripe rejects autocapitalized "Https://")';
+      }
+    } catch (e: any) {
+      diag.appUrl.reason = e?.message || "not a valid URL";
+    }
+
+    for (const pack of getPacks()) {
+      const row: any = {
+        id: pack.id,
+        name: pack.name,
+        envVar: `PRICE_${pack.id.toUpperCase()}`,
+        priceIdSet: Boolean(pack.priceId),
+        priceId: pack.priceId || null,
+        valid: false,
+        detail: null as string | null,
+      };
+      if (!pack.priceId) {
+        row.detail = `PRICE_${pack.id.toUpperCase()} is not set`;
+      } else if (!process.env.STRIPE_SECRET_KEY) {
+        row.detail = "STRIPE_SECRET_KEY is not configured";
+      } else {
+        try {
+          const price = await stripeGet(
+            `/v1/prices/${encodeURIComponent(pack.priceId)}`
+          );
+          if (price?.active) {
+            row.valid = true;
+            const amount = price.unit_amount != null ? price.unit_amount / 100 : "?";
+            row.detail = `${amount} ${String(price.currency || "").toUpperCase()} / ${price.type || "one-time"}`;
+          } else {
+            row.detail = "price exists but is archived/inactive";
+          }
+        } catch (e: any) {
+          row.detail = e?.message || "lookup failed";
+        }
+      }
+      diag.packs.push(row);
+    }
+
+    diag.ok =
+      diag.stripeKey.configured &&
+      diag.appUrl.valid &&
+      diag.packs.every((p: any) => p.valid);
+
+    const wantsHtml = String(req.headers.accept || "").includes("text/html");
+    if (!wantsHtml) return res.json(diag);
+
+    const ok = (b: boolean) => (b ? "✓" : "✗");
+    const cls = (b: boolean) => (b ? "ok" : "bad");
+    res.setHeader("Content-Type", "text/html; charset=utf-8").send(`<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Billing diagnostics</title>
+<style>body{background:#0b1020;color:#e5e7eb;font-family:system-ui,sans-serif;padding:20px;max-width:640px;margin:auto}
+h1{font-size:20px}.card{background:#151b31;border-radius:12px;padding:14px;margin:10px 0}
+.ok{color:#4ade80}.bad{color:#f87171}.dim{color:#9ca3af;font-size:13px;word-break:break-all}
+.row{display:flex;justify-content:space-between;padding:6px 0;border-top:1px solid #263053}
+.row:first-child{border-top:0}</style></head><body>
+<h1>Billing diagnostics <span class="${cls(diag.ok)}">${ok(diag.ok)}</span></h1>
+<div class="card"><div class="row"><span>Stripe secret key</span><span class="${cls(diag.stripeKey.configured)}">${ok(diag.stripeKey.configured)}</span></div>
+<div class="row"><span>Webhook secret</span><span class="${cls(diag.webhookSecret.configured)}">${ok(diag.webhookSecret.configured)}</span></div></div>
+<div class="card"><div class="row"><span>Checkout base URL</span><span class="${cls(diag.appUrl.valid)}">${ok(diag.appUrl.valid)}</span></div>
+<div class="dim">effective: ${diag.appUrl.effective || "—"}</div>
+${diag.appUrl.reason ? `<div class="bad">${diag.appUrl.reason}</div>` : ""}</div>
+${diag.packs
+  .map(
+    (p: any) => `<div class="card"><div class="row"><span>${p.name} <span class="dim">${p.envVar}</span></span><span class="${cls(p.valid)}">${ok(p.valid)}</span></div>
+<div class="dim">${p.priceId || "no price id"} — ${p.detail || ""}</div></div>`
+  )
+  .join("")}
+<p class="dim">Secret values are never displayed. Price lookups hit the live Stripe API, so a test/live mode mismatch shows up here.</p>
+</body></html>`);
+  })
+);
+
 function stripeFetch(path: string, params: Record<string, string>): Promise<any> {
   const secret = process.env.STRIPE_SECRET_KEY;
   if (!secret) throw new Error("STRIPE_SECRET_KEY is not configured");
@@ -123,9 +234,53 @@ function stripeFetch(path: string, params: Record<string, string>): Promise<any>
   });
 }
 
+function stripeGet(path: string): Promise<any> {
+  const secret = process.env.STRIPE_SECRET_KEY;
+  if (!secret) throw new Error("STRIPE_SECRET_KEY is not configured");
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "api.stripe.com",
+        path,
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          "Stripe-Version": "2024-06-20",
+        },
+      },
+      (res: any) => {
+        let data = "";
+        res.on("data", (c: any) => (data += c));
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(data);
+            if (res.statusCode && res.statusCode >= 400) {
+              reject(new Error(json?.error?.message || `Stripe error ${res.statusCode}`));
+            } else resolve(json);
+          } catch (e) {
+            reject(new Error(`Stripe returned non-JSON (${res.statusCode})`));
+          }
+        });
+      }
+    );
+    req.on("error", reject);
+    req.setTimeout(15000, () => req.destroy(new Error("Stripe request timed out")));
+    req.end();
+  });
+}
+
 function appUrl(req: any): string {
   const configured = process.env.APP_URL;
-  if (configured) return configured.replace(/\/$/, "");
+  if (configured) {
+    const trimmed = configured.replace(/\/$/, "");
+    // Normalize: a schemeless value gets https:// prepended, and the scheme
+    // is lowercased (mobile keyboards love to autocapitalize it to "Https://",
+    // which Stripe's URL validation rejects). Either defect previously
+    // surfaced as Stripe's cryptic "Invalid URL" checkout error.
+    const m = trimmed.match(/^(https?):\/\/(.*)$/i);
+    if (m) return `${m[1].toLowerCase()}://${m[2]}`;
+    return `https://${trimmed}`;
+  }
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "http";
   return `${proto}://${req.headers.host}`;
 }
