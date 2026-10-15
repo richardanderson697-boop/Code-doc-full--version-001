@@ -19,10 +19,16 @@ export interface Pack {
   credits: number;
   priceId: string | undefined;
   tagline: string;
+  // Audience scoping for separate price lists on the shared ledger.
+  // "all" (default): shown in the standard pricing UI.
+  // "finalread": only listed via GET /api/billing/packs?audience=finalread,
+  // so the $199 review pack never sits next to the $10 consumer pack.
+  audience?: "all" | "finalread";
 }
 
 // Price IDs come from env so test and live modes don't share config.
 // Created 2026-09-22 (test mode): Starter $10/400, Builder $25/1100, Pro $50/2400.
+// Added 2026-10-15: FinalRead Review $199/400 (separate price list, same ledger).
 export function getPacks(): Pack[] {
   return [
     {
@@ -49,19 +55,34 @@ export function getPacks(): Pack[] {
       priceId: process.env.PRICE_PRO,
       tagline: "Heavy auditing, best value",
     },
+    {
+      id: "finalread",
+      name: "FinalRead Review",
+      priceCents: 19900,
+      credits: 400,
+      priceId: process.env.PRICE_FINALREAD,
+      tagline: "One complete diligence review with Q&A and developer handoff",
+      audience: "finalread",
+    },
   ];
 }
 
-router.get("/api/billing/packs", (_req, res) => {
+router.get("/api/billing/packs", (req, res) => {
+  const audience = req.query.audience === "finalread" ? "finalread" : "all";
   res.json({
-    packs: getPacks().map((p) => ({
-      id: p.id,
-      name: p.name,
-      priceCents: p.priceCents,
-      credits: p.credits,
-      tagline: p.tagline,
-      available: Boolean(p.priceId),
-    })),
+    packs: getPacks()
+      .filter((p) => {
+        const aud = p.audience ?? "all";
+        return audience === "finalread" ? aud === "finalread" : aud === "all";
+      })
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        priceCents: p.priceCents,
+        credits: p.credits,
+        tagline: p.tagline,
+        available: Boolean(p.priceId),
+      })),
   });
 });
 
