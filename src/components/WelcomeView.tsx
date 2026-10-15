@@ -16,6 +16,7 @@ import {
   Check,
   Upload,
   FolderArchive,
+  FileSearch,
   Loader2,
   Trash2
 } from "lucide-react";
@@ -236,6 +237,31 @@ export default function WelcomeView({
         <p className="text-slate-400 text-xs md:text-sm max-w-xl mx-auto font-light leading-relaxed">
           Create functional web applications from scratch, or analyze your external React/TypeScript code files under a completely objective, zero-memory lens.
         </p>
+      </div>
+
+      {/* FinalRead entry point: standalone diligence reviews for buyers/investors */}
+      <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-2xl p-4 md:p-5 mb-6 flex flex-col sm:flex-row sm:items-center gap-3 select-none">
+        <div className="p-2.5 rounded-xl bg-indigo-500/10 border border-indigo-500/25 text-indigo-300 shrink-0 w-fit">
+          <FileSearch className="w-5 h-5" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <h3 className="text-sm font-bold text-slate-200">
+            Buying or investing in software?{" "}
+            <span className="text-indigo-300">Start with a FinalRead.</span>
+          </h3>
+          <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
+            An independent first-pass review — risks, unfinished work, and the
+            questions worth asking — before you pay for deeper due diligence.
+            One review, $199.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => { window.location.hash = "finalread"; }}
+          className="px-4 py-2.5 bg-indigo-500 hover:bg-indigo-400 text-white text-xs font-bold rounded-xl transition whitespace-nowrap flex items-center gap-1.5"
+        >
+          Get reviewed <ArrowRight className="w-3.5 h-3.5" />
+        </button>
       </div>
 
       {/* Tab Selector */}

@@ -14,9 +14,12 @@ interface Props {
   open: boolean;
   onClose: () => void;
   notice?: string;
+  // When "finalread", lists only the FinalRead price list (?audience=finalread)
+  // instead of the consumer packs.
+  audience?: "finalread";
 }
 
-export default function PricingModal({ open, onClose, notice }: Props) {
+export default function PricingModal({ open, onClose, notice, audience }: Props) {
   const [packs, setPacks] = useState<Pack[]>([]);
   const [buying, setBuying] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -24,11 +27,12 @@ export default function PricingModal({ open, onClose, notice }: Props) {
   useEffect(() => {
     if (!open) return;
     setError("");
-    fetch("/api/billing/packs", { credentials: "include" })
+    const qs = audience ? `?audience=${encodeURIComponent(audience)}` : "";
+    fetch(`/api/billing/packs${qs}`, { credentials: "include" })
       .then((r) => r.json())
       .then((d) => setPacks(d.packs ?? []))
       .catch(() => setError("Could not load packs."));
-  }, [open ]);
+  }, [open, audience]);
 
   if (!open) return null;
 
@@ -59,15 +63,16 @@ export default function PricingModal({ open, onClose, notice }: Props) {
       >
         <div className="flex items-center justify-between mb-1">
           <h3 className="font-bold text-slate-100 flex items-center gap-2">
-            <Zap className="w-4 h-4 text-amber-400" /> Buy credits
+            <Zap className="w-4 h-4 text-amber-400" /> {audience === "finalread" ? "Get your FinalRead review" : "Buy credits"}
           </h3>
           <button onClick={onClose} className="p-1 rounded-lg text-slate-500 hover:text-slate-300 hover:bg-slate-800" aria-label="Close">
             <X className="w-4 h-4" />
           </button>
         </div>
         <p className="text-xs text-slate-400 mb-5">
-          1 credit = 1¢ of AI compute. A deep workspace audit runs about 10–30 credits; quick chats are 1–3.
-          Credits never expire.
+          {audience === "finalread"
+            ? "One FinalRead Review pack covers a complete diligence cycle: the full report, stakeholder Q&A, and the developer handoff packet. Credits never expire."
+            : "1 credit = 1¢ of AI compute. A deep workspace audit runs about 10–30 credits; quick chats are 1–3. Credits never expire."}
         </p>
         {notice && (
           <p className="text-xs text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2 mb-4">{notice}</p>
@@ -105,10 +110,18 @@ export default function PricingModal({ open, onClose, notice }: Props) {
             </div>
           ))}
         </div>
-        <p className="text-[11px] text-slate-600 mt-4 flex items-start gap-1">
-          <Check className="w-3 h-3 mt-0.5 shrink-0" />
-          Secure checkout by Stripe. The free deterministic PreFlight security scan always costs 0 credits.
-        </p>
+        {audience !== "finalread" && (
+          <p className="text-[11px] text-slate-600 mt-4 flex items-start gap-1">
+            <Check className="w-3 h-3 mt-0.5 shrink-0" />
+            Secure checkout by Stripe. The free deterministic PreFlight security scan always costs 0 credits.
+          </p>
+        )}
+        {audience === "finalread" && (
+          <p className="text-[11px] text-slate-600 mt-4 flex items-start gap-1">
+            <Check className="w-3 h-3 mt-0.5 shrink-0" />
+            Secure checkout by Stripe. Your review starts as soon as the credits land.
+          </p>
+        )}
         <p className="text-[11px] text-slate-600 mt-2 text-center">
           Purchases are subject to our{" "}
           <button

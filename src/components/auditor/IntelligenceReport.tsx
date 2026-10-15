@@ -1,6 +1,6 @@
 // Workspace project intelligence report: stats, rubric, file ledger,
 // application map, and missing-feature checklist.
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Activity, AlertCircle, Brain, Check, CheckCircle2, CheckSquare, Copy, FileCode, FileWarning, Files, Network, Search } from "lucide-react";
 
 import PreFlightFindingsPanel from "./PreFlightFindingsPanel";
@@ -18,6 +18,15 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
   const [fileLedgerSearch, setFileLedgerSearch] = useState("");
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
   const [finalreadOpen, setFinalreadOpen] = useState(false);
+
+  // Tell the app shell when the FinalRead stakeholder view is open, so the
+  // credits gate offers the FinalRead price list instead of consumer packs.
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent("codedoc:finalread-mode", { detail: { open: finalreadOpen } }));
+    return () => {
+      window.dispatchEvent(new CustomEvent("codedoc:finalread-mode", { detail: { open: false } }));
+    };
+  }, [finalreadOpen]);
 
   const handleCopyIntelReport = () => {
     if (!intelResult) return;

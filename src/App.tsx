@@ -9,6 +9,7 @@ import ProjectFilesPanel from "./components/ProjectFilesPanel";
 import AnatomyInspector from "./components/AnatomyInspector";
 import AIDebugger from "./components/AIDebugger";
 import CodeAuditor from "./components/CodeAuditor";
+import FinalReadEntry from "./components/auditor/FinalReadEntry";
 import AuthModal from "./components/AuthModal";
 import PricingModal from "./components/PricingModal";
 import Footer from "./components/Footer";
@@ -104,7 +105,25 @@ export default function App() {
     history.replaceState(null, "", window.location.pathname + window.location.search);
     setLegalDoc(null);
   };
+  // Standalone FinalRead entry via URL hash (#finalread) — stable, linkable,
+  // bookmarkable. The entry view takes over the main content area; the buyer
+  // never sees the GradeVibes workspace UI.
+  const [finalreadEntryOpen, setFinalreadEntryOpen] = useState<boolean>(
+    () => window.location.hash === "#finalread"
+  );
+  useEffect(() => {
+    const onHash = () => setFinalreadEntryOpen(window.location.hash === "#finalread");
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+  const closeFinalReadEntry = () => {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    setFinalreadEntryOpen(false);
+  };
+
   const [pricingNotice, setPricingNotice] = useState("");
+  const [pricingAudience, setPricingAudience] = useState<"finalread" | undefined>(undefined);
+  const finalreadModeRef = useRef(false);
 
   useEffect(() => {
     void fetchMe().then(setUser);
@@ -128,12 +147,20 @@ export default function App() {
         setUser((prev) => (prev ? { ...prev, credits: balance } : prev));
       }
       setPricingNotice(
-        `You're low on credits (balance ${balance ?? 0}, this action needs ~${required ?? "?"}). Top up to continue — the free PreFlight scan always costs 0.`
+        finalreadModeRef.current
+          ? `This FinalRead review needs credits (balance ${balance ?? 0}). One FinalRead Review pack ($199) covers the complete diligence cycle.`
+          : `You're low on credits (balance ${balance ?? 0}, this action needs ~${required ?? "?"}). Top up to continue — the free PreFlight scan always costs 0.`
       );
       setPricingOpen(true);
     };
     window.addEventListener("codedoc:auth-required", onAuthRequired);
     window.addEventListener("codedoc:credits-required", onCreditsRequired);
+    const onFinalreadMode = (e: Event) => {
+      const open = Boolean((e as CustomEvent).detail?.open);
+      finalreadModeRef.current = open;
+      setPricingAudience(open ? "finalread" : undefined);
+    };
+    window.addEventListener("codedoc:finalread-mode", onFinalreadMode);
     // Live balance updates stamped on metered API responses (header or SSE
     // event) — the badge refreshes without a logout/login cycle.
     const onBalanceUpdated = (e: Event) => {
@@ -146,6 +173,7 @@ export default function App() {
     return () => {
       window.removeEventListener("codedoc:auth-required", onAuthRequired);
       window.removeEventListener("codedoc:credits-required", onCreditsRequired);
+      window.removeEventListener("codedoc:finalread-mode", onFinalreadMode);
       window.removeEventListener("codedoc:balance-updated", onBalanceUpdated);
     };
   }, []);
@@ -695,6 +723,10 @@ export default function App() {
 
       {/* Main Container Workspace */}
       <main id="main-content" className="flex-1 flex flex-col min-h-0 bg-slate-950 relative overflow-hidden">
+        {finalreadEntryOpen ? (
+          <FinalReadEntry onExit={closeFinalReadEntry} />
+        ) : (
+          <>
         {warningMessage && (
           <div className="mx-5 mt-4 p-3.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl flex items-center gap-3 text-xs select-text">
             <Sparkles className="w-4 h-4 text-amber-400 shrink-0 animate-pulse" />
@@ -1023,6 +1055,8 @@ export default function App() {
             </div>
           </div>
         )}
+          </>
+        )}
       </main>
 
       {/* Slide-over registry sidebar */}
@@ -1047,6 +1081,7 @@ export default function App() {
       <PricingModal
         open={pricingOpen}
         notice={pricingNotice}
+        audience={pricingAudience}
         onClose={() => { setPricingOpen(false); void fetchMe().then(setUser); }}
       />
       {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
