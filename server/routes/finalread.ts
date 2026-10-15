@@ -76,6 +76,13 @@ function systemPrompt(context: string): string {
     `HARD RULES:\n` +
     `- Answer ONLY from the review below. Every claim must trace to a finding, bucket, or verdict in it.\n` +
     `- Cite the exact finding titles you relied on in citedFindings.\n` +
+    `- The four starter questions always map to review sections — never decline them as uncovered: ` +
+    `"Is this app actually finished?" → the verdict and completeness score; ` +
+    `"What's the biggest risk?" → the highest-severity liabilities; ` +
+    `"Is the login and authentication real?" → the Authentication bucket (its score, evidence, and what the scan found); ` +
+    `"What should be fixed first?" → the liabilities ordered by severity.\n` +
+    `- "Is X real?" means "what did the review establish about X's implementation?" — answer from the category's score ` +
+    `and evidence (e.g. "the review found sign-in code with no backend, scoring it 2/10"), never from certainty the review doesn't claim.\n` +
     `- The "scan evidence" lines under each bucket item are the raw scan signals for your precision — use them to ` +
     `name specifics in plain words (e.g. "the payments code"). Quote raw file paths or line numbers ONLY when the stakeholder ` +
     `explicitly asks for them.\n` +
