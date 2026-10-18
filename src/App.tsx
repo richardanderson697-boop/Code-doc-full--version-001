@@ -122,8 +122,16 @@ export default function App() {
   };
 
   const [pricingNotice, setPricingNotice] = useState("");
-  const [pricingAudience, setPricingAudience] = useState<"finalread" | undefined>(undefined);
-  const finalreadModeRef = useRef(false);
+  // Initialized from the URL hash so a fresh load directly on #finalread
+  // starts in FinalRead mode: child effects (which dispatch the mode event)
+  // run before this component's listener is registered, so the event alone
+  // would be missed on first paint.
+  const [pricingAudience, setPricingAudience] = useState<"finalread" | undefined>(() =>
+    typeof window !== "undefined" && window.location.hash === "#finalread" ? "finalread" : undefined
+  );
+  const finalreadModeRef = useRef(
+    typeof window !== "undefined" && window.location.hash === "#finalread"
+  );
 
   useEffect(() => {
     void fetchMe().then(setUser);
@@ -631,7 +639,7 @@ export default function App() {
             </div>
             <div>
               <h2 className="font-bold text-xs text-slate-100 uppercase tracking-wider font-sans select-none">
-                GradeVibes
+                {finalreadEntryOpen ? "FinalRead" : "GradeVibes"}
               </h2>
               {hasActiveWorkspace && (
                 <div className="flex items-center gap-2">
@@ -1087,7 +1095,7 @@ export default function App() {
       {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
 
       {/* Site footer with legal links */}
-      <Footer />
+      <Footer brand={finalreadEntryOpen ? "FinalRead" : undefined} />
     </div>
   );
 }

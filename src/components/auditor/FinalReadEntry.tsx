@@ -55,6 +55,14 @@ const DELIVERABLES = [
 ];
 
 export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
+  // Buyer-facing tab title while the FinalRead entry is open; restore on exit.
+  useEffect(() => {
+    const prev = document.title;
+    document.title = "FinalRead — Know where to look before you pay";
+    return () => {
+      document.title = prev;
+    };
+  }, []);
   const [phase, setPhase] = useState<Phase>("idle");
   const [stageIdx, setStageIdx] = useState(0);
   const [error, setError] = useState("");
@@ -302,7 +310,7 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
             onClick={onExit}
             className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300 transition"
           >
-            <ArrowLeft className="w-3.5 h-3.5" /> Back to GradeVibes
+            <ArrowLeft className="w-3.5 h-3.5" /> Back
           </button>
           <span className="text-[11px] font-bold uppercase tracking-widest text-indigo-400">
             FinalRead
