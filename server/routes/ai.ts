@@ -591,8 +591,8 @@ Do not skip sections, and make sure the code is completely written (no comments 
           temperature: 0.7,
         },
       },
-      () => {
-        res.write(`data: ${JSON.stringify({ warning: `The primary model (${PRIMARY_MODEL}) is currently experiencing high demand. Seamlessly falling back to ${FALLBACK_MODEL}...` })}\n\n`);
+      (_primaryErr, fallbackModel) => {
+        res.write(`data: ${JSON.stringify({ warning: `The primary model (${PRIMARY_MODEL}) is currently experiencing high demand. Seamlessly falling back to ${fallbackModel || FALLBACK_MODEL}...` })}\n\n`);
       }
     );
 

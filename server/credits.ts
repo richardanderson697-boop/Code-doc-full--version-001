@@ -3,15 +3,21 @@
 import { getDb, type PendingCreditRow } from "./store";
 import { log } from "./logger";
 import { PRIMARY_MODEL, FALLBACK_MODEL } from "./gemini";
+import { CLAUDE_HAIKU_MODEL, CLAUDE_SONNET_MODEL } from "./anthropic";
 
 interface ModelRate {
   inputPerMillion: number;
   outputPerMillion: number;
 }
 
+// Claude rates verified 2026-10-19 against Anthropic's published pricing.
+// Metering uses the token counts Anthropic returns, so failover calls are
+// charged at the answering model's real rate — never the Gemini default.
 const RATES: Record<string, ModelRate> = {
   [PRIMARY_MODEL]: { inputPerMillion: 1.5, outputPerMillion: 7.5 },
   [FALLBACK_MODEL]: { inputPerMillion: 0.3, outputPerMillion: 2.5 },
+  [CLAUDE_HAIKU_MODEL]: { inputPerMillion: 0.1, outputPerMillion: 0.5 },
+  [CLAUDE_SONNET_MODEL]: { inputPerMillion: 2.0, outputPerMillion: 10.0 },
 };
 
 const DEFAULT_RATE: ModelRate = RATES[PRIMARY_MODEL];
