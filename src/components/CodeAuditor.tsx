@@ -116,6 +116,10 @@ export default function CodeAuditor({
   // Deterministic findings kept from a failed AI audit, so an outage of the
   // AI service still shows the scan results instead of only an error.
   const [degradedPreflight, setDegradedPreflight] = useState<PreFlightReport | null>(null);
+  // Same for project intelligence: the route computes the deterministic scan
+  // before the model call and returns it with the error, so a model outage
+  // degrades to findings instead of a bare failure banner.
+  const [intelPreflight, setIntelPreflight] = useState<PreFlightReport | null>(null);
 
   // New ZIP file selection states for Step 1
   const [selectedZipPath, setSelectedZipPath] = useState<string | null>(null);
@@ -635,6 +639,7 @@ export default function CodeAuditor({
     setIntelStatus("loading");
     setIntelError("");
     setIntelResult(null);
+    setIntelPreflight(null);
 
     // The server grades exactly what we send: nothing is ever inferred.
     // "workspace" sends nothing (server uses the whole uploaded workspace),
@@ -663,6 +668,7 @@ export default function CodeAuditor({
 
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
+        if (errData.preflight) setIntelPreflight(errData.preflight);
         throw new Error(errData.error || `Server error (status ${response.status})`);
       }
 
@@ -1459,12 +1465,26 @@ export default function CodeAuditor({
                 </div>
               </div>
             ) : (
-              <div className="flex items-start gap-3 border border-rose-500/25 bg-rose-500/5 rounded-xl p-4 select-text">
-                <XCircle className="text-rose-500 flex-shrink-0 w-4.5 h-4.5 mt-0.5" />
-                <div className="text-xs text-rose-300 font-mono leading-relaxed">
-                  <strong className="text-rose-400 font-semibold uppercase block mb-1">Intelligence Mapping Failure</strong>
-                  {intelError}
+              <div className="space-y-4">
+                <div className="flex items-start gap-3 border border-rose-500/25 bg-rose-500/5 rounded-xl p-4 select-text">
+                  <XCircle className="text-rose-500 flex-shrink-0 w-4.5 h-4.5 mt-0.5" />
+                  <div className="text-xs text-rose-300 font-mono leading-relaxed">
+                    <strong className="text-rose-400 font-semibold uppercase block mb-1">Intelligence Mapping Failure</strong>
+                    {intelError}
+                  </div>
                 </div>
+
+                {/* The model pass failed, but the route computed the
+                    deterministic scan first and returned it with the error.
+                    Show the findings rather than nothing. */}
+                {intelPreflight && (
+                  <>
+                    <p className="text-[10px] text-slate-400 font-mono px-1">
+                      The deterministic scan runs locally and completed successfully. Its findings are below.
+                    </p>
+                    <PreFlightFindingsPanel report={intelPreflight} />
+                  </>
+                )}
               </div>
             )
           )}

@@ -5,6 +5,7 @@ import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini
 import { WorkspaceFile, cleanWorkspacePath, countLines } from "../workspace";
 import { listWorkspaceFiles, getWorkspaceFile } from "../workspace-store";
 import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
+import type { PreFlightReport } from "../../shared/preflight-types";
 import {
   computeDeterministicAssessment,
   formatAssessmentForPrompt,
@@ -29,6 +30,10 @@ const MAX_INTEL_TOTAL_BYTES = 5 * 1024 * 1024;
 
 
 router.post("/api/project-intelligence", requireAuth, requireCredits("intelligence"), asyncRoute(async (req: AuthedRequest, res) => {
+  // Hoisted so the error path can return it: the deterministic scan runs
+  // before the model call, so a model outage should still hand the client
+  // the findings instead of a bare error (same contract as cold-audit).
+  let preflight: PreFlightReport | undefined;
   try {
     let files: WorkspaceFile[] = [];
     const userId = req.user!.id;
@@ -106,7 +111,7 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
 
     // PreFlight deterministic pass over the whole workspace: line-anchored
     // security/quality findings the LLM report can cite as ground truth.
-    const preflight = runPreFlightScan(files.map(f => ({ path: f.path, content: f.content })));
+    preflight = runPreFlightScan(files.map(f => ({ path: f.path, content: f.content })));
 
     // Build workspace context string for Gemini
     let workspaceContext = `You are evaluating a React/TypeScript project with ${totalFiles} file(s) totaling ${totalLines} line(s) of code.\n\n`;
@@ -428,7 +433,10 @@ The total completenessScore is computed server-side (rescaled over the applicabl
     res.json(parsedIntel);
   } catch (error: any) {
     log.error("Project Intelligence API Error:", error);
-    res.status(500).json({ error: formatGeminiError(error) });
+    res.status(500).json({
+      error: formatGeminiError(error),
+      ...(preflight ? { preflight } : {}),
+    });
   }
 }));
 
