@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "description": "AI-driven React/TypeScript workspace: generate, evolve, inspect, and audit code with Gemini plus a deterministic PreFlight scan.",
+  "engines": {
+    "node": "24.x"
+  },
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
