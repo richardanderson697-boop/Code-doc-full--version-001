@@ -22,6 +22,36 @@ export const NO_ESTIMATES_REPLY =
   "What I can tell you is what needs fixing and in what order: start with the liabilities, " +
   "then the half-built areas. Your developer can scope the work from the handoff packet.";
 
+/** Runtime questions — answerable only by watching the app run, never from a
+ *  static review. Routed deterministically to the fixed runtime reply, the
+ *  same way no-estimates questions are: no model call, no charge. The model
+ *  proved it can't classify these reliably itself (asked "what happens if my
+ *  server goes down", it answered with the previous question's line numbers
+ *  instead of the runtime tier), so classification happens here, not in the
+ *  prompt. Patterns are deliberately scenario-flavored ("what happens if the
+ *  X goes down") rather than bare nouns, so static questions about servers,
+ *  files, or restart policy in the code still reach the model. */
+const RUNTIME_PATTERNS = [
+  /\bwhat happens if\b/i,
+  /\bwhat happens when\b/i,
+  /\bgo(es)? down\b/i,
+  /\bserver (is |was )?down\b/i,
+  /\bcrash(es|ed|ing)?\b/i,
+  /\bunder load\b/i,
+  /\btraffic spike\b/i,
+  /\boutage\b/i,
+  /\bfail[- ]?over\b/i,
+  /\bscal(e|es|ing|ability)\b.*\busers?\b/i,
+  /\bin production\b/i,
+  /\breal users\b/i,
+  /\bdowntime\b/i,
+];
+
+export function isRuntimeQuestion(question: string): boolean {
+  const q = question || "";
+  return RUNTIME_PATTERNS.some((p) => p.test(q));
+}
+
 /** The four starter pills: answered deterministically from the report —
  *  no model call, no charge, and they can never decline. A model asked
  *  "what's the biggest risk?" can talk itself into declining; the report
@@ -142,12 +172,67 @@ export const RUNTIME_DECLINE_REPLY =
   "This review reads the code; it never executes it. What would answer it: run it under load, " +
   "crash-test it, or watch it in production for a while.";
 
+/** Warehouse budget: the deep sections appended after the headline report
+ *  (application map, category detail, file ledger) share one deterministic
+ *  character budget so a large intelligence result can't blow up the
+ *  prompt — or the premium fallback chain's token guard. Priority order:
+ *  application map → category detail → file ledger. Truncation cuts at a
+ *  line boundary, reserves room for the truncation note up front, and
+ *  appends that note, so the warehouse portion never exceeds the budget. */
+export const WAREHOUSE_CONTEXT_BUDGET = 24000;
+
+const WAREHOUSE_TRUNCATION_NOTE =
+  "(warehouse detail truncated for size — the full review holds more than fits here)";
+
+function buildWarehouseLines(report: FinalReadReport): string[] {
+  const sections: string[][] = [];
+
+  const map = report.applicationMap;
+  if (map) {
+    const lines: string[] = [];
+    if (map.entrypoint) lines.push(`- entrypoint: ${map.entrypoint}`);
+    for (const c of map.components || []) {
+      const imports =
+        c.imports && c.imports.length > 0 ? ` — imports: ${c.imports.join(", ")}` : "";
+      lines.push(`- component: ${c.name}${c.filePath ? ` (${c.filePath})` : ""}${imports}`);
+    }
+    for (const e of map.endpoints || []) {
+      lines.push(`- endpoint: ${e.method} ${e.path}${e.purpose ? ` — ${e.purpose}` : ""}`);
+    }
+    if (lines.length > 0) sections.push(["APPLICATION MAP:", ...lines]);
+  }
+
+  const reasons = report.categoryReasons;
+  if (reasons && Object.keys(reasons).length > 0) {
+    const lines = Object.keys(reasons).map((key) => `- ${key}: ${reasons[key]}`);
+    sections.push(["CATEGORY DETAIL:", ...lines]);
+  }
+
+  const ledger = report.fileLedger;
+  if (ledger && ledger.length > 0) {
+    const lines = ledger.map((e) => {
+      const bits = [e.filePath];
+      if (e.lineCount != null) bits.push(`${e.lineCount} lines`);
+      if (e.description) bits.push(e.description);
+      if (e.contribution) bits.push(`contributes: ${e.contribution}`);
+      return `- ${bits.join(" — ")}`;
+    });
+    sections.push(["FILE LEDGER:", ...lines]);
+  }
+
+  return sections.flat();
+}
+
 /** Compact, citable context for the model prompt: verdict, bucket titles,
- *  and the liability details. Deliberately excludes code, file contents,
- *  and anything the stakeholder UI never shows. Category items carry
- *  condensed deterministic scan evidence so "which?" questions have
- *  specifics to stand on — the prompt tells the model to use the anchors
- *  for precision but never quote raw file paths to the stakeholder. */
+ *  and the liability details, followed by the warehouse sections — the
+ *  deep analysis (application map, the assessor's raw category reasons,
+ *  the per-file ledger) the stakeholder UI never displays. The warehouse
+ *  rides along so "how is X handled" questions can retrieve what the
+ *  intelligence run established instead of declining from the thin bucket
+ *  context alone. Category items carry condensed deterministic scan
+ *  evidence so "which?" questions have specifics to stand on — the prompt
+ *  tells the model to use the anchors for precision but never quote raw
+ *  file paths to the stakeholder. Still excludes code and file contents. */
 export function buildQaContext(report: FinalReadReport): string {
   const lines: string[] = [];
   lines.push(`PROJECT: ${report.projectTitle}`);
@@ -180,5 +265,26 @@ export function buildQaContext(report: FinalReadReport): string {
   section("working", report.working);
   lines.push("COULD NOT ESTABLISH:");
   for (const c of report.couldNotEstablish) lines.push(`- ${c}`);
+
+  // Warehouse sections, under the shared budget. No warehouse data → no
+  // lines at all (no empty headers), so the context is exactly what it
+  // was before the warehouse existed.
+  const warehouse = buildWarehouseLines(report);
+  if (warehouse.length > 0) {
+    const contentBudget =
+      WAREHOUSE_CONTEXT_BUDGET - (WAREHOUSE_TRUNCATION_NOTE.length + 1);
+    let used = 0;
+    let truncated = false;
+    for (const line of warehouse) {
+      const cost = line.length + 1; // the joining newline
+      if (used + cost > contentBudget) {
+        truncated = true;
+        break;
+      }
+      lines.push(line);
+      used += cost;
+    }
+    if (truncated) lines.push(WAREHOUSE_TRUNCATION_NOTE);
+  }
   return lines.join("\n");
 }

@@ -32,6 +32,25 @@ export interface FinalReadScanGaps {
   filesScanned?: number;
 }
 
+/** One per-file ledger entry from the intelligence run: what the file is
+ *  and what it contributes. Warehouse detail — carried for the Q&A, never
+ *  rendered in the stakeholder UI. */
+export interface FinalReadFileLedgerEntry {
+  filePath: string;
+  lineCount?: number;
+  description?: string;
+  contribution?: string;
+}
+
+/** The intelligence run's structured application map (entrypoint, key
+ *  components with their imports, backend endpoints with purposes).
+ *  Warehouse detail — carried for the Q&A, never rendered in the UI. */
+export interface FinalReadApplicationMap {
+  entrypoint?: string;
+  components?: Array<{ name: string; filePath: string; imports?: string[] }>;
+  endpoints?: Array<{ method: string; path: string; purpose?: string }>;
+}
+
 export interface FinalReadAuditInput {
   projectTitle?: string;
   /** 0-100 completeness score. */
@@ -49,6 +68,14 @@ export interface FinalReadAuditInput {
   findings?: FinalReadFindingInput[];
   missingFeatures?: Array<{ category?: string; feature: string; reason?: string }>;
   scanGaps?: FinalReadScanGaps;
+  /** Warehouse detail from the intelligence run: the structured
+   *  application map. The stakeholder UI never displays it, but the Q&A
+   *  context includes it so "how is X wired up" questions can retrieve
+   *  what the analysis established instead of declining. */
+  applicationMap?: FinalReadApplicationMap;
+  /** Warehouse detail from the intelligence run: the per-file ledger.
+   *  Same deal as applicationMap — retrievable by the Q&A, not displayed. */
+  fileLedger?: FinalReadFileLedgerEntry[];
 }
 
 export interface FinalReadBucketItem {
@@ -75,6 +102,18 @@ export interface FinalReadReport {
   /** Always non-empty: the report model requires this panel to show. */
   couldNotEstablish: string[];
   counts: { working: number; halfBuilt: number; liabilities: number };
+  /** Warehouse detail (Q&A-only, never rendered): the intelligence run's
+   *  application map, when the audit provided a usable one. */
+  applicationMap?: FinalReadApplicationMap;
+  /** Warehouse detail (Q&A-only, never rendered): the per-file ledger. */
+  fileLedger?: FinalReadFileLedgerEntry[];
+  /** The assessor's raw per-category reasons, keyed by category. The
+   *  bucket items already fold these into business implications; carrying
+   *  them verbatim lets the Q&A stand on the review's own technical basis
+   *  (citations included) when a stakeholder asks how something is handled.
+   *  Derived from categoryScores — the single source of truth — rather
+   *  than a second input field that could disagree with the scores. */
+  categoryReasons?: Record<string, string>;
 }
 
 // Plain-English business framing per rubric category: what the category
@@ -205,6 +244,89 @@ function condenseEvidence(lines: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+// Warehouse sanitizers: the audit arrives from the client, so the
+// warehouse fields get the same defensive treatment as everything else
+// here — wrong container shapes and junk entries drop to undefined
+// instead of reaching the Q&A context (or throwing).
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
+function cleanString(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const s = v.trim();
+  return s ? s : undefined;
+}
+
+function sanitizeApplicationMap(raw: unknown): FinalReadApplicationMap | undefined {
+  if (!isPlainObject(raw)) return undefined;
+  const out: FinalReadApplicationMap = {};
+  const entrypoint = cleanString(raw.entrypoint);
+  if (entrypoint) out.entrypoint = entrypoint;
+  if (Array.isArray(raw.components)) {
+    const components: NonNullable<FinalReadApplicationMap["components"]> = [];
+    for (const c of raw.components) {
+      if (!isPlainObject(c)) continue;
+      const name = cleanString(c.name);
+      const filePath = cleanString(c.filePath);
+      if (!name && !filePath) continue;
+      const imports = Array.isArray(c.imports)
+        ? c.imports.map((i) => cleanString(i)).filter((i): i is string => !!i)
+        : undefined;
+      components.push({
+        name: name || "",
+        filePath: filePath || "",
+        ...(imports && imports.length > 0 ? { imports } : {}),
+      });
+    }
+    if (components.length > 0) out.components = components;
+  }
+  if (Array.isArray(raw.endpoints)) {
+    const endpoints: NonNullable<FinalReadApplicationMap["endpoints"]> = [];
+    for (const e of raw.endpoints) {
+      if (!isPlainObject(e)) continue;
+      const method = cleanString(e.method);
+      const path = cleanString(e.path);
+      if (!method || !path) continue;
+      const purpose = cleanString(e.purpose);
+      endpoints.push({ method, path, ...(purpose ? { purpose } : {}) });
+    }
+    if (endpoints.length > 0) out.endpoints = endpoints;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function sanitizeFileLedger(raw: unknown): FinalReadFileLedgerEntry[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: FinalReadFileLedgerEntry[] = [];
+  for (const e of raw) {
+    if (!isPlainObject(e)) continue;
+    const filePath = cleanString(e.filePath);
+    if (!filePath) continue;
+    const entry: FinalReadFileLedgerEntry = { filePath };
+    const lineCount = Number(e.lineCount);
+    if (Number.isFinite(lineCount) && lineCount > 0) entry.lineCount = Math.round(lineCount);
+    const description = cleanString(e.description);
+    if (description) entry.description = description;
+    const contribution = cleanString(e.contribution);
+    if (contribution) entry.contribution = contribution;
+    out.push(entry);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function deriveCategoryReasons(
+  categories: Record<string, FinalReadCategoryInput>
+): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  for (const key of Object.keys(categories)) {
+    const reason = (categories[key]?.reason || "").trim();
+    if (reason) out[key] = reason;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadReport {
   const working: FinalReadBucketItem[] = [];
   const halfBuilt: FinalReadBucketItem[] = [];
@@ -271,5 +393,8 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     liabilities,
     couldNotEstablish,
     counts: { working: working.length, halfBuilt: halfBuilt.length, liabilities: liabilities.length },
+    applicationMap: sanitizeApplicationMap(input.applicationMap),
+    fileLedger: sanitizeFileLedger(input.fileLedger),
+    categoryReasons: deriveCategoryReasons(categories),
   };
 }

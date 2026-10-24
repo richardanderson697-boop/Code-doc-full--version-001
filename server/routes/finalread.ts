@@ -4,6 +4,8 @@
 // tier). Everything else is free:
 //
 // - cost/time/effort questions → fixed "no estimates" reply, no model call
+// - runtime-pattern questions ("what happens if the server goes down") →
+//   fixed runtime reply, no model call (deterministic; the model misroutes these)
 // - tiered declines (resilience brief):
 //     partial → the review flags the area but lacks the detail; the model
 //               names what WAS established from cited findings. Grounded and
@@ -31,6 +33,7 @@ import {
 import {
   isNoEstimatesQuestion,
   NO_ESTIMATES_REPLY,
+  isRuntimeQuestion,
   unknownCitations,
   buildQaContext,
   normalizeDeclineTier,
@@ -75,7 +78,8 @@ function systemPrompt(context: string): string {
     `But if the stakeholder explicitly asks for technical specifics (file names, line numbers, code details), give them ` +
     `straight from the review's evidence — an explicit request overrides the plain-English default.\n\n` +
     `HARD RULES:\n` +
-    `- Answer ONLY from the review below. Every claim must trace to a finding, bucket, or verdict in it.\n` +
+    `- Answer ONLY from the review below. Every claim must trace to a finding, bucket, verdict, or the warehouse ` +
+    `detail (APPLICATION MAP, CATEGORY DETAIL, FILE LEDGER) in it.\n` +
     `- Cite the exact finding titles you relied on in citedFindings.\n` +
     `- The four starter questions always map to review sections — never decline them as uncovered: ` +
     `"Is this app actually finished?" → the verdict and completeness score; ` +
@@ -91,7 +95,10 @@ function systemPrompt(context: string): string {
     `declineTier to "partial": write what the review DID establish using ONLY related cited findings — never invent the missing analysis.\n` +
     `- If the question can only be answered by watching the app run (load, real users, production data, third-party outages), ` +
     `set insufficientContext to true and declineTier to "runtime".\n` +
-    `- If nothing in the review bears on the question, set insufficientContext to true and declineTier to "unknown".\n` +
+    `- If nothing in the review bears on the question, set insufficientContext to true and declineTier to "unknown". ` +
+    `The review includes the warehouse detail below the buckets (APPLICATION MAP, CATEGORY DETAIL, FILE LEDGER) — check ALL of it ` +
+    `before deciding nothing bears on the question. If any part of the review establishes part of an answer, use the "partial" ` +
+    `tier instead: answer with the part the review establishes and state the limit, rather than declining outright.\n` +
     `- NEVER give cost, time, or effort estimates — no hours, prices, timelines, or t-shirt sizes.\n` +
     `- NEVER invent findings, files, or numbers that are not in the review.\n\n` +
     `THE REVIEW:\n${context}`
@@ -141,6 +148,20 @@ router.post(
       });
     }
 
+    // 2c. Runtime questions: deterministic classification — the model has
+    // shown it can't route these itself (it once answered "what happens if
+    // my server goes down" with the previous question's line numbers).
+    // Fixed reply, no model call, no charge. Same response shape as the
+    // model's own runtime tier (4a) so the client needs no new handling.
+    if (isRuntimeQuestion(question)) {
+      return res.json({
+        declined: true,
+        answer: RUNTIME_DECLINE_REPLY,
+        citedFindings: [],
+        runtime: true,
+      });
+    }
+
     // 3. Grounded model call with retries. Failed attempts are never charged.
     const prompt = systemPrompt(buildQaContext(report));
     let parsed: any = null;
@@ -148,14 +169,20 @@ router.post(
     let modelName = "";
     for (let attempt = 1; attempt <= 3 && !parsed; attempt++) {
       try {
-        const gen = await generateWithFallback({
-          contents: `${prompt}\n\nQUESTION: ${question.trim()}`,
-          config: {
-            temperature: 0.3,
-            responseMimeType: "application/json",
-            responseSchema: ANSWER_SCHEMA,
+        const gen = await generateWithFallback(
+          {
+            contents: `${prompt}\n\nQUESTION: ${question.trim()}`,
+            config: {
+              temperature: 0.3,
+              responseMimeType: "application/json",
+              responseSchema: ANSWER_SCHEMA,
+            },
           },
-        });
+          undefined,
+          // FinalRead is the premium tier: on a Gemini failure it falls back
+          // to Claude Sonnet, never to the consumer lite model.
+          { tier: "premium" }
+        );
         lastResponse = gen.response;
         modelName = gen.modelName;
         const raw = (gen.response.text || "").trim();

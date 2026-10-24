@@ -44,12 +44,30 @@ export function intelResultToFinalReadInput(
     rawEvidence && typeof rawEvidence === "object" && !Array.isArray(rawEvidence)
       ? rawEvidence
       : undefined;
+  // Warehouse detail for the Q&A: the intelligence run's application map
+  // and per-file ledger. The overlay never renders these — they ride along
+  // so the server-side Q&A context can retrieve what the analysis
+  // established about how the app is wired. Guarded like the evidence
+  // above: only the expected container shapes pass through; the report
+  // builder sanitizes entry-level detail. (The raw category reasons need
+  // no separate handling — they already ride inside categoryScores.)
+  const applicationMap =
+    intelResult?.applicationMap &&
+    typeof intelResult.applicationMap === "object" &&
+    !Array.isArray(intelResult.applicationMap)
+      ? intelResult.applicationMap
+      : undefined;
+  const fileLedger = Array.isArray(intelResult?.fileLedger)
+    ? intelResult.fileLedger
+    : undefined;
   return {
     projectTitle,
     completenessScore: Number(intelResult?.completenessScore) || 0,
     applicationSummary: intelResult?.overallSummary || undefined,
     categoryScores: intelResult?.categoryScores || {},
     categoryEvidence,
+    applicationMap,
+    fileLedger,
     findings: (preflight?.findings || []).map((f: any) => ({
       severity: f.severity,
       title: f.title,
