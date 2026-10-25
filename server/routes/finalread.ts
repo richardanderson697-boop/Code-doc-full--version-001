@@ -11,7 +11,15 @@
 //               names what WAS established from cited findings. Grounded and
 //               usable, so it charges like an answer.
 //     runtime → needs live runtime observation; fixed server-side reply.
-//     unknown → nothing in the review bears on it; the old flat decline.
+//     unknown → nothing in the review bears on it; one double-check call
+//               to the other premium model first. If it agrees, the flat
+//               decline marked as double-checked, plus the free-decline
+//               rephrase note. If the check can't run or fails, the flat
+//               decline unmarked, still with the note.
+// - free declines carry the rephrase note (unknown + uncited-fallback
+//   only); partials (charged), runtime, and estimate replies never do.
+// - partial gaps are scoped to the material surfaced for the question,
+//   never asserted about the whole review.
 // - out-of-scope or uncited answers → declined, no charge
 // - unusable model output after retries → 502, no charge
 //
@@ -22,13 +30,21 @@ import { asyncRoute } from "../async-route";
 import {
   generateWithFallback,
   extractUsage,
+  ai,
+  PRIMARY_MODEL,
 } from "../gemini";
+import {
+  generateWithClaude,
+  isClaudeConfigured,
+  CLAUDE_SONNET_MODEL,
+} from "../anthropic";
 import { log } from "../logger";
 import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
 import {
   buildFinalReadReport,
   type FinalReadAuditInput,
+  type FinalReadReport,
 } from "../../shared/finalread-report";
 import {
   isNoEstimatesQuestion,
@@ -38,9 +54,16 @@ import {
   buildQaContext,
   normalizeDeclineTier,
   PARTIAL_DECLINE_PREFIX,
+  PARTIAL_SCOPE_GUIDANCE,
   RUNTIME_DECLINE_REPLY,
+  formatUnknownDecline,
+  formatUncitedDecline,
+  doubleCheckPrompt,
+  pickVerificationModel,
   starterAnswer,
 } from "../../shared/finalread-qa";
+
+import type { GenerateContentConfig } from "@google/genai";
 
 const router = Router();
 
@@ -64,7 +87,7 @@ const ANSWER_SCHEMA = {
     declineTier: {
       type: "STRING",
       description:
-        "When insufficientContext is true, one of: 'partial' (the review flags the area but lacks the specific detail — write what it DID establish using ONLY related cited findings, never invent the missing analysis), 'runtime' (the question can only be answered by watching the app run), or 'unknown' (nothing in the review bears on the question). Omit when answered.",
+        "When insufficientContext is true, one of: 'partial' (the review flags the area but lacks the specific detail — write what it DID establish using ONLY related cited findings, never invent the missing analysis, and scope any gap to the material surfaced for this question — never claim the whole review lacks it), 'runtime' (the question can only be answered by watching the app run), or 'unknown' (nothing in the review bears on the question). Omit when answered.",
       enum: ["partial", "runtime", "unknown"],
     },
   },
@@ -92,7 +115,8 @@ function systemPrompt(context: string): string {
     `name specifics in plain words (e.g. "the payments code"). Quote raw file paths or line numbers ONLY when the stakeholder ` +
     `explicitly asks for them.\n` +
     `- If the review flags the area but lacks the specific detail asked for, set insufficientContext to true and ` +
-    `declineTier to "partial": write what the review DID establish using ONLY related cited findings — never invent the missing analysis.\n` +
+    `declineTier to "partial": write what the review DID establish using ONLY related cited findings — never invent the missing analysis. ` +
+    `${PARTIAL_SCOPE_GUIDANCE}\n` +
     `- If the question can only be answered by watching the app run (load, real users, production data, third-party outages), ` +
     `set insufficientContext to true and declineTier to "runtime".\n` +
     `- If nothing in the review bears on the question, set insufficientContext to true and declineTier to "unknown". ` +
@@ -103,6 +127,130 @@ function systemPrompt(context: string): string {
     `- NEVER invent findings, files, or numbers that are not in the review.\n\n` +
     `THE REVIEW:\n${context}`
   );
+}
+
+// Double-check for unknown-tier declines only (investor package only —
+// this route is the only FinalRead ask path; the consumer tier has no
+// Q&A). When the first model says nothing bears on the question, one
+// verification call goes to the OTHER model in the premium chain with an
+// explicit both-ways term-expansion instruction. One attempt, no retry
+// loop. The first call was a decline, so it was never charged; a
+// verification answer that passes the caller's citation check is charged
+// exactly once, like a normal answer. If the verification call fails,
+// errors, or can't run, the caller keeps the original decline WITHOUT the
+// double-checked marking — the check did not complete.
+type VerificationOutcome =
+  | {
+      kind: "answer";
+      parsed: {
+        answer: string;
+        citedFindings: string[];
+        insufficientContext: boolean;
+        declineTier: string;
+      };
+      lastResponse: any;
+      modelName: string;
+      partialPrefix: boolean;
+    }
+  | { kind: "decline"; answer: string };
+
+async function verifyUnknownDecline(
+  question: string,
+  report: FinalReadReport,
+  firstModelName: string
+): Promise<VerificationOutcome> {
+  const verifyModel = pickVerificationModel(
+    firstModelName === CLAUDE_SONNET_MODEL,
+    isClaudeConfigured()
+  );
+  if (!verifyModel) {
+    log.warn("finalread/ask double-check skipped: other premium model unavailable");
+    return { kind: "decline", answer: formatUnknownDecline(false) };
+  }
+  try {
+    const contents = doubleCheckPrompt(buildQaContext(report, question), question);
+    const config: GenerateContentConfig = {
+      temperature: 0.3,
+      responseMimeType: "application/json",
+      responseSchema: ANSWER_SCHEMA,
+    };
+    let raw: string;
+    let resp: any;
+    let vModel: string;
+    if (verifyModel === "claude") {
+      const claude = await generateWithClaude({ contents, config }, CLAUDE_SONNET_MODEL);
+      raw = (claude.text || "").trim();
+      resp = claude;
+      vModel = CLAUDE_SONNET_MODEL;
+    } else {
+      const gen = await ai.models.generateContent({
+        model: PRIMARY_MODEL,
+        contents,
+        config,
+      });
+      raw = String((gen as any).text || "").trim();
+      resp = gen;
+      vModel = PRIMARY_MODEL;
+    }
+    const candidate = JSON.parse(raw);
+    const answer = String(candidate.answer || "").trim();
+    const cited = Array.isArray(candidate.citedFindings)
+      ? candidate.citedFindings.map((c: any) => String(c))
+      : [];
+    const declined =
+      candidate.insufficientContext === true ||
+      candidate.insufficientContext === "true" ||
+      candidate.insufficientContext === 1;
+    if (!declined && answer) {
+      // Grounded answer. Citations are NOT validated here — the caller
+      // runs the same 4b check as for a first-model answer, so a
+      // verification answer with invented citations still declines free.
+      return {
+        kind: "answer",
+        parsed: {
+          answer,
+          citedFindings: cited,
+          insufficientContext: false,
+          declineTier: normalizeDeclineTier(candidate.declineTier),
+        },
+        lastResponse: resp,
+        modelName: vModel,
+        partialPrefix: false,
+      };
+    }
+    if (declined) {
+      const tier = normalizeDeclineTier(candidate.declineTier);
+      if (
+        tier === "partial" &&
+        answer &&
+        unknownCitations(cited, report).length === 0
+      ) {
+        return {
+          kind: "answer",
+          parsed: {
+            answer,
+            citedFindings: cited,
+            insufficientContext: true,
+            declineTier: "partial",
+          },
+          lastResponse: resp,
+          modelName: vModel,
+          partialPrefix: true,
+        };
+      }
+      if (tier === "runtime") {
+        return { kind: "decline", answer: RUNTIME_DECLINE_REPLY };
+      }
+      // Unknown (or ungrounded partial): both models agree nothing
+      // grounded bears on the question.
+      return { kind: "decline", answer: formatUnknownDecline(true) };
+    }
+    log.warn("finalread/ask double-check: empty answer without decline");
+    return { kind: "decline", answer: formatUnknownDecline(false) };
+  } catch (err: any) {
+    log.warn(`finalread/ask double-check failed: ${err?.message || err}`);
+    return { kind: "decline", answer: formatUnknownDecline(false) };
+  }
 }
 
 router.post(
@@ -163,7 +311,9 @@ router.post(
     }
 
     // 3. Grounded model call with retries. Failed attempts are never charged.
-    const prompt = systemPrompt(buildQaContext(report));
+    // The question rides into the context so question-matching warehouse
+    // lines survive the runaway ceiling ahead of unrelated lines.
+    const prompt = systemPrompt(buildQaContext(report, question));
     let parsed: any = null;
     let lastResponse: any = null;
     let modelName = "";
@@ -221,10 +371,11 @@ router.post(
     //   cited findings and usable, so it charges like an answer (with a
     //   deterministic prefix). Uncited partials fall back to the flat decline.
     // - runtime: needs live runtime observation. Fixed reply, free.
-    // - unknown: nothing in the review bears on it. The old flat decline, free.
-    const FLAT_DECLINE_REPLY =
-      "That question can't be answered from this review without guessing, so I won't guess. " +
-      "It covers what the scan found — ask about the verdict, the liabilities, or what's half-built.";
+    // - unknown: nothing in the review bears on it. One double-check call
+    //   to the other premium model first; if it agrees, the flat decline
+    //   marked as double-checked, plus the free-decline rephrase note.
+    //   Ungrounded partials share the flat-decline path (free, so the note
+    //   claim stays true) but never trigger the double-check.
     if (parsed.insufficientContext) {
       const partialGrounded =
         parsed.declineTier === "partial" &&
@@ -240,10 +391,27 @@ router.post(
           citedFindings: [],
           runtime: true,
         });
+      } else if (parsed.declineTier === "unknown") {
+        const outcome = await verifyUnknownDecline(question, report, modelName);
+        if (outcome.kind === "answer") {
+          parsed = outcome.parsed;
+          lastResponse = outcome.lastResponse;
+          modelName = outcome.modelName;
+          if (outcome.partialPrefix) {
+            parsed.answer = PARTIAL_DECLINE_PREFIX + parsed.answer;
+          }
+          // Falls through to 4b (citation check) and 5 (charge once).
+        } else {
+          return res.json({
+            declined: true,
+            answer: outcome.answer,
+            citedFindings: [],
+          });
+        }
       } else {
         return res.json({
           declined: true,
-          answer: FLAT_DECLINE_REPLY,
+          answer: formatUnknownDecline(false),
           citedFindings: [],
         });
       }
@@ -255,9 +423,7 @@ router.post(
       log.warn(`finalread/ask: uncited answer declined (unknown: ${unknown.join("; ")})`);
       return res.json({
         declined: true,
-        answer:
-          "I can't answer that from what's in this review without guessing, so I won't. " +
-          "Try asking about the verdict, the liabilities, or a specific half-built area.",
+        answer: formatUncitedDecline(),
         citedFindings: [],
       });
     }

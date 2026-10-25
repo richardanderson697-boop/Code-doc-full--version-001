@@ -10,7 +10,18 @@ import {
   WAREHOUSE_CONTEXT_BUDGET,
   normalizeDeclineTier,
   PARTIAL_DECLINE_PREFIX,
+  PARTIAL_SCOPE_GUIDANCE,
   RUNTIME_DECLINE_REPLY,
+  FLAT_DECLINE_REPLY,
+  FREE_DECLINE_REPHRASE_NOTE,
+  DOUBLE_CHECKED_DECLINE_PREFIX,
+  formatUnknownDecline,
+  formatUncitedDecline,
+  questionTerms,
+  warehouseLineMatches,
+  selectWarehouseLines,
+  pickVerificationModel,
+  doubleCheckPrompt,
   starterAnswer,
 } from "../shared/finalread-qa";
 import { buildFinalReadReport } from "../shared/finalread-report";
@@ -297,11 +308,11 @@ describe("buildQaContext warehouse", () => {
     expect(ctx).not.toMatch(/truncated for size/);
   });
 
-  it("truncates an oversized warehouse at the budget, map first, with a note", () => {
+  it("truncates an oversized warehouse at the runaway ceiling, map first, with a note", () => {
     const bigLedger = Array.from({ length: 300 }, (_, i) => ({
       filePath: `src/file-${i}.ts`,
       lineCount: 100,
-      description: "x".repeat(200),
+      description: "x".repeat(2000),
       contribution: "y".repeat(100),
     }));
     const report = buildFinalReadReport({
@@ -396,6 +407,162 @@ describe("warehouse sanitization", () => {
   });
 });
 
+describe("warehouse runaway ceiling", () => {
+  it("is raised far above the old 24,000-char budget", () => {
+    expect(WAREHOUSE_CONTEXT_BUDGET).toBe(500000);
+  });
+
+  it("passes a 72-file-scale warehouse through whole, with no truncation note", () => {
+    const ledger = Array.from({ length: 300 }, (_, i) => ({
+      filePath: `src/file-${i}.ts`,
+      lineCount: 100,
+      description: "x".repeat(200),
+      contribution: "y".repeat(100),
+    }));
+    const report = buildFinalReadReport({
+      projectTitle: "Huge App",
+      completenessScore: 50,
+      categoryScores: { coreLogic: { score: 5, reason: "Partially built." } },
+      applicationMap: {
+        entrypoint: "server.ts",
+        endpoints: [{ method: "GET", path: "/api/health", purpose: "Health check" }],
+      },
+      fileLedger: ledger,
+      findings: [],
+    });
+    const ctx = buildQaContext(report);
+    expect(ctx).not.toMatch(/truncated for size/);
+    expect(ctx).toMatch(/file-299/);
+  });
+});
+
+describe("questionTerms and retention", () => {
+  it("lowercases, drops stopwords and short tokens, de-duplicates", () => {
+    expect(questionTerms("Does this app use Speech Synthesis?")).toEqual([
+      "use",
+      "speech",
+      "synthesis",
+    ]);
+    expect(questionTerms("Is it an OS thing?")).toEqual(["thing"]);
+    expect(questionTerms("")).toEqual([]);
+  });
+
+  it("matches case-insensitively with cheap plural/singular variants", () => {
+    expect(warehouseLineMatches("- Holds the api key for TTS", ["keys"])).toBe(true);
+    expect(warehouseLineMatches("- Handles SpeechSynthesis playback", ["speech"])).toBe(true);
+    expect(warehouseLineMatches("- Handles Stripe billing", ["keys"])).toBe(false);
+    expect(warehouseLineMatches("- Handles Stripe billing", [])).toBe(false);
+  });
+
+  function retentionReport() {
+    const filler = Array.from({ length: 20 }, (_, i) => ({
+      filePath: `src/file-${i}.ts`,
+      lineCount: 100,
+      description: "Filler module for test",
+      contribution: "Nothing",
+    }));
+    return buildFinalReadReport({
+      projectTitle: "Retention App",
+      completenessScore: 50,
+      categoryScores: { coreLogic: { score: 5, reason: "Partially built." } },
+      applicationMap: {
+        entrypoint: "server.ts",
+        endpoints: [{ method: "GET", path: "/api/health", purpose: "Health check" }],
+      },
+      fileLedger: [
+        ...filler,
+        {
+          filePath: "src/components/AudioBookPlayer.tsx",
+          lineCount: 200,
+          description: "Handles SpeechSynthesis playback",
+          contribution: "Plays chapters aloud",
+        },
+      ],
+      findings: [],
+    });
+  }
+
+  it("admits question-matching lines first, within the ceiling, not exempt from it", () => {
+    const report = retentionReport();
+    const withQuestion = selectWarehouseLines(report, "speech synthesis", 350).join("\n");
+    const withoutQuestion = selectWarehouseLines(report, undefined, 350).join("\n");
+    // The player line sits last in the ledger; without the question it is
+    // cut, with the question it is admitted first.
+    expect(withQuestion).toMatch(/SpeechSynthesis/);
+    expect(withoutQuestion).not.toMatch(/SpeechSynthesis/);
+    // Matching lines come before unrelated lines, and the ceiling still
+    // applies: the note is present and the tail stays cut.
+    expect(withQuestion.indexOf("SpeechSynthesis")).toBeLessThan(
+      withQuestion.indexOf("/api/health")
+    );
+    expect(withQuestion).toMatch(/truncated for size/);
+    expect(withoutQuestion).toMatch(/truncated for size/);
+    expect(withQuestion).toMatch(/\/api\/health/);
+  });
+
+  it("buildQaContext passes the question through and stays identical with no match", () => {
+    const report = retentionReport();
+    expect(buildQaContext(report, "zzz qqq")).toBe(buildQaContext(report));
+    expect(buildQaContext(report, "")).toBe(buildQaContext(report));
+    expect(buildQaContext(report, "speech synthesis")).toMatch(/SpeechSynthesis/);
+  });
+});
+
+describe("double-check helpers", () => {
+  it("picks the other premium model, never the same one or the lite model", () => {
+    expect(pickVerificationModel(false, true)).toBe("claude");
+    expect(pickVerificationModel(true, true)).toBe("gemini");
+    expect(pickVerificationModel(true, false)).toBe("gemini");
+    expect(pickVerificationModel(false, false)).toBeNull();
+  });
+
+  it("the verification prompt expands terms both ways with the dogfood examples", () => {
+    const prompt = doubleCheckPrompt("THE REVIEW", "Does it use a codex?");
+    expect(prompt).toMatch(/BOTH ways/);
+    expect(prompt).toMatch(/codex/);
+    expect(prompt).toMatch(/fact ledger/);
+    expect(prompt).toMatch(/SpeechSynthesis/);
+    expect(prompt).toMatch(/native browser speech/);
+    expect(prompt).toMatch(/free OS voices/);
+    expect(prompt).toMatch(/stateless proxy/);
+    expect(prompt).toMatch(/whether keys are stored/);
+    expect(prompt).toMatch(/THE REVIEW/);
+    expect(prompt).toMatch(/Does it use a codex\?/);
+  });
+});
+
+describe("free-decline rephrase note scoping", () => {
+  it("uses the exact founder-approved wording", () => {
+    expect(FREE_DECLINE_REPHRASE_NOTE).toBe(
+      "This question wasn't answered, so no credit was charged. Rephrasing sometimes finds it — try describing what you're asking about in plain words, rather than using a product or feature name."
+    );
+  });
+
+  it("rides on unknown and uncited declines, marked only when double-checked", () => {
+    expect(formatUnknownDecline(false)).toContain(FLAT_DECLINE_REPLY);
+    expect(formatUnknownDecline(false)).toContain(FREE_DECLINE_REPHRASE_NOTE);
+    expect(formatUnknownDecline(false)).not.toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
+    expect(formatUnknownDecline(true)).toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
+    expect(formatUnknownDecline(true)).toContain(FLAT_DECLINE_REPLY);
+    expect(formatUnknownDecline(true)).toContain(FREE_DECLINE_REPHRASE_NOTE);
+    expect(formatUncitedDecline()).toContain(FREE_DECLINE_REPHRASE_NOTE);
+    expect(formatUncitedDecline()).not.toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
+  });
+
+  it("never appears in the charged or policy replies themselves", () => {
+    expect(PARTIAL_DECLINE_PREFIX).not.toContain("no credit was charged");
+    expect(RUNTIME_DECLINE_REPLY).not.toContain("no credit was charged");
+    expect(NO_ESTIMATES_REPLY).not.toContain("no credit was charged");
+  });
+});
+
+describe("partial scope guardrail", () => {
+  it("scopes gaps to the surfaced material and forbids whole-review absence claims", () => {
+    expect(PARTIAL_SCOPE_GUIDANCE).toMatch(/not found in the material surfaced for this question/);
+    expect(PARTIAL_SCOPE_GUIDANCE).toMatch(/the review does not detail/);
+    expect(PARTIAL_SCOPE_GUIDANCE).toMatch(/absence from it is not absence from the review/);
+  });
+});
 describe("intelResultToFinalReadInput warehouse", () => {
   it("carries the application map and file ledger out of an intelligence result", () => {
     const input = intelResultToFinalReadInput({
