@@ -38,6 +38,48 @@ function sampleReport() {
   });
 }
 
+function warehouseReport() {
+  return buildFinalReadReport({
+    projectTitle: "Test App",
+    completenessScore: 60,
+    categoryScores: {
+      coreLogic: {
+        score: 6,
+        reason:
+          "Character continuity is tracked through a fact ledger that merges character lists",
+      },
+    },
+    findings: [
+      { severity: "high", title: "Hardcoded secret", file: "src/c.ts", line: 1 },
+    ],
+    applicationMap: {
+      entrypoint: "src/server.ts",
+      components: [
+        {
+          name: "BookCodex",
+          filePath: "src/components/BookCodex.tsx",
+          imports: ["src/lib/factLedger.ts"],
+        },
+      ],
+      endpoints: [
+        {
+          method: "POST",
+          path: "/api/elevenlabs/tts",
+          purpose: "Stateless ElevenLabs text-to-speech proxy",
+        },
+      ],
+    },
+    fileLedger: [
+      {
+        filePath: "src/lib/factLedger.ts",
+        lineCount: 698,
+        description: "Macro plot arc analyzer and character continuity ledger",
+        contribution: "tracks character roles and chapter facts",
+      },
+    ],
+  });
+}
+
 describe("isNoEstimatesQuestion", () => {
   it("catches cost/time/effort phrasings", () => {
     for (const q of [
@@ -85,6 +127,94 @@ describe("unknownCitations", () => {
   it("is case-insensitive and trims", () => {
     const report = sampleReport();
     expect(unknownCitations(["  hardcoded SECRET "], report)).toEqual([]);
+  });
+
+  it("passes warehouse-grounded citations: paths, identifiers, and phrases", () => {
+    const report = warehouseReport();
+    expect(
+      unknownCitations(
+        [
+          "src/lib/factLedger.ts",
+          "factLedger.ts",
+          "lib/factLedger.ts",
+          "src/components/BookCodex.tsx",
+          "BookCodex",
+          "POST /api/elevenlabs/tts",
+          "/api/elevenlabs/tts",
+          "src/server.ts",
+          "Stateless ElevenLabs text-to-speech proxy",
+          "character continuity ledger",
+          "tracks character roles",
+          "fact ledger that merges character lists",
+        ],
+        report
+      )
+    ).toEqual([]);
+  });
+
+  it("still passes finding titles alongside warehouse citations", () => {
+    const report = warehouseReport();
+    expect(
+      unknownCitations(["Hardcoded secret", "src/lib/factLedger.ts"], report)
+    ).toEqual([]);
+  });
+
+  it("is case-insensitive and trims warehouse citations", () => {
+    const report = warehouseReport();
+    expect(
+      unknownCitations(
+        ["  FACTLEDGER.TS ", "  Character Continuity Ledger "],
+        report
+      )
+    ).toEqual([]);
+  });
+
+  it("still flags invented citations, including invented file paths", () => {
+    const report = warehouseReport();
+    expect(
+      unknownCitations(
+        [
+          "Quantum flux capacitor",
+          "src/lib/nonexistent.ts",
+          "character teleportation matrix",
+        ],
+        report
+      )
+    ).toEqual([
+      "Quantum flux capacitor",
+      "src/lib/nonexistent.ts",
+      "character teleportation matrix",
+    ]);
+  });
+
+  it("does not pass generic single-word citations", () => {
+    const report = warehouseReport();
+    expect(unknownCitations(["characters", "audio", "voices"], report)).toEqual([
+      "characters",
+      "audio",
+      "voices",
+    ]);
+  });
+
+  it("does not pass invented citations that embed a real phrase", () => {
+    const report = warehouseReport();
+    expect(
+      unknownCitations(
+        [
+          "the character continuity ledger uses quantum entanglement to teleport chapters",
+        ],
+        report
+      )
+    ).toEqual([
+      "the character continuity ledger uses quantum entanglement to teleport chapters",
+    ]);
+  });
+
+  it("does not pass phrases stitched across two warehouse fields", () => {
+    const report = warehouseReport();
+    expect(
+      unknownCitations(["proxy tracks character roles"], report)
+    ).toEqual(["proxy tracks character roles"]);
   });
 });
 

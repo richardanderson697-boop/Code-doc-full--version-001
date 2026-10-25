@@ -130,17 +130,121 @@ export function starterAnswer(
   return null;
 }
 
-/** A grounded answer must cite real finding titles from the report. Returns
- *  the cited titles that do NOT match anything the report contains. */
+/** A grounded answer must cite something the report actually contains.
+ *  Returns the cited titles that do NOT match anything the report holds.
+ *
+ *  Matching rule (2026-10-25, warehouse-citation fix): a cited string
+ *  passes when, after normalizing (trim, lowercase, collapsed whitespace,
+ *  surrounding quotes and trailing :;, stripped), it matches one of:
+ *  1. A finding title from liabilities / halfBuilt / working — the
+ *     original behavior, unchanged.
+ *  2. A warehouse identifier, exactly: the map entrypoint, a component
+ *     name, a component or ledger file path, an endpoint path, or a
+ *     "METHOD path" string. File basenames count when they carry an
+ *     extension (factLedger.ts cites src/lib/factLedger.ts); a bare
+ *     directory name does not.
+ *  3. A trailing, segment-aligned suffix of a known file/endpoint path
+ *     (lib/factLedger.ts for src/lib/factLedger.ts).
+ *  4. A warehouse phrase: a cited string of at least two words that
+ *     appears verbatim (normalized) inside ONE structured warehouse text
+ *     field — an endpoint purpose, a ledger description or contribution,
+ *     a component name, or a category reason. Matching is per-field,
+ *     never against the concatenated context blob, so a phrase stitched
+ *     across two unrelated lines cannot pass.
+ *
+ *  Deliberately still rejected: single generic words ("characters",
+ *  "audio") — neither identifiers in the report nor multi-word phrases;
+ *  invented strings and invented file paths; phrases that appear nowhere
+ *  in the report. The reverse direction (a real field embedded inside a
+ *  longer invented citation) is NOT accepted: a long invented citation
+ *  that happens to contain a real short phrase must still fail. That is
+ *  what keeps the check an anti-hallucination check now that the full
+ *  warehouse is in Q&A context — the model may ground HOW answers in
+ *  warehouse material, but only in warehouse material that is really
+ *  there. Bucket-item evidence lines are not covered here; they are
+ *  folded into the items' business implications, and a citation to a
+ *  verbatim evidence line still fails (follow-up if that ever bites). */
 export function unknownCitations(citedTitles: string[], report: FinalReadReport): string[] {
-  const known = new Set<string>();
+  const norm = (s: string): string =>
+    String(s || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ")
+      .replace(/^["']+|["']+$/g, "")
+      .replace(/[:;,]+$/g, "")
+      .trim();
+  const basename = (p: string): string => {
+    const parts = String(p || "").split("/");
+    return parts[parts.length - 1] || "";
+  };
+
+  const titles = new Set<string>();
   for (const item of [...report.liabilities, ...report.halfBuilt, ...report.working]) {
-    known.add(item.title.trim().toLowerCase());
+    const n = norm(item.title);
+    if (n) titles.add(n);
   }
+
+  const identifiers = new Set<string>();
+  const paths: string[] = [];
+  const fields: string[] = [];
+  const addPath = (p: string | undefined): void => {
+    const n = norm(p || "");
+    if (!n) return;
+    identifiers.add(n);
+    paths.push(n);
+    const base = norm(basename(p || ""));
+    if (base.includes(".")) identifiers.add(base);
+  };
+
+  const map = report.applicationMap;
+  if (map) {
+    addPath(map.entrypoint);
+    for (const c of map.components || []) {
+      const name = norm(c.name);
+      if (name) {
+        identifiers.add(name);
+        fields.push(name);
+      }
+      addPath(c.filePath);
+    }
+    for (const e of map.endpoints || []) {
+      addPath(e.path);
+      const methodPath = norm(`${e.method || ""} ${e.path || ""}`);
+      if (methodPath) identifiers.add(methodPath);
+      const purpose = norm(e.purpose || "");
+      if (purpose) fields.push(purpose);
+    }
+  }
+  for (const e of report.fileLedger || []) {
+    addPath(e.filePath);
+    const description = norm(e.description || "");
+    if (description) fields.push(description);
+    const contribution = norm(e.contribution || "");
+    if (contribution) fields.push(contribution);
+  }
+  const reasons = report.categoryReasons;
+  if (reasons) {
+    for (const key of Object.keys(reasons)) {
+      const reason = norm(reasons[key]);
+      if (reason) fields.push(reason);
+    }
+  }
+
   const unknown: string[] = [];
   for (const t of citedTitles || []) {
-    const norm = String(t || "").trim().toLowerCase();
-    if (norm && !known.has(norm)) unknown.push(String(t).trim());
+    const n = norm(t);
+    if (!n) continue;
+    if (titles.has(n) || identifiers.has(n)) continue;
+    if (
+      n.includes("/") &&
+      paths.some((p) => p === n || p.endsWith(`/${n}`))
+    ) {
+      continue;
+    }
+    if (n.split(" ").length >= 2 && fields.some((f) => f.includes(n))) {
+      continue;
+    }
+    unknown.push(String(t).trim());
   }
   return unknown;
 }
