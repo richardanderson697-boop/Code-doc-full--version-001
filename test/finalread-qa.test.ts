@@ -218,6 +218,77 @@ describe("unknownCitations", () => {
   });
 });
 
+describe("unknownCitations category lines", () => {
+  // Category bucket items as the report builder makes them: title is the
+  // category label, implication starts with the label + score head.
+  function categoryLineReport() {
+    return buildFinalReadReport({
+      projectTitle: "Test App",
+      completenessScore: 60,
+      categoryScores: {
+        coreLogic: {
+          score: 6,
+          reason: "Character continuity is partly tracked",
+        },
+        authentication: { score: 10, reason: "Login is complete" },
+        x: { score: 2 },
+      },
+      findings: [
+        {
+          severity: "critical",
+          title: "SQL injection",
+          file: "src/a.ts",
+          line: 1,
+        },
+      ],
+    });
+  }
+
+  it("passes rendered category lines: head, labels, and normalization", () => {
+    const report = categoryLineReport();
+    expect(
+      unknownCitations(
+        [
+          "Core logic: Half-built (6/10)",
+          "Authentication: Solid ground (10/10)",
+          "X: A gap (2/10)",
+          "core logic:  half-built (6/10)",
+          "Core logic: Half-built (6/10):",
+        ],
+        report
+      )
+    ).toEqual([]);
+  });
+
+  it("still flags a category line with the wrong score", () => {
+    const report = categoryLineReport();
+    expect(unknownCitations(["Core logic: Half-built (9/10)"], report)).toEqual([
+      "Core logic: Half-built (9/10)",
+    ]);
+  });
+
+  it("still flags a category line for a nonexistent category", () => {
+    const report = categoryLineReport();
+    expect(unknownCitations(["Payments: Half-built (6/10)"], report)).toEqual([
+      "Payments: Half-built (6/10)",
+    ]);
+  });
+
+  it("still flags a bare label + score with no title", () => {
+    const report = categoryLineReport();
+    expect(unknownCitations(["Half-built (6/10)"], report)).toEqual([
+      "Half-built (6/10)",
+    ]);
+  });
+
+  it("still flags a finding title plus a label/score it does not carry", () => {
+    const report = categoryLineReport();
+    expect(
+      unknownCitations(["SQL injection: Half-built (6/10)"], report)
+    ).toEqual(["SQL injection: Half-built (6/10)"]);
+  });
+});
+
 describe("buildQaContext", () => {
   it("includes verdict, buckets, and the honesty panel", () => {
     const ctx = buildQaContext(sampleReport());

@@ -173,19 +173,32 @@ export function starterAnswer(
  *     a component name, or a category reason. Matching is per-field,
  *     never against the concatenated context blob, so a phrase stitched
  *     across two unrelated lines cannot pass.
+ *  5. A rendered category line (2026-10-26, category-line fix): the
+ *     report builder turns each category into a bucket item whose
+ *     businessImplication starts with "Solid ground (N/10):",
+ *     "Half-built (N/10):", or "A gap (N/10):", and the Q&A context
+ *     renders it as "- {title}: {businessImplication}". A cited string
+ *     passes when it equals, normalized, "{title}: {label} ({score}/10)"
+ *     for some bucket item whose implication starts with that head.
+ *     The set is derived from the report's own items, never from free
+ *     text, so a wrong score or nonexistent category still fails.
+ *     Finding implications never start with the label pattern, so only
+ *     category items contribute entries.
  *
  *  Deliberately still rejected: single generic words ("characters",
  *  "audio") — neither identifiers in the report nor multi-word phrases;
  *  invented strings and invented file paths; phrases that appear nowhere
- *  in the report. The reverse direction (a real field embedded inside a
- *  longer invented citation) is NOT accepted: a long invented citation
- *  that happens to contain a real short phrase must still fail. That is
- *  what keeps the check an anti-hallucination check now that the full
- *  warehouse is in Q&A context — the model may ground HOW answers in
- *  warehouse material, but only in warehouse material that is really
- *  there. Bucket-item evidence lines are not covered here; they are
- *  folded into the items' business implications, and a citation to a
- *  verbatim evidence line still fails (follow-up if that ever bites). */
+ *  in the report; a category line with the wrong score, a nonexistent
+ *  category, or a bare label + score with no title. The reverse
+ *  direction (a real field embedded inside a longer invented citation)
+ *  is NOT accepted: a long invented citation that happens to contain a
+ *  real short phrase must still fail. That is what keeps the check an
+ *  anti-hallucination check now that the full warehouse is in Q&A
+ *  context — the model may ground HOW answers in warehouse material, but
+ *  only in warehouse material that is really there. Bucket-item evidence
+ *  lines are not covered here; they are folded into the items' business
+ *  implications, and a citation to a verbatim evidence line still fails
+ *  (follow-up if that ever bites). */
 export function unknownCitations(citedTitles: string[], report: FinalReadReport): string[] {
   const norm = (s: string): string =>
     String(s || "")
@@ -257,6 +270,33 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
     }
   }
 
+  // Rule 5 (2026-10-26, category-line fix): rendered category lines.
+  // The report builder turns each category into a bucket item whose
+  // businessImplication starts with "Solid ground (N/10):", "Half-built
+  // (N/10):", or "A gap (N/10):", and the Q&A context renders it as
+  // "- {title}: {businessImplication}". A model citing that rendered
+  // head ("Core logic: Half-built (6/10)") cites real report content,
+  // so it passes — but only exactly, derived from the report's own
+  // items, so a wrong score or nonexistent category still fails.
+  // Finding implications never start with the label pattern, so only
+  // category items contribute entries; needsVerification items are
+  // iterated for uniformity but contribute nothing in practice. Items
+  // without a title contribute nothing: a rendered line always has one.
+  const categoryLines = new Set<string>();
+  const headPattern = /^(Solid ground|Half-built|A gap) \((\d+)\/10\):/;
+  for (const item of [
+    ...report.liabilities,
+    ...report.halfBuilt,
+    ...report.working,
+    ...report.needsVerification,
+  ]) {
+    if (!item.title) continue;
+    const m = headPattern.exec(String(item.businessImplication || "").trim());
+    if (!m) continue;
+    const line = norm(`${item.title}: ${m[1]} (${m[2]}/10)`);
+    if (line) categoryLines.add(line);
+  }
+
   const unknown: string[] = [];
   for (const t of citedTitles || []) {
     const n = norm(t);
@@ -271,6 +311,7 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
     if (n.split(" ").length >= 2 && fields.some((f) => f.includes(n))) {
       continue;
     }
+    if (categoryLines.has(n)) continue;
     unknown.push(String(t).trim());
   }
   return unknown;
