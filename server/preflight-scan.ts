@@ -214,6 +214,10 @@ export function runPreFlightScan(
     // finding, so record the original for the caller and the tests.
     severity: SEVERITIES.has(f?.severity) ? f.severity : "info",
     originalSeverity: SEVERITIES.has(f?.severity) ? undefined : String(f?.severity ?? "(missing)"),
+    // Probes flag findings they could not establish (delegated handlers);
+    // the flag must survive the adapter or the verification guard below
+    // has nothing to route on. Never inferred from title text.
+    unverified: f?.unverified === true ? true : undefined,
     probe: String(f?.probe || "PreFlight"),
     title: String(f?.title || ""),
     file: String(f?.file || ""),

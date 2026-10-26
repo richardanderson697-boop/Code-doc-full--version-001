@@ -108,6 +108,12 @@ const FAST_HASH_ALGOS = new Set(['sha256', 'sha-256', 'sha384', 'sha512', 'sha-5
 const CRED_CONTEXT_RE =
   /\b\w*(?:password|passwd|passphrase|pwd|plaintext|plain_text|credential|secret|api_?key|private_?key|master_?key|session_?key)\w*\b/i;
 
+// Token naming for the fast-hash counter-signal: a hash of a token
+// (reset token, session token) is not a password hash. Judged on the
+// call lines and signature only, like the other counter-signals, so a
+// token word in the window cannot silence a real password hash.
+const TOKEN_NAMING_RE = /\b\w*token\w*\b/i;
+
 // Password context for sha256/sha512. Narrow on purpose: `createHash('sha256')`
 // over a master key is a defensible if unfashionable KDF, and over a file is
 // simply correct. Only a password makes it a finding.
@@ -250,6 +256,34 @@ function enclosingSignature(lines, i) {
   return '';
 }
 
+// The createHash line plus its chained continuations: lines starting with
+// `.` (method-chain continuations) and, when the hash is assigned to a
+// receiver variable, that variable's .update/.digest lines. Bounded by
+// the ±4-line window the probe already uses. Anything further out is a
+// neighboring statement, not part of the call.
+function hashCallLines(lines, i) {
+  const out = [lines[i] ?? ''];
+  const receiverMatch = (lines[i] ?? '').match(
+    /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;\n]*createHash\s*\(/
+  );
+  const receiverRe = receiverMatch
+    ? new RegExp(`^${receiverMatch[1].replace(/\$/g, '\\$')}\\s*\\.\\s*(?:update|digest)\\b`)
+    : null;
+  for (let j = i + 1; j < lines.length && j <= i + 4; j++) {
+    const trimmed = (lines[j] ?? '').trim();
+    if (trimmed.startsWith('.')) {
+      out.push(lines[j]);
+      continue;
+    }
+    if (receiverRe && receiverRe.test(trimmed)) {
+      out.push(lines[j]);
+      continue;
+    }
+    break;
+  }
+  return out.join('\n');
+}
+
 export function probeWeakCryptography(files) {
   const findings = [];
 
@@ -359,7 +393,23 @@ export function probeWeakCryptography(files) {
         });
       } else {
         if (fileHasKdf) continue;
-        if (!PASSWORD_CONTEXT_RE.test(context) && !AUTH_FN_NAME_RE.test(signature)) continue;
+        // Fast-hash gate, rung 1c: the credential word must be on the
+        // call's own lines — the createHash line plus its chained
+        // continuations — or in the enclosing signature. A password word
+        // merely in the ±4-line window is circumstantial: it is how a
+        // token hash sitting next to password code (hashResetToken
+        // beside a reset handler) got reported as a password hash.
+        // Token-naming counter-signal: a hash of a token-named value is
+        // not a password hash, unless a credential word is also named on
+        // the call lines or signature. The broken-hash gate above is
+        // untouched by either change, and fileHasKdf is not extended.
+        const callLines = hashCallLines(lines, i);
+        const hasNamedCredential =
+          PASSWORD_CONTEXT_RE.test(callLines) || PASSWORD_CONTEXT_RE.test(signature);
+        const isTokenHash =
+          TOKEN_NAMING_RE.test(callLines) || TOKEN_NAMING_RE.test(signature);
+        if (isTokenHash && !hasNamedCredential) continue;
+        if (!hasNamedCredential && !AUTH_FN_NAME_RE.test(signature)) continue;
         report('fasthashpw', ln, {
           title: `Password hashed with ${m[2]} and no key derivation function`,
           severity: 'high',

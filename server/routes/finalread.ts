@@ -108,7 +108,11 @@ function systemPrompt(context: string): string {
     `"Is this app actually finished?" → the verdict and completeness score; ` +
     `"What's the biggest risk?" → the highest-severity liabilities; ` +
     `"Is the login and authentication real?" → the Authentication bucket (its score, evidence, and what the scan found); ` +
-    `"What should be fixed first?" → the liabilities ordered by severity.\n` +
+    `"What should be fixed first?" → the liabilities ordered by severity. ` +
+    `"What still needs verifying?" → the NEEDS VERIFICATION section below the liabilities.\n` +
+    `- Items in the NEEDS VERIFICATION section were flagged by the scan but NOT established — the review could not verify ` +
+    `them from the code. NEVER state one as an established fact, a liability, or something the app does or lacks. ` +
+    `Describe each only as flagged and awaiting developer confirmation, and say what would settle it (the "how a developer checks it" line).\n` +
     `- "Is X real?" means "what did the review establish about X's implementation?" — answer from the category's score ` +
     `and evidence (e.g. "the review found sign-in code with no backend, scoring it 2/10"), never from certainty the review doesn't claim.\n` +
     `- The "scan evidence" lines under each bucket item are the raw scan signals for your precision — use them to ` +

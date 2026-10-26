@@ -383,6 +383,24 @@ describe("finding/category reconciliation (both checks rule)", () => {
     expect(a.capsApplied.join(" ")).not.toMatch(/reconciliation/i);
   });
 
+  it("does not cap on an unverified critical finding (verification guard)", () => {
+    const a = computeDeterministicAssessment(
+      AUTH_FILES,
+      preflightWith([finding({ unverified: true })])
+    );
+    expect(a.categories.authentication.score).toBe(10);
+    expect(a.capsApplied.join(" ")).not.toMatch(/reconciliation/i);
+  });
+
+  it("caps on the verified finding when an unverified one rides along", () => {
+    const a = computeDeterministicAssessment(
+      AUTH_FILES,
+      preflightWith([finding({ unverified: true }), finding({})])
+    );
+    expect(a.categories.authentication.score).toBe(4);
+    expect(a.capsApplied.join(" ")).toMatch(/reconciliation/i);
+  });
+
   it("leaves unrelated categories alone", () => {
     const a = computeDeterministicAssessment(
       AUTH_FILES,

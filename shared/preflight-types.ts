@@ -12,6 +12,11 @@ export interface PreFlightFinding {
   // adapter coerced it to "info". Present so a coerced critical is visible
   // rather than silently downgraded.
   originalSeverity?: string;
+  // Set when the probe could not establish the finding (e.g. a delegated
+  // handler whose auth lives outside the scanned file). An unverified
+  // finding must never cap a score or read as an established liability —
+  // it routes to the "needs developer verification" bucket instead.
+  unverified?: boolean;
   probe: string;
   title: string;
   file: string;

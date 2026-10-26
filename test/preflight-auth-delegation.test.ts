@@ -69,3 +69,115 @@ describe("probeAPIRouteAuth — delegated handlers", () => {
     expect(f.title).toContain("without auth check");
   });
 });
+
+describe("probeAPIRouteAuth — per-route token authentication (rung 1a)", () => {
+  // Mirrors the real forgot-password handler: no session signal, but the
+  // route verifies a caller token (read + token-keyed lookup + rejection
+  // before the password change). All three parts, in order.
+  const TOKEN_AUTH_INLINE = `
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token, newPassword } = req.body;
+  const row = await db.get(
+    "SELECT id, user_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = $1",
+    [hashToken(token)]
+  );
+  if (!row || row.used_at || new Date(row.expires_at) < new Date()) {
+    return res.status(400).json({ error: "Invalid or expired token" });
+  }
+  await db.run("UPDATE users SET password_hash = $1 WHERE id = $2", [hash(newPassword), row.user_id]);
+  res.json({ ok: true });
+});`;
+
+  const TOKEN_AUTH_INFILE = `
+app.post("/api/auth/reset-password", resetPasswordHandler);
+async function resetPasswordHandler(req, res) {
+  const { token, newPassword } = req.body;
+  const row = await db.get(
+    "SELECT id FROM password_reset_tokens WHERE token_hash = $1",
+    [hashToken(token)]
+  );
+  if (!row) {
+    return res.status(400).json({ error: "Invalid token" });
+  }
+  await db.run("UPDATE users SET password_hash = $1", [hash(newPassword)]);
+  res.json({ ok: true });
+}`;
+
+  // Token read but never validated: still a hole.
+  const TOKEN_READ_WITHOUT_VALIDATION = `
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token } = req.body;
+  await db.run("UPDATE users SET password_hash = $1 WHERE id = $2", [hash(req.body.newPassword)]);
+  res.json({ ok: true });
+});`;
+
+  // Lookup by user id alone is not a token lookup.
+  const USER_ID_ONLY_LOOKUP = `
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token } = req.body;
+  const user = await db.get("SELECT id FROM users WHERE id = $1", [req.body.userId]);
+  if (!user) {
+    return res.status(400).json({ error: "No such user" });
+  }
+  await db.run("UPDATE users SET password_hash = $1 WHERE id = $2", [hash(req.body.newPassword), user.id]);
+  res.json({ ok: true });
+});`;
+
+  // Token validated only AFTER the password change: still a hole.
+  const MUTATION_BEFORE_REJECTION = `
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token } = req.body;
+  const row = await db.get(
+    "SELECT id, user_id, expires_at, used_at FROM password_reset_tokens WHERE token_hash = $1",
+    [hashToken(token)]
+  );
+  await db.run("UPDATE users SET password_hash = $1 WHERE id = $2", [hash(req.body.newPassword), row.user_id]);
+  if (!row || row.used_at) {
+    return res.status(400).json({ error: "Invalid token" });
+  }
+  res.json({ ok: true });
+});`;
+
+  it("skips an inline handler that verifies a caller token", () => {
+    expect(run(TOKEN_AUTH_INLINE)).toEqual([]);
+  });
+
+  it("skips an in-file handler that verifies a caller token", () => {
+    expect(run(TOKEN_AUTH_INFILE)).toEqual([]);
+  });
+
+  it("keeps CRITICAL when the token is read but never validated", () => {
+    const findings = run(TOKEN_READ_WITHOUT_VALIDATION);
+    expect(findings.length).toBe(1);
+    expect(findings[0].severity).toBe("critical");
+    expect(findings[0].title).toContain("without auth check");
+  });
+
+  it("keeps CRITICAL when the lookup is by user id, not by token", () => {
+    const findings = run(USER_ID_ONLY_LOOKUP);
+    expect(findings.length).toBe(1);
+    expect(findings[0].severity).toBe("critical");
+    expect(findings[0].title).toContain("without auth check");
+  });
+
+  it("keeps CRITICAL when the mutation precedes the rejection", () => {
+    const findings = run(MUTATION_BEFORE_REJECTION);
+    expect(findings.length).toBe(1);
+    expect(findings[0].severity).toBe("critical");
+    expect(findings[0].title).toContain("without auth check");
+  });
+
+  it("does not let one token-auth route exempt another route in the file", () => {
+    const findings = run(`${TOKEN_AUTH_INLINE}\n${INLINE_NOAUTH}`);
+    expect(findings.length).toBe(1);
+    expect(findings[0].title).toContain("/api/admin/reset");
+    expect(findings[0].severity).toBe("critical");
+  });
+
+  it("marks delegated findings unverified, and established findings not", () => {
+    const [delegated] = run(DELEGATED_WEBHOOK);
+    expect(delegated.unverified).toBe(true);
+    const [inline] = run(INLINE_NOAUTH);
+    expect(inline.unverified).toBeUndefined();
+  });
+});

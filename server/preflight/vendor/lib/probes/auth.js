@@ -376,6 +376,32 @@ export function probeAuthWeakness(files) {
       const pwdSpellingOnly = !/\b\w*(?:password|passwd)\b/i.test(wideLine);
       const namesAPath =
         /\b\w*(?:dir|directory|folder|cwd|path|filename|filepath|workspace)\w*\b/i.test(wideLine);
+      // Confirmation match: `password !== confirm` / `password !==
+      // confirmPassword` compares a new value against its confirmation,
+      // not a stored credential. Suppress when the non-password operand
+      // is confirmation-named: equal to confirm/confirmation, starting
+      // with confirm (covers `confirmPassword`), or ending in
+      // Confirm/Confirmation/RepeatPassword, case-insensitive. The
+      // spec's prose says "ending in"; its acceptance pair also
+      // requires `confirmPassword`, so both directions are covered.
+      const isConfirmationComparison = (() => {
+        const cmp = /(\w+(?:\.\w+)*)\s*[!=]==?\s*(\w+(?:\.\w+)*)/g;
+        const lastSeg = (s) => s.split(".").pop() || "";
+        const isPasswordName = (s) => /^(?:\w*)(?:password|passwd|pwd)$/i.test(s);
+        const isConfirmName = (s) =>
+          /^(?:confirm|confirmation)$/i.test(s) ||
+          /^confirm/i.test(s) ||
+          /(?:confirm|confirmation|repeatpassword)$/i.test(s);
+        let m;
+        while ((m = cmp.exec(wideLine)) !== null) {
+          const a = lastSeg(m[1]);
+          const b = lastSeg(m[2]);
+          if ((isPasswordName(a) && isConfirmName(b)) || (isConfirmName(a) && isPasswordName(b))) {
+            return true;
+          }
+        }
+        return false;
+      })();
       if (
         (/(?:\b\w*(?:password|passwd|pwd)\b)\s*[!=]==?\s*(?!(?:null|undefined|true|false)\b)\w+(?:\.\w+)*\b/i.test(
           wideLine
@@ -388,7 +414,8 @@ export function probeAuthWeakness(files) {
         // keychain round-trip check is not an auth path. FP triage 2026-07.
         !/\b(?:test|dummy|mock|sample|expected|fake|placeholder)_?(?:password|passwd|pwd)\b/i.test(
           line
-        )
+        ) &&
+        !isConfirmationComparison
       ) {
         findings.push({
           id: `auth-plainpasswordcompare-${file.path}-${i}`,
@@ -1375,6 +1402,99 @@ function isDelegatedRouteHandler(argsText, fileContent) {
   return !isDefinedInFile(callMatch[1], fileContent);
 }
 
+// --- Token-authenticated handler detection (rung 1a) ---
+//
+// A forgot-password / token-verification handler authenticates without any
+// session signal: it reads a token from the request, looks the token (or
+// its hash) up in a store, and rejects unknown / expired / used tokens
+// before acting. ALL THREE parts are required, in order (lookup, then
+// rejection, then any state change). A route that merely reads a token
+// without validating it, or looks something up by user id alone, is NOT
+// token-authenticated and still fires. Checked per-route, never
+// file-level: a token shape anywhere else in the file must not exempt
+// this route.
+function handlerHasTokenAuth(handlerText) {
+  if (!handlerText) return false;
+  // 1. Token read: destructured from req.body / req.query, a .token
+  // property read, or an Authorization header read.
+  const tokenRead =
+    /\{\s*[^}]*\btoken\b[^}]*\}\s*=\s*req\.(body|query)\b/i.test(handlerText) ||
+    /req\.(body|query)\s*\.\s*token\b/i.test(handlerText) ||
+    /req\.headers\b[^;]{0,200}?\bauthorization\b/i.test(handlerText);
+  if (!tokenRead) return false;
+  // 2. Token-keyed store lookup: a token_hash column, a *token* table, or
+  // a comparison against a stored token hash. A lookup by user id alone
+  // does NOT count.
+  const lookupMatch =
+    /\btoken_hash\b/i.exec(handlerText) ||
+    /\bfrom\s+\w*token\w*\b/i.exec(handlerText) ||
+    /\b\w*token\w*hash\s*[!=]==?/i.exec(handlerText);
+  if (!lookupMatch) return false;
+  // 3. Rejection before effect: a 400/401/403 rejection (or throw) after
+  // the lookup, and before any state mutation that follows it. A route
+  // that validates only after acting is not authenticated.
+  const afterLookup = handlerText.slice(lookupMatch.index);
+  const rejection =
+    /\b(?:res\.status\s*\(\s*(?:400|401|403)\b|res\.sendStatus\s*\(\s*(?:400|401|403)\b|throw\s+new\s+Error\b)/i.exec(
+      afterLookup
+    );
+  if (!rejection) return false;
+  const mutation =
+    /\b(?:UPDATE|INSERT\s+INTO|DELETE\s+FROM)\b|db\.(?:run|exec)\s*\(|password_hash\s*=/i.exec(
+      afterLookup
+    );
+  if (mutation && mutation.index < rejection.index) return false;
+  return true;
+}
+
+// Body of an in-file function definition, brace-balanced (strings and
+// comments skipped the same way extractCallArgs scans). Null when the
+// definition cannot be located or balanced — callers fall back to the
+// call-site args, which keeps today's behavior (flag) for those routes.
+function extractFunctionBody(content, name) {
+  const esc = name.replace(/\$/g, "\\$");
+  const def =
+    content.match(new RegExp(`\\b(?:async\\s+)?function\\s+${esc}\\s*\\([^)]*\\)\\s*\\{`)) ||
+    content.match(
+      new RegExp(`\\b(?:const|let|var)\\s+${esc}\\s*=\\s*(?:async\\s+)?function\\s*\\([^)]*\\)\\s*\\{`)
+    ) ||
+    content.match(
+      new RegExp(`\\b(?:const|let|var)\\s+${esc}\\s*=\\s*(?:async\\s*)?\\([^)]*\\)\\s*=>\\s*\\{`)
+    );
+  if (!def) return null;
+  const openIdx = content.indexOf("{", def.index);
+  if (openIdx === -1) return null;
+  let depth = 0;
+  let inStr = null;
+  for (let i = openIdx; i < content.length; i++) {
+    const ch = content[i];
+    if (inStr) {
+      if (ch === inStr && content[i - 1] !== "\\") inStr = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      inStr = ch;
+      continue;
+    }
+    if (ch === "/" && content[i + 1] === "/") {
+      const nl = content.indexOf("\n", i);
+      i = nl === -1 ? content.length : nl;
+      continue;
+    }
+    if (ch === "/" && content[i + 1] === "*") {
+      const ec = content.indexOf("*/", i + 2);
+      i = ec === -1 ? content.length : ec + 1;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return content.slice(openIdx + 1, i);
+    }
+  }
+  return null;
+}
+
 // --- API Route Auth ---
 
 export function probeAPIRouteAuth(files) {
@@ -1619,11 +1739,38 @@ export function probeAPIRouteAuth(files) {
         // the honest "could not verify" at low instead of asserting
         // "without auth check" at CRITICAL.
         const delegated = isDelegatedRouteHandler(extractCallArgs(c, rm.index), c);
+        // Token-authenticated handler: verified by token lookup, not by a
+        // session signal, so the file-level hasAuth check misses it. Skip
+        // the route only when the handler body itself shows all three
+        // parts (read + store lookup + rejection before effect), and only
+        // per-route — a token shape elsewhere in the file exempts nothing.
+        // The route was evaluated, so it still counts as emitted: the
+        // file-level fallbacks below must not re-flag it.
+        if (!delegated) {
+          const argsText = extractCallArgs(c, rm.index);
+          let handlerText = argsText || "";
+          if (argsText) {
+            const args = splitTopLevelArgs(argsText);
+            const last = args[args.length - 1].trim();
+            const bare = last.match(/^([A-Za-z_$][\w$]*)$/);
+            if (bare && isDefinedInFile(bare[1], c)) {
+              handlerText = extractFunctionBody(c, bare[1]) || argsText;
+            }
+          }
+          if (handlerHasTokenAuth(handlerText)) {
+            emittedPerRoute = true;
+            continue;
+          }
+        }
         const sev = delegated ? 'low' : routeSensitive ? sensitiveSeverity : destructiveSeverity;
         emittedPerRoute = true;
         findings.push({
           id: `api-noauth-${file.path}-${routeLine}`,
           probe: 'API Route Auth',
+          // Delegated findings are flagged, not established: the auth lives
+          // outside the scanned file. The verification guard routes them to
+          // "needs developer verification" instead of liabilities.
+          ...(delegated ? { unverified: true } : {}),
           title: delegated
             ? `${method} ${routePath} — handler delegated out of this file, auth could not be verified`
             : hasAuthAcknowledgmentComment

@@ -17,6 +17,12 @@ export interface FinalReadFindingInput {
   evidence?: string;
   /** The scanner's own fix text, when one exists. */
   remediation?: string;
+  /**
+   * Set when the probe could not establish the finding (e.g. a delegated
+   * handler whose auth lives outside the scanned file). Flagged findings
+   * never become liabilities — they route to needsVerification instead.
+   */
+  unverified?: boolean;
 }
 
 export interface FinalReadCategoryInput {
@@ -88,6 +94,22 @@ export interface FinalReadBucketItem {
   evidence?: string[];
   /** The scanner's own remediation text, when the item came from a finding. */
   remediation?: string;
+  /**
+   * Present only on needsVerification items: the four fields the
+   * developer-verification section renders. Never invent a check — when
+   * the finding carries no remediation, howToCheck is the generic
+   * ask-the-developer fallback.
+   */
+  verification?: {
+    /** What the scan saw: file:line plus probe evidence. */
+    whatWeSaw: string;
+    /** The severity implication, framed conditionally (never asserted). */
+    ifReal: string;
+    /** How a developer checks it (finding remediation or generic fallback). */
+    howToCheck: string;
+    /** What each answer means: confirmed → liability, refuted → leaves the list. */
+    whatEachAnswerMeans: string;
+  };
 }
 
 export interface FinalReadReport {
@@ -99,9 +121,17 @@ export interface FinalReadReport {
   working: FinalReadBucketItem[];
   halfBuilt: FinalReadBucketItem[];
   liabilities: FinalReadBucketItem[];
+  /**
+   * Findings the probe flagged but could not establish. Never liabilities,
+   * never hidden — the stakeholder UI renders these in their own section.
+   * Ordered severity-desc, then file order.
+   */
+  needsVerification: FinalReadBucketItem[];
+  /** ISO timestamp the report object was built (rendered in the verification section header). */
+  generatedAt: string;
   /** Always non-empty: the report model requires this panel to show. */
   couldNotEstablish: string[];
-  counts: { working: number; halfBuilt: number; liabilities: number };
+  counts: { working: number; halfBuilt: number; liabilities: number; needsVerification: number };
   /** Warehouse detail (Q&A-only, never rendered): the intelligence run's
    *  application map, when the audit provided a usable one. */
   applicationMap?: FinalReadApplicationMap;
@@ -177,7 +207,29 @@ function bucketForScore(score: number): "working" | "halfBuilt" | "liabilities" 
   return "liabilities";
 }
 
-function verdictFor(completenessScore: number, liabilityCount: number): string {
+/**
+ * The severity implication for a verification item, framed conditionally.
+ * Mirrors implicationForFinding's branches but never asserts the issue is
+ * real — the item is flagged, not established.
+ */
+function ifRealForFinding(f: FinalReadFindingInput): string {
+  const sev = (f.severity || "info").toLowerCase();
+  if (sev === "critical" || sev === "high") {
+    return (
+      `If confirmed, this is the kind of issue that becomes an incident, ` +
+      `a breach headline, or an angry customer. It should be fixed before anyone bets on this app.`
+    );
+  }
+  if (sev === "medium") {
+    return (
+      `If confirmed, worth fixing before launch — left alone, issues like this ` +
+      `tend to surface at the worst moment, usually in front of users.`
+    );
+  }
+  return `If confirmed, a minor issue — not a decision-maker's problem on its own, but worth handing to a developer with the rest.`;
+}
+
+function verdictFor(completenessScore: number, liabilityCount: number, verificationCount = 0): string {
   let v: string;
   if (completenessScore >= 80) {
     v =
@@ -194,6 +246,10 @@ function verdictFor(completenessScore: number, liabilityCount: number): string {
   }
   if (liabilityCount > 0) {
     v += ` Pay particular attention to the ${liabilityCount} ${liabilityCount === 1 ? "liability" : "liabilities"} — those are the reasons to pause.`;
+  } else if (verificationCount > 0) {
+    // Plain sentence only: verification items are flagged, not established,
+    // so they never read as "reasons to pause" on their own.
+    v += ` There ${verificationCount === 1 ? "is" : "are"} ${verificationCount} ${verificationCount === 1 ? "item" : "items"} flagged for developer verification below — none counted as a liability until confirmed.`;
   }
   return v;
 }
@@ -331,6 +387,7 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
   const working: FinalReadBucketItem[] = [];
   const halfBuilt: FinalReadBucketItem[] = [];
   const liabilities: FinalReadBucketItem[] = [];
+  const needsVerification: FinalReadBucketItem[] = [];
 
   const categories = input.categoryScores || {};
   for (const key of Object.keys(categories)) {
@@ -364,11 +421,35 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     });
   }
 
-  // PreFlight critical/high findings are liabilities; medium and below ride
-  // along as context inside the liability bucket only when severe. Keep the
-  // overlay honest: every liability names its file and line.
+  // PreFlight critical/high findings are liabilities — unless the probe
+  // flagged them as unverified, in which case they route to the
+  // verification bucket instead, regardless of severity: never
+  // liabilities, never hidden. Medium and below ride along as context
+  // inside the liability bucket only when severe. Keep the overlay
+  // honest: every liability names its file and line.
   for (const f of input.findings || []) {
     const sev = (f.severity || "info").toLowerCase();
+    if (f.unverified === true) {
+      needsVerification.push({
+        title: f.title,
+        businessImplication:
+          `Flagged by the scan but not established from the code reviewed. ` +
+          `A developer still needs to confirm or refute it — until then it counts neither for nor against this app.`,
+        severity: sev,
+        file: f.file,
+        line: f.line,
+        remediation: f.remediation,
+        verification: {
+          whatWeSaw: `Flagged at ${f.file}${f.line != null ? `:${f.line}` : ""}${f.probe ? ` (${f.probe})` : ""}${f.evidence ? ` — ${f.evidence}` : ""}`,
+          ifReal: ifRealForFinding(f),
+          howToCheck:
+            f.remediation ||
+            `Ask the developer to confirm whether this holds, and to point at the code that settles it.`,
+          whatEachAnswerMeans: `Confirmed → it becomes a liability. Refuted → it leaves this list.`,
+        },
+      });
+      continue;
+    }
     if (sev !== "critical" && sev !== "high") continue;
     liabilities.push({
       title: f.title,
@@ -380,19 +461,32 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     });
   }
 
+  // Verification items order severity-desc, then file order (stable sort
+  // preserves input order within a severity).
+  const sevRank = (s: string) =>
+    ({ critical: 0, high: 1, medium: 2, low: 3, info: 4 })[s] ?? 5;
+  needsVerification.sort((a, b) => sevRank(a.severity) - sevRank(b.severity));
+
   const couldNotEstablish = couldNotEstablishFor(input);
   const completenessScore = Math.max(0, Math.min(100, Math.round(Number(input.completenessScore) || 0)));
 
   return {
     projectTitle: (input.projectTitle || "").trim() || "Reviewed project",
-    verdict: verdictFor(completenessScore, liabilities.length),
+    verdict: verdictFor(completenessScore, liabilities.length, needsVerification.length),
     completenessScore,
     applicationSummary: (input.applicationSummary || "").trim() || undefined,
     working,
     halfBuilt,
     liabilities,
+    needsVerification,
+    generatedAt: new Date().toISOString(),
     couldNotEstablish,
-    counts: { working: working.length, halfBuilt: halfBuilt.length, liabilities: liabilities.length },
+    counts: {
+      working: working.length,
+      halfBuilt: halfBuilt.length,
+      liabilities: liabilities.length,
+      needsVerification: needsVerification.length,
+    },
     applicationMap: sanitizeApplicationMap(input.applicationMap),
     fileLedger: sanitizeFileLedger(input.fileLedger),
     categoryReasons: deriveCategoryReasons(categories),

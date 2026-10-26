@@ -14,6 +14,7 @@ import {
   AlertTriangle,
   CheckCircle2,
   FileWarning,
+  ShieldQuestion,
   MessageCircle,
   FileText,
 } from "lucide-react";
@@ -76,6 +77,10 @@ export function intelResultToFinalReadInput(
       probe: f.probe,
       evidence: f.evidence,
       remediation: f.remediation,
+      // The verification guard routes on this flag: dropping it here
+      // would send delegated findings to liabilities on the client even
+      // though the server routes them to needsVerification.
+      unverified: f.unverified,
     })),
     missingFeatures: intelResult?.missingFeatures || [],
     scanGaps: preflight
@@ -94,6 +99,7 @@ const STARTER_QUESTIONS = [
   "What's the biggest risk?",
   "Is the login and authentication real?",
   "What should be fixed first?",
+  "What still needs verifying?",
 ];
 
 type QaPhase = "idle" | "loading" | "done" | "error";
@@ -123,12 +129,16 @@ function BucketSection({
   items,
   accent,
   defaultOpen,
+  subtitle,
+  renderDetail,
 }: {
   title: string;
   icon: ReactNode;
   items: FinalReadBucketItem[];
   accent: string;
   defaultOpen: boolean;
+  subtitle?: string;
+  renderDetail?: (item: FinalReadBucketItem) => ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   const [expandedItem, setExpandedItem] = useState<string | null>(null);
@@ -152,6 +162,9 @@ function BucketSection({
       </button>
       {open && (
         <div className="px-4 pb-3 space-y-2">
+          {subtitle && (
+            <p className="text-xs text-slate-500 leading-relaxed">{subtitle}</p>
+          )}
           {items.length === 0 && (
             <p className="text-xs text-slate-500">Nothing in this bucket.</p>
           )}
@@ -167,11 +180,14 @@ function BucketSection({
                 >
                   {item.title}
                 </button>
-                {isOpen && (
-                  <p className="px-3 pb-3 text-[13px] text-slate-600 leading-relaxed">
-                    {item.businessImplication}
-                  </p>
-                )}
+                {isOpen &&
+                  (renderDetail ? (
+                    <div className="px-3 pb-3 space-y-2">{renderDetail(item)}</div>
+                  ) : (
+                    <p className="px-3 pb-3 text-[13px] text-slate-600 leading-relaxed">
+                      {item.businessImplication}
+                    </p>
+                  ))}
               </div>
             );
           })}
@@ -391,6 +407,44 @@ export default function FinalReadOverlay({
             items={report.liabilities}
             accent="bg-rose-100 text-rose-700"
             defaultOpen={true}
+          />
+          {/* Needs developer verification — flagged, not established.
+              Default-open like liabilities (it needs a human), with a
+              distinct violet accent so it never reads as a liability. */}
+          <BucketSection
+            title="Needs developer verification"
+            icon={<ShieldQuestion className="w-4 h-4 text-violet-600" />}
+            items={report.needsVerification}
+            accent="bg-violet-100 text-violet-700"
+            defaultOpen={true}
+            subtitle={`Flagged by the scan but not established — a developer still needs to confirm or refute each item. Report generated ${new Date(report.generatedAt).toLocaleDateString()}.`}
+            renderDetail={(item) => (
+              <>
+                <p className="text-[13px] text-slate-600 leading-relaxed">
+                  {item.businessImplication}
+                </p>
+                {item.verification && (
+                  <dl className="space-y-2 text-[13px] leading-relaxed">
+                    <div>
+                      <dt className="font-semibold text-slate-700">What we saw</dt>
+                      <dd className="text-slate-600">{item.verification.whatWeSaw}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-semibold text-slate-700">If real</dt>
+                      <dd className="text-slate-600">{item.verification.ifReal}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-semibold text-slate-700">How a developer checks it</dt>
+                      <dd className="text-slate-600">{item.verification.howToCheck}</dd>
+                    </div>
+                    <div>
+                      <dt className="font-semibold text-slate-700">What each answer means</dt>
+                      <dd className="text-slate-600">{item.verification.whatEachAnswerMeans}</dd>
+                    </div>
+                  </dl>
+                )}
+              </>
+            )}
           />
 
           {/* What the review could not establish — always shown */}

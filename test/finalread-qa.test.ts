@@ -736,3 +736,97 @@ describe("intelResultToFinalReadInput warehouse", () => {
     expect(input.fileLedger).toBeUndefined();
   });
 });
+
+describe("needsVerification in Q&A", () => {
+  function verificationReport() {
+    return buildFinalReadReport({
+      projectTitle: "Test App",
+      completenessScore: 60,
+      categoryScores: {},
+      findings: [
+        {
+          severity: "critical",
+          title: "POST /api/auth/reset-password without auth check",
+          file: "server/routes/auth.ts",
+          line: 179,
+          probe: "API Route Auth",
+          evidence: "app.post('/api/auth/reset-password', handler)",
+          unverified: true,
+        },
+      ],
+    });
+  }
+
+  it("accepts a verification item title as a citation", () => {
+    const report = verificationReport();
+    expect(
+      unknownCitations(["POST /api/auth/reset-password without auth check"], report)
+    ).toEqual([]);
+  });
+
+  it("answers 'what still needs verifying' as flagged, never established", () => {
+    const report = verificationReport();
+    const answer = starterAnswer("What still needs verifying?", report);
+    expect(answer).not.toBeNull();
+    expect(answer!.answer).toMatch(/flagged/i);
+    expect(answer!.answer).toMatch(/not established/i);
+    expect(answer!.answer).toMatch(/none counted as a liability/i);
+    expect(answer!.answer).not.toMatch(/is a liability/i);
+    expect(answer!.answer).toContain("POST /api/auth/reset-password without auth check");
+    expect(answer!.citedFindings).toEqual([
+      "POST /api/auth/reset-password without auth check",
+    ]);
+  });
+
+  it("says nothing is flagged when the verification bucket is empty", () => {
+    const report = sampleReport();
+    const answer = starterAnswer("What still needs verifying?", report);
+    expect(answer).not.toBeNull();
+    expect(answer!.answer).toMatch(/flagged nothing for developer verification/);
+  });
+
+  it("keeps verification items out of the biggest-risk, fix-first, and login shortcuts", () => {
+    const report = verificationReport();
+    const risk = starterAnswer("What's the biggest risk?", report);
+    expect(risk!.answer).not.toContain("reset-password");
+    const fixFirst = starterAnswer("What should be fixed first?", report);
+    expect(fixFirst!.answer).toMatch(/no liabilities to fix/);
+    const login = starterAnswer("Is the login and authentication real?", report);
+    expect(login!.answer).toMatch(/did not assess authentication/);
+  });
+
+  it("prints a NEEDS VERIFICATION section after liabilities, framed as flagged", () => {
+    const report = verificationReport();
+    const ctx = buildQaContext(report);
+    expect(ctx).toMatch(/NEEDS VERIFICATION/);
+    expect(ctx).toMatch(/NOT established/);
+    expect(
+      ctx.indexOf("LIABILITIES") < ctx.indexOf("NEEDS VERIFICATION") &&
+        ctx.indexOf("NEEDS VERIFICATION") < ctx.indexOf("HALF-BUILT")
+    ).toBe(true);
+  });
+
+  it("carries the unverified flag through the overlay input mapping", () => {
+    const input = intelResultToFinalReadInput({
+      completenessScore: 60,
+      preflight: {
+        findings: [
+          {
+            severity: "low",
+            title: "POST /api/billing/hook — handler delegated out of this file, auth could not be verified",
+            file: "server/routes/billing.ts",
+            line: 42,
+            probe: "API Route Auth",
+            unverified: true,
+          },
+        ],
+      },
+    });
+    expect(input.findings?.[0].unverified).toBe(true);
+    const report = buildFinalReadReport(input);
+    expect(report.needsVerification.map((i) => i.title)).toEqual([
+      "POST /api/billing/hook — handler delegated out of this file, auth could not be verified",
+    ]);
+    expect(report.liabilities).toEqual([]);
+  });
+});

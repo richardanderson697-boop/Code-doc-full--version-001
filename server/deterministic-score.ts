@@ -851,6 +851,10 @@ function reconcileFindingCaps(
   if (preflight.failed || preflight.probeFailures.length > 0) return;
   const worst = new Map<CategoryKey, { severity: "critical" | "high"; title: string }>();
   for (const f of preflight.findings) {
+    // Verification guard: a finding the probe could not establish must
+    // never move a score. It routes to "needs developer verification"
+    // instead (see buildFinalReadReport) — it is not evidence of a defect.
+    if (f.unverified === true) continue;
     if (f.severity !== "critical" && f.severity !== "high") continue;
     for (const k of findingCategories(f)) {
       const prev = worst.get(k);

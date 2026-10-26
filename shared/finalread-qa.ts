@@ -127,6 +127,28 @@ export function starterAnswer(
     };
   }
 
+  // Verification items get their own deterministic path: listed as
+  // flagged, never as established facts, and never counted as liabilities.
+  if (q === "what still needs verifying" || q === "what still needs verification") {
+    if (report.needsVerification.length === 0) {
+      return {
+        answer:
+          "The review flagged nothing for developer verification — every finding it reported was established from the code reviewed.",
+        citedFindings: [],
+      };
+    }
+    const n = report.needsVerification.length;
+    return {
+      answer:
+        `The review flagged ${n} ${n === 1 ? "item" : "items"} for developer verification. ` +
+        `Flagged, not established — none counted as a liability until a developer confirms ${n === 1 ? "it" : "them"}: ` +
+        report.needsVerification
+          .map((it) => `${it.title} — ${it.verification ? it.verification.whatWeSaw : it.businessImplication}`)
+          .join(" "),
+      citedFindings: report.needsVerification.map((it) => it.title),
+    };
+  }
+
   return null;
 }
 
@@ -179,7 +201,12 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
   };
 
   const titles = new Set<string>();
-  for (const item of [...report.liabilities, ...report.halfBuilt, ...report.working]) {
+  for (const item of [
+    ...report.liabilities,
+    ...report.halfBuilt,
+    ...report.working,
+    ...report.needsVerification,
+  ]) {
     const n = norm(item.title);
     if (n) titles.add(n);
   }
@@ -566,6 +593,24 @@ export function buildQaContext(report: FinalReadReport, question?: string): stri
     }
   };
   section("liabilities", report.liabilities);
+  // Verification items sit right after liabilities: visible, but never
+  // mistaken for them. The header line states the flagged-not-established
+  // status up front so the model cannot read the items below as findings.
+  if (report.needsVerification.length > 0) {
+    lines.push(`NEEDS VERIFICATION (${report.needsVerification.length}):`);
+    lines.push(
+      `These items were flagged by the scan but NOT established — the review could not verify them from the code. Never present one as an established fact or a liability.`
+    );
+    for (const it of report.needsVerification) {
+      const loc = it.file ? ` [${it.file}${it.line != null ? ":" + it.line : ""}]` : "";
+      lines.push(`- ${it.title}${loc}: ${it.businessImplication}`);
+      if (it.verification) {
+        lines.push(`  what the scan saw: ${it.verification.whatWeSaw}`);
+        lines.push(`  if confirmed: ${it.verification.ifReal}`);
+        lines.push(`  how a developer checks it: ${it.verification.howToCheck}`);
+      }
+    }
+  }
   section("half-built", report.halfBuilt);
   section("working", report.working);
   lines.push("COULD NOT ESTABLISH:");

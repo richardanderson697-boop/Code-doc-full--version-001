@@ -164,3 +164,136 @@ describe("buildFinalReadReport category evidence", () => {
     expect(all.every((i) => i.evidence === undefined)).toBe(true);
   });
 });
+
+describe("buildFinalReadReport needsVerification", () => {
+  it("routes unverified critical/high findings to needsVerification, never liabilities", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: {},
+        missingFeatures: [],
+        findings: [
+          {
+            severity: "critical",
+            title: "POST /api/auth/reset-password without auth check",
+            file: "server/routes/auth.ts",
+            line: 179,
+            probe: "API Route Auth",
+            evidence: "app.post('/api/auth/reset-password', handler)",
+            unverified: true,
+          },
+          {
+            severity: "high",
+            title: "POST /api/billing/hook — handler delegated out of this file, auth could not be verified",
+            file: "server/routes/billing.ts",
+            line: 42,
+            probe: "API Route Auth",
+            unverified: true,
+          },
+        ],
+      })
+    );
+    expect(r.liabilities).toEqual([]);
+    expect(r.needsVerification.map((i) => i.title)).toEqual([
+      "POST /api/auth/reset-password without auth check",
+      "POST /api/billing/hook — handler delegated out of this file, auth could not be verified",
+    ]);
+    expect(r.counts).toEqual({ working: 0, halfBuilt: 0, liabilities: 0, needsVerification: 2 });
+    expect(Number.isNaN(Date.parse(r.generatedAt))).toBe(false);
+  });
+
+  it("routes unverified findings regardless of severity", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: {},
+        missingFeatures: [],
+        findings: [
+          { severity: "medium", title: "Delegated medium", file: "server/a.ts", line: 1, unverified: true },
+        ],
+      })
+    );
+    expect(r.needsVerification.map((i) => i.title)).toEqual(["Delegated medium"]);
+    expect(r.liabilities).toEqual([]);
+  });
+
+  it("orders verification items severity-desc, then file order", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: {},
+        missingFeatures: [],
+        findings: [
+          { severity: "high", title: "High first in input", file: "server/b.ts", line: 1, unverified: true },
+          { severity: "critical", title: "Critical second in input", file: "server/a.ts", line: 1, unverified: true },
+        ],
+      })
+    );
+    expect(r.needsVerification.map((i) => i.title)).toEqual([
+      "Critical second in input",
+      "High first in input",
+    ]);
+  });
+
+  it("verdict counts verified liabilities only", () => {
+    const onlyVerification = buildFinalReadReport(
+      baseInput({
+        categoryScores: {},
+        missingFeatures: [],
+        findings: [
+          { severity: "critical", title: "Delegated route", file: "server/a.ts", line: 1, unverified: true },
+        ],
+      })
+    );
+    expect(onlyVerification.verdict).toMatch(/1 item flagged for developer verification/);
+    expect(onlyVerification.verdict).not.toMatch(/reasons to pause/);
+    const mixed = buildFinalReadReport(
+      baseInput({
+        categoryScores: {},
+        missingFeatures: [],
+        findings: [
+          { severity: "critical", title: "Hardcoded secret", file: "src/c.ts", line: 1 },
+          { severity: "critical", title: "Delegated route", file: "server/a.ts", line: 1, unverified: true },
+        ],
+      })
+    );
+    expect(mixed.verdict).toMatch(/1 liability/);
+    expect(mixed.verdict).not.toMatch(/2 liabilities/);
+    expect(mixed.needsVerification.map((i) => i.title)).toEqual(["Delegated route"]);
+  });
+
+  it("fills the four verification fields, with a generic check fallback", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: {},
+        missingFeatures: [],
+        findings: [
+          {
+            severity: "critical",
+            title: "Delegated route",
+            file: "server/a.ts",
+            line: 9,
+            probe: "API Route Auth",
+            evidence: "app.post('/api/x', handler)",
+            remediation: "Add auth middleware or confirm the delegate checks auth.",
+            unverified: true,
+          },
+          {
+            severity: "high",
+            title: "Delegated route without remediation",
+            file: "server/b.ts",
+            line: 3,
+            unverified: true,
+          },
+        ],
+      })
+    );
+    const [withFix, withoutFix] = r.needsVerification;
+    expect(withFix.verification?.whatWeSaw).toContain("server/a.ts:9");
+    expect(withFix.verification?.whatWeSaw).toContain("API Route Auth");
+    expect(withFix.verification?.whatWeSaw).toContain("app.post('/api/x', handler)");
+    expect(withFix.verification?.ifReal).toMatch(/^If confirmed/);
+    expect(withFix.verification?.howToCheck).toContain("Add auth middleware");
+    expect(withFix.verification?.whatEachAnswerMeans).toMatch(/becomes a liability/);
+    expect(withFix.verification?.whatEachAnswerMeans).toMatch(/leaves this list/);
+    expect(withoutFix.verification?.howToCheck).toMatch(/Ask the developer to confirm/);
+    expect(withoutFix.businessImplication).toMatch(/not established/);
+  });
+});
