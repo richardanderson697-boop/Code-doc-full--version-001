@@ -125,10 +125,24 @@ export default function App() {
   // Initialized from the URL hash so a fresh load directly on #finalread
   // starts in FinalRead mode: child effects (which dispatch the mode event)
   // run before this component's listener is registered, so the event alone
-  // would be missed on first paint.
+  // would be missed on first paint. Also restored from a previous FinalRead
+  // visit, so a returning buyer still sees the $199 pack when opening Buy
+  // credits from the main page — the modal's switch link is the explicit way
+  // back to consumer packs.
   const [pricingAudience, setPricingAudience] = useState<"finalread" | undefined>(() =>
-    typeof window !== "undefined" && window.location.hash === "#finalread" ? "finalread" : undefined
+    typeof window !== "undefined" &&
+    (window.location.hash === "#finalread" ||
+      window.localStorage.getItem("gradevibes-pricing-audience") === "finalread")
+      ? "finalread"
+      : undefined
   );
+  const handlePricingAudienceChange = (a: "finalread" | undefined) => {
+    setPricingAudience(a);
+    try {
+      if (a) window.localStorage.setItem("gradevibes-pricing-audience", "finalread");
+      else window.localStorage.removeItem("gradevibes-pricing-audience");
+    } catch {}
+  };
   const finalreadModeRef = useRef(
     typeof window !== "undefined" && window.location.hash === "#finalread"
   );
@@ -166,7 +180,10 @@ export default function App() {
     const onFinalreadMode = (e: Event) => {
       const open = Boolean((e as CustomEvent).detail?.open);
       finalreadModeRef.current = open;
-      setPricingAudience(open ? "finalread" : undefined);
+      // Entering FinalRead mode sticks: closing the entry view back to the
+      // main page must NOT drop the buyer back to consumer packs (that was
+      // the funnel leak). The modal's switch link is the explicit exit.
+      if (open) handlePricingAudienceChange("finalread");
     };
     window.addEventListener("codedoc:finalread-mode", onFinalreadMode);
     // Live balance updates stamped on metered API responses (header or SSE
@@ -1090,6 +1107,7 @@ export default function App() {
         open={pricingOpen}
         notice={pricingNotice}
         audience={pricingAudience}
+        onAudienceChange={handlePricingAudienceChange}
         onClose={() => { setPricingOpen(false); void fetchMe().then(setUser); }}
       />
       {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
