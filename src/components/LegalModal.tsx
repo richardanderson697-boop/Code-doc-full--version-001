@@ -26,11 +26,13 @@ function PrivacyPolicy() {
         <p>Your code is used <strong className="text-slate-300">only</strong> to produce the analysis you requested.</p>
         <p>We do <strong className="text-slate-300">not</strong> use your code to train AI models — ours or anyone else's.</p>
         <p>We do <strong className="text-slate-300">not</strong> sell, share, or show your code to third parties except the processors listed below, who receive only what's needed to run the service.</p>
-        <p>Code sent to our AI provider (Google Gemini) is transmitted for analysis under Google's API data-processing terms for paid usage.</p>
+        <p>Code is sent to our AI providers for analysis: Google Gemini (primary), and Anthropic Claude when Gemini is unavailable (our fallback). Each provider processes code only under its own API data-processing terms for paid usage.</p>
       </Section>
       <Section title="Processors and third parties">
         <p><strong className="text-slate-300">Stripe</strong> — payment processing (sees purchase details, never your code).</p>
         <p><strong className="text-slate-300">Google (Gemini API)</strong> — receives code excerpts you submit for analysis; used only to generate your report.</p>
+        <p><strong className="text-slate-300">Anthropic (Claude API)</strong> — receives code excerpts you submit for analysis when our primary AI provider is unavailable; used only to generate your report.</p>
+        <p><strong className="text-slate-300">Resend</strong> — sends password-reset emails (sees your email address and the reset link, never your code).</p>
         <p><strong className="text-slate-300">Railway / hosting infrastructure</strong> — runs our servers and database.</p>
       </Section>
       <Section title="Data retention">
@@ -71,6 +73,7 @@ function TermsOfService() {
       <Section title="4. Credits and payments">
         <p>The service runs on credits. 1 credit ≈ $0.01 of AI processing cost. New accounts receive 50 welcome credits, free.</p>
         <p>Credit packs are one-time purchases (Starter $10 / 400 credits, Builder $25 / 1,100, Pro $50 / 2,400), processed by Stripe. Prices may change; the price at purchase applies.</p>
+        <p>FinalRead reviews use a separate pack: <strong className="text-slate-300">FinalRead Review $199 / 400 credits</strong>, covering one complete diligence cycle (full report, stakeholder Q&A, and developer handoff packet), processed by Stripe. The same credit rules in this section apply: credits don't expire, are tied to your account, and are non-refundable except where required by law or where we fail to deliver the purchased analysis.</p>
         <p>Credits are deducted per analysis based on actual metered usage. Some features (like the PreFlight scan) are free and don't consume credits.</p>
         <p><strong className="text-slate-300">Credits are non-refundable</strong> except where required by law or where we fail to deliver the purchased analysis. If a paid request errors before producing usable output, we don't charge for it — that's a bug, tell us.</p>
         <p>Credits don't expire, but they're tied to your account and can't be transferred or redeemed for cash.</p>
