@@ -12,6 +12,20 @@ export default function Footer({ brand = "GradeVibes" }: { brand?: string }) {
           {brand} · Static analysis — no code was executed
         </p>
         <div className="flex items-center gap-4 text-[11px] font-mono">
+          {/* Quiet buyer discovery: the homepage card is audience-gated, so
+              this footer link is the discovery path for cold visitors. Hidden
+              while the FinalRead entry itself is open (redundant there). */}
+          {brand !== "FinalRead" && (
+            <>
+              <button
+                onClick={() => { window.location.hash = "finalread"; }}
+                className="text-slate-500 hover:text-slate-300 transition"
+              >
+                Buying or investing in software? FinalRead
+              </button>
+              <span className="text-slate-800">·</span>
+            </>
+          )}
           <button
             onClick={() => openLegal("privacy")}
             className="text-slate-500 hover:text-slate-300 transition"

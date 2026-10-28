@@ -15,14 +15,14 @@ interface Props {
   onClose: () => void;
   notice?: string;
   // When "finalread", lists only the FinalRead price list (?audience=finalread)
-  // instead of the consumer packs.
+  // instead of the consumer packs. Each audience sees only its own packs:
+  // there is deliberately no in-modal switch to the other list. Audience
+  // movement happens at the page level (footer link into #finalread, entry
+  // exit back to the workspace), and the parent owns persistence.
   audience?: "finalread";
-  // Lets the buyer switch lists inside the modal (a first-time FinalRead buyer
-  // landing on the main page has no other signal). The parent owns persistence.
-  onAudienceChange?: (a: "finalread" | undefined) => void;
 }
 
-export default function PricingModal({ open, onClose, notice, audience, onAudienceChange }: Props) {
+export default function PricingModal({ open, onClose, notice, audience }: Props) {
   const [packs, setPacks] = useState<Pack[]>([]);
   const [buying, setBuying] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -113,19 +113,6 @@ export default function PricingModal({ open, onClose, notice, audience, onAudien
             </div>
           ))}
         </div>
-        {onAudienceChange && (
-          <p className="text-[11px] text-center mt-4">
-            <button
-              type="button"
-              onClick={() => onAudienceChange(audience === "finalread" ? undefined : "finalread")}
-              className="text-indigo-400 hover:text-indigo-300 underline underline-offset-2"
-            >
-              {audience === "finalread"
-                ? "Buying regular credits instead? Show consumer packs"
-                : "Buying a FinalRead review? Show the $199 review pack"}
-            </button>
-          </p>
-        )}
         {audience !== "finalread" && (
           <p className="text-[11px] text-slate-600 mt-4 flex items-start gap-1">
             <Check className="w-3 h-3 mt-0.5 shrink-0" />

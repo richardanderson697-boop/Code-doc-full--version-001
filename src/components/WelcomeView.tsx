@@ -32,6 +32,10 @@ interface WelcomeViewProps {
   isLoading: boolean;
   savedCount: number;
   onOpenRegistry: () => void;
+  // Gates the FinalRead buyer card: true only for the FinalRead audience
+  // (hash #finalread or stored audience flag), so the default builder
+  // homepage stays builder-only.
+  showFinalReadCard: boolean;
 }
 
 export default function WelcomeView({
@@ -41,7 +45,8 @@ export default function WelcomeView({
   onUploadZipCodebase,
   isLoading, 
   savedCount, 
-  onOpenRegistry 
+  onOpenRegistry,
+  showFinalReadCard
 }: WelcomeViewProps) {
   const [buildMode, setBuildMode] = useState<"single" | "multi">("single");
   const [prompt, setPrompt] = useState("");
@@ -239,7 +244,10 @@ export default function WelcomeView({
         </p>
       </div>
 
-      {/* FinalRead entry point: standalone diligence reviews for buyers/investors */}
+      {/* FinalRead entry point: standalone diligence reviews for buyers/investors.
+          Shown only to the FinalRead audience; the default builder homepage
+          omits it, with discovery via the quiet footer link instead. */}
+      {showFinalReadCard && (
       <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-2xl p-4 md:p-5 mb-6 flex flex-col sm:flex-row sm:items-center gap-3 select-none">
         <div className="p-2.5 rounded-xl bg-indigo-500/10 border border-indigo-500/25 text-indigo-300 shrink-0 w-fit">
           <FileSearch className="w-5 h-5" />
@@ -263,6 +271,7 @@ export default function WelcomeView({
           Get reviewed <ArrowRight className="w-3.5 h-3.5" />
         </button>
       </div>
+      )}
 
       {/* Tab Selector */}
       <div className="flex bg-slate-900/80 border border-slate-800 p-1 rounded-xl mb-6 max-w-lg mx-auto select-none">

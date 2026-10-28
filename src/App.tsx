@@ -809,6 +809,7 @@ export default function App() {
               isLoading={isGenerating}
               savedCount={projects.length}
               onOpenRegistry={() => setSidebarOpen(true)}
+              showFinalReadCard={pricingAudience === "finalread"}
             />
           </div>
         ) : (
@@ -1107,7 +1108,6 @@ export default function App() {
         open={pricingOpen}
         notice={pricingNotice}
         audience={pricingAudience}
-        onAudienceChange={handlePricingAudienceChange}
         onClose={() => { setPricingOpen(false); void fetchMe().then(setUser); }}
       />
       {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
