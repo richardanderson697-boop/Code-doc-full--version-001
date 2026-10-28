@@ -20,8 +20,10 @@ export function isAndroidUa(ua: string): boolean {
 /**
  * Intent URL that opens gradevibes.com in the device's default browser app.
  * No browser package is pinned, so it resolves to whatever browser the
- * user has set as default rather than assuming Chrome.
+ * user has set as default rather than assuming Chrome. It carries
+ * ?tab=upload so the break-out lands on the Upload ZIP Codebase tab
+ * (GitHub URL import) instead of the default New App Builder tab.
  */
 export function externalBrowserUrl(): string {
-  return "intent://gradevibes.com#Intent;scheme=https;action=android.intent.action.VIEW;end";
+  return "intent://gradevibes.com/?tab=upload#Intent;scheme=https;action=android.intent.action.VIEW;end";
 }

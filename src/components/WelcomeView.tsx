@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { VibeProject } from "../types";
 import { logError } from "../utils/logger";
+import { initialTabFromSearch } from "../utils/tabDeepLink";
 import MultiFileBuilder, { MultiFileInfo } from "./MultiFileBuilder";
 
 interface WelcomeViewProps {
@@ -44,7 +45,11 @@ export default function WelcomeView({
 }: WelcomeViewProps) {
   const [buildMode, setBuildMode] = useState<"single" | "multi">("single");
   const [prompt, setPrompt] = useState("");
-  const [activeTab, setActiveTab] = useState<"generate" | "audit" | "zip">("generate");
+  // ?tab=upload deep-links straight to the Upload ZIP Codebase tab
+  // (GitHub URL import); every other landing keeps the default tab.
+  const [activeTab, setActiveTab] = useState<"generate" | "audit" | "zip">(
+    () => initialTabFromSearch(window.location.search)
+  );
   const [externalCode, setExternalCode] = useState("");
   const [pasteFeedback, setPasteFeedback] = useState<"success" | "denied" | null>(null);
 

@@ -57,4 +57,8 @@ describe("isAndroidUa / externalBrowserUrl", () => {
     expect(url).toContain("android.intent.action.VIEW");
     expect(url).not.toContain("package=");
   });
+
+  it("carries ?tab=upload so break-out lands on the upload tab", () => {
+    expect(externalBrowserUrl()).toContain("?tab=upload");
+  });
 });
