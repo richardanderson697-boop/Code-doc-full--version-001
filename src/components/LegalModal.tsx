@@ -15,7 +15,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 function PrivacyPolicy() {
   return (
     <>
-      <p className="text-[13px] text-slate-500 mb-6">Last updated: October 6, 2026</p>
+      <p className="text-[13px] text-slate-500 mb-6">Last updated: October 27, 2026</p>
       <Section title="What we collect">
         <p><strong className="text-slate-300">Account information.</strong> When you sign up, we collect your email address and a password (stored as a salted scrypt hash — we never see your plaintext password). We use this to operate your account and manage sessions (30-day login cookies).</p>
         <p><strong className="text-slate-300">Code you upload.</strong> When you run an analysis, the code you provide is stored in our database, isolated per user — your workspace is visible only to you. We need it to run the analysis you asked for and to let you re-run or review past results.</p>
@@ -60,7 +60,7 @@ function PrivacyPolicy() {
 function TermsOfService() {
   return (
     <>
-      <p className="text-[13px] text-slate-500 mb-6">Last updated: October 6, 2026</p>
+      <p className="text-[13px] text-slate-500 mb-6">Last updated: October 27, 2026</p>
       <Section title="1. What the service does">
         <p>GradeVibes analyzes code you provide and reports on its completeness and security posture using static analysis and AI-assisted review. <strong className="text-slate-300">No code is executed.</strong> Reports are informational assessments, not certifications.</p>
       </Section>
