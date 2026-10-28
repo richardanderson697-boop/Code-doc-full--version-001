@@ -17,6 +17,8 @@ import LegalModal, { LegalDoc } from "./components/LegalModal";
 import { parseReactAnatomy } from "./utils/anatomyParser";
 import { logError } from "./utils/logger";
 import { apiFetch, fetchMe, notifyBalance, AuthRequiredError, CreditsRequiredError } from "./utils/apiFetch";
+import { detectInAppBrowser } from "./utils/inAppBrowser";
+import InAppBrowserBanner from "./components/InAppBrowserBanner";
 
 export default function App() {
   const [projects, setProjects] = useState<VibeProject[]>([]);
@@ -55,6 +57,30 @@ export default function App() {
   const [warningMessage, setWarningMessage] = useState("");
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [copied, setCopied] = useState(false);
+
+  // Facebook/Instagram in-app browser: audio is restricted in those
+  // webviews, so offer a break-out to the full browser. Dismissal lasts
+  // the session only; the banner never appears in a full browser.
+  const [inAppBannerDismissed, setInAppBannerDismissed] = useState<boolean>(
+    () =>
+      typeof window !== "undefined" &&
+      window.sessionStorage.getItem("gradevibes-inapp-banner-dismissed") === "1"
+  );
+  const inAppBrowser = useMemo(
+    () =>
+      typeof navigator !== "undefined"
+        ? detectInAppBrowser(navigator.userAgent)
+        : null,
+    []
+  );
+  const dismissInAppBanner = () => {
+    try {
+      window.sessionStorage.setItem("gradevibes-inapp-banner-dismissed", "1");
+    } catch {
+      // Private mode or blocked storage: session state still hides it.
+    }
+    setInAppBannerDismissed(true);
+  };
 
   // Auth + credits
   const [user, setUser] = useState<{ id: string; email: string; credits: number } | null>(null);
@@ -630,6 +656,10 @@ export default function App() {
       >
         Skip to content
       </a>
+
+      {inAppBrowser && !inAppBannerDismissed && (
+        <InAppBrowserBanner app={inAppBrowser} onDismiss={dismissInAppBanner} />
+      )}
 
       {/* Visual Header */}
       <header className="sticky top-0 z-30 flex items-center justify-between px-5 py-3.5 bg-slate-900 border-b border-slate-800">
