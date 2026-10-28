@@ -16,7 +16,6 @@ import {
   Check,
   Upload,
   FolderArchive,
-  FileSearch,
   Loader2,
   Trash2
 } from "lucide-react";
@@ -32,10 +31,6 @@ interface WelcomeViewProps {
   isLoading: boolean;
   savedCount: number;
   onOpenRegistry: () => void;
-  // Gates the FinalRead buyer card: true only for the FinalRead audience
-  // (hash #finalread or stored audience flag), so the default builder
-  // homepage stays builder-only.
-  showFinalReadCard: boolean;
 }
 
 export default function WelcomeView({
@@ -45,8 +40,7 @@ export default function WelcomeView({
   onUploadZipCodebase,
   isLoading, 
   savedCount, 
-  onOpenRegistry,
-  showFinalReadCard
+  onOpenRegistry 
 }: WelcomeViewProps) {
   const [buildMode, setBuildMode] = useState<"single" | "multi">("single");
   const [prompt, setPrompt] = useState("");
@@ -244,34 +238,9 @@ export default function WelcomeView({
         </p>
       </div>
 
-      {/* FinalRead entry point: standalone diligence reviews for buyers/investors.
-          Shown only to the FinalRead audience; the default builder homepage
-          omits it, with discovery via the quiet footer link instead. */}
-      {showFinalReadCard && (
-      <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-2xl p-4 md:p-5 mb-6 flex flex-col sm:flex-row sm:items-center gap-3 select-none">
-        <div className="p-2.5 rounded-xl bg-indigo-500/10 border border-indigo-500/25 text-indigo-300 shrink-0 w-fit">
-          <FileSearch className="w-5 h-5" />
-        </div>
-        <div className="flex-1 min-w-0">
-          <h3 className="text-sm font-bold text-slate-200">
-            Buying or investing in software?{" "}
-            <span className="text-indigo-300">Start with a FinalRead.</span>
-          </h3>
-          <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
-            An independent first-pass review — risks, unfinished work, and the
-            questions worth asking — before you pay for deeper due diligence.
-            One review, $199.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => { window.location.hash = "finalread"; }}
-          className="px-4 py-2.5 bg-indigo-500 hover:bg-indigo-400 text-white text-xs font-bold rounded-xl transition whitespace-nowrap flex items-center gap-1.5"
-        >
-          Get reviewed <ArrowRight className="w-3.5 h-3.5" />
-        </button>
-      </div>
-      )}
+      {/* No FinalRead card here by design: under view-following pricing the
+          builder homepage is always builder-only, and discovery runs via
+          the quiet footer link instead. */}
 
       {/* Tab Selector */}
       <div className="flex bg-slate-900/80 border border-slate-800 p-1 rounded-xl mb-6 max-w-lg mx-auto select-none">

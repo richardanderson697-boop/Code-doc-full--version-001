@@ -122,27 +122,22 @@ export default function App() {
   };
 
   const [pricingNotice, setPricingNotice] = useState("");
-  // Initialized from the URL hash so a fresh load directly on #finalread
-  // starts in FinalRead mode: child effects (which dispatch the mode event)
-  // run before this component's listener is registered, so the event alone
-  // would be missed on first paint. Also restored from a previous FinalRead
-  // visit, so a returning buyer still sees the $199 pack when opening Buy
-  // credits from the main page — the modal's switch link is the explicit way
-  // back to consumer packs.
-  const [pricingAudience, setPricingAudience] = useState<"finalread" | undefined>(() =>
-    typeof window !== "undefined" &&
-    (window.location.hash === "#finalread" ||
-      window.localStorage.getItem("gradevibes-pricing-audience") === "finalread")
-      ? "finalread"
-      : undefined
-  );
-  const handlePricingAudienceChange = (a: "finalread" | undefined) => {
-    setPricingAudience(a);
+  // Pricing audience follows the view you're in — never sticky. The
+  // FinalRead entry open means FinalRead pricing; the GradeVibes workspace
+  // means consumer pricing. An earlier design persisted the audience in
+  // localStorage so exiting the entry kept $199 pricing, with the modal's
+  // switch link as the way back; the switch is gone, so that persistence
+  // became a trap: both views showed $199-only with no way back to the
+  // three consumer packs. Deriving from the entry state removes it, and
+  // exiting the entry restores consumer pricing on its own.
+  const pricingAudience = finalreadEntryOpen ? "finalread" : undefined;
+  // One-time cleanup of the pre-view-following sticky flag, so old browsers
+  // don't carry a dead key that could confuse a future reader.
+  useEffect(() => {
     try {
-      if (a) window.localStorage.setItem("gradevibes-pricing-audience", "finalread");
-      else window.localStorage.removeItem("gradevibes-pricing-audience");
+      window.localStorage.removeItem("gradevibes-pricing-audience");
     } catch {}
-  };
+  }, []);
   const finalreadModeRef = useRef(
     typeof window !== "undefined" && window.location.hash === "#finalread"
   );
@@ -180,10 +175,9 @@ export default function App() {
     const onFinalreadMode = (e: Event) => {
       const open = Boolean((e as CustomEvent).detail?.open);
       finalreadModeRef.current = open;
-      // Entering FinalRead mode sticks: closing the entry view back to the
-      // main page must NOT drop the buyer back to consumer packs (that was
-      // the funnel leak). The modal's switch link is the explicit exit.
-      if (open) handlePricingAudienceChange("finalread");
+      // Note: mode no longer touches pricing audience — the audience is
+      // derived from the entry state above, so exiting the entry restores
+      // consumer pricing on its own.
     };
     window.addEventListener("codedoc:finalread-mode", onFinalreadMode);
     // Live balance updates stamped on metered API responses (header or SSE
@@ -809,7 +803,6 @@ export default function App() {
               isLoading={isGenerating}
               savedCount={projects.length}
               onOpenRegistry={() => setSidebarOpen(true)}
-              showFinalReadCard={pricingAudience === "finalread"}
             />
           </div>
         ) : (
