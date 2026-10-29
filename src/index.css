@@ -1,1 +1,15 @@
 @import "tailwindcss";
+
+@media print {
+  /* FinalRead stakeholder view: while the overlay is open, print only the
+     report. The overlay is portaled to document.body, so hiding #root in
+     print leaves just the report, and releasing the body scroll lock lets
+     it paginate instead of clipping. Scoped to the overlay's body class,
+     which exists only while the view is open. */
+  body.finalread-overlay-open {
+    overflow: visible !important;
+  }
+  body.finalread-overlay-open #root {
+    display: none !important;
+  }
+}

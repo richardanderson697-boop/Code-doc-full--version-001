@@ -3,7 +3,14 @@
 // audit result via shared/finalread-report.ts — no code, no file paths, no
 // diffs on this surface. Plain Tailwind utilities (no global CSS), so the
 // overlay cannot affect the rest of the app.
+//
+// Print: the overlay is portaled to document.body, and index.css hides #root
+// in print while this view is open, so printing yields only the report.
+// Collapsed sections and item detail render hidden on screen but visible in
+// print (hidden print:block), so the PDF always carries every explanation
+// with no click required. The Q&A section is never printed.
 import { useState, useMemo, useEffect, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   X,
   ChevronDown,
@@ -17,6 +24,7 @@ import {
   ShieldQuestion,
   MessageCircle,
   FileText,
+  Printer,
 } from "lucide-react";
 import { apiFetch } from "../../utils/apiFetch";
 import { speakText, stopSpeech } from "../../utils/speechUtils";
@@ -157,42 +165,46 @@ function BucketSection({
           </span>
         </span>
         <ChevronDown
-          className={`w-4 h-4 text-slate-400 transition-transform ${open ? "rotate-180" : ""}`}
+          className={`w-4 h-4 text-slate-400 transition-transform print:hidden ${open ? "rotate-180" : ""}`}
         />
       </button>
-      {open && (
-        <div className="px-4 pb-3 space-y-2">
-          {subtitle && (
-            <p className="text-xs text-slate-500 leading-relaxed">{subtitle}</p>
-          )}
-          {items.length === 0 && (
-            <p className="text-xs text-slate-500">Nothing in this bucket.</p>
-          )}
-          {items.map((item) => {
-            const key = itemKey(item);
-            const isOpen = expandedItem === key;
-            return (
-              <div key={key} className="border border-slate-100 rounded-lg">
-                <button
-                  type="button"
-                  onClick={() => setExpandedItem(isOpen ? null : key)}
-                  className="w-full text-left px-3 py-2 text-[13px] font-medium text-slate-700"
-                >
-                  {item.title}
-                </button>
-                {isOpen &&
-                  (renderDetail ? (
-                    <div className="px-3 pb-3 space-y-2">{renderDetail(item)}</div>
-                  ) : (
-                    <p className="px-3 pb-3 text-[13px] text-slate-600 leading-relaxed">
-                      {item.businessImplication}
-                    </p>
-                  ))}
+      {/* Print: collapsed sections render hidden on screen but visible in
+          print, so the PDF always carries every section. */}
+      <div className={`px-4 pb-3 space-y-2 ${open ? "" : "hidden print:block"}`}>
+        {subtitle && (
+          <p className="text-xs text-slate-500 leading-relaxed">{subtitle}</p>
+        )}
+        {items.length === 0 && (
+          <p className="text-xs text-slate-500">Nothing in this bucket.</p>
+        )}
+        {items.map((item) => {
+          const key = itemKey(item);
+          const isOpen = expandedItem === key;
+          return (
+            <div key={key} className="border border-slate-100 rounded-lg">
+              <button
+                type="button"
+                onClick={() => setExpandedItem(isOpen ? null : key)}
+                className="w-full text-left px-3 py-2 text-[13px] font-medium text-slate-700"
+              >
+                {item.title}
+              </button>
+              {/* Print: collapsed item detail renders hidden on screen but
+                  visible in print, so the PDF carries every explanation
+                  with no click required. */}
+              <div className={isOpen ? "" : "hidden print:block"}>
+                {renderDetail ? (
+                  <div className="px-3 pb-3 space-y-2">{renderDetail(item)}</div>
+                ) : (
+                  <p className="px-3 pb-3 text-[13px] text-slate-600 leading-relaxed">
+                    {item.businessImplication}
+                  </p>
+                )}
               </div>
-            );
-          })}
-        </div>
-      )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -231,12 +243,16 @@ export default function FinalReadOverlay({
   useEffect(() => {
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
+    // Print hook: index.css uses this class to release the scroll lock and
+    // hide the app root while printing, so only the report prints.
+    document.body.classList.add("finalread-overlay-open");
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => {
       document.body.style.overflow = prev;
+      document.body.classList.remove("finalread-overlay-open");
       window.removeEventListener("keydown", onKey);
       stopSpeech();
     };
@@ -348,9 +364,11 @@ export default function FinalReadOverlay({
         ? "text-amber-600"
         : "text-rose-600";
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/60 p-4">
-      <div className="w-full max-w-3xl my-8 bg-slate-50 rounded-2xl shadow-2xl overflow-hidden">
+  // Portaled to document.body so print CSS can hide the app root (#root)
+  // while printing and leave only this report on the page.
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/60 p-4 print:static print:block print:overflow-visible print:bg-white print:p-0">
+      <div className="w-full max-w-3xl my-8 bg-slate-50 rounded-2xl shadow-2xl overflow-hidden print:max-w-none print:my-0 print:rounded-none print:shadow-none print:overflow-visible">
         {/* Header */}
         <div className="flex items-start justify-between px-6 py-5 bg-white border-b border-slate-200">
           <div>
@@ -366,15 +384,29 @@ export default function FinalReadOverlay({
                 {report.completenessScore}/100
               </span>
             </p>
+            <p className="hidden print:block text-sm text-slate-500 mt-0.5">
+              Report generated{" "}
+              {new Date(report.generatedAt).toLocaleDateString()}
+            </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close stakeholder view"
-            className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2 print:hidden">
+            <button
+              type="button"
+              onClick={() => window.print()}
+              className="flex items-center gap-1.5 px-3 py-2 text-sm font-semibold rounded-lg bg-slate-800 text-white hover:bg-slate-700"
+            >
+              <Printer className="w-4 h-4" />
+              Print / Save PDF
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close stakeholder view"
+              className="p-2 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         <div className="px-6 py-5 space-y-5">
@@ -461,8 +493,8 @@ export default function FinalReadOverlay({
             </ul>
           </div>
 
-          {/* Q&A */}
-          <div className="bg-white border border-slate-200 rounded-xl p-4">
+          {/* Q&A — never printed: the Q&A stays live-only. */}
+          <div className="bg-white border border-slate-200 rounded-xl p-4 print:hidden">
             <p className="text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-1 flex items-center gap-1.5">
               <MessageCircle className="w-4 h-4" /> Ask about this review
             </p>
@@ -571,7 +603,7 @@ export default function FinalReadOverlay({
                 return (
                   <label
                     key={key}
-                    className="flex items-start gap-2 text-[13px] text-slate-700 cursor-pointer"
+                    className={`flex items-start gap-2 text-[13px] text-slate-700 cursor-pointer ${checked.has(key) ? "" : "print:hidden"}`}
                   >
                     <input
                       type="checkbox"
@@ -595,7 +627,7 @@ export default function FinalReadOverlay({
               type="button"
               onClick={exportHandoff}
               disabled={checked.size === 0}
-              className="flex items-center gap-1.5 px-3 py-2 text-sm font-semibold rounded-lg bg-slate-800 text-white hover:bg-slate-700 disabled:opacity-50"
+              className="flex items-center gap-1.5 px-3 py-2 text-sm font-semibold rounded-lg bg-slate-800 text-white hover:bg-slate-700 disabled:opacity-50 print:hidden"
             >
               <Download className="w-4 h-4" />
               Export handoff packet ({checked.size} of {handoffItems.length})
@@ -603,6 +635,7 @@ export default function FinalReadOverlay({
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
