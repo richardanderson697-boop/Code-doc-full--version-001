@@ -176,7 +176,7 @@ export default function WelcomeView({
           const response = await apiFetch("/api/upload-zip", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ zipBase64: base64String })
+            body: JSON.stringify({ zipBase64: base64String, fileName: file.name })
           });
 
           const contentType = response.headers.get("content-type") || "";

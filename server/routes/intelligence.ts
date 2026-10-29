@@ -3,7 +3,12 @@ import { Router } from "express";
 import { asyncRoute } from "../async-route";
 import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
 import { WorkspaceFile, cleanWorkspacePath, countLines } from "../workspace";
-import { listWorkspaceFiles, getWorkspaceFile } from "../workspace-store";
+import { listWorkspaceFiles, getWorkspaceFile, getWorkspaceSource } from "../workspace-store";
+import {
+  findReadmeFile,
+  extractReadmeTitle,
+  extractReadmeTagline,
+} from "../readme-identity";
 import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
 import type { PreFlightReport } from "../../shared/preflight-types";
 import {
@@ -37,6 +42,10 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
   try {
     let files: WorkspaceFile[] = [];
     const userId = req.user!.id;
+    // Only the whole-workspace run may donate a README title or an import
+    // source to the report header: selected paths and pasted code are
+    // fragments, and their README (if any) is not the project's identity.
+    let fromWorkspace = false;
 
     // Source selection, in priority order. The client may name the exact
     // source it wants scored; the server never guesses.
@@ -91,6 +100,7 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
       const scannedFiles = await listWorkspaceFiles(userId);
       if (scannedFiles.length > 0) {
         files = scannedFiles.map((f) => ({ path: f.path, content: f.content, lineCount: f.lineCount }));
+        fromWorkspace = true;
       }
     }
 
@@ -430,6 +440,20 @@ The total completenessScore is computed server-side (rescaled over the applicabl
       droppedCitations: citationResult.droppedCitations,
       importsRepaired,
     };
+    // Report header identity (display-only, never scored): the README's
+    // own H1 and tagline, plus the recorded import source. A source read
+    // failure must never fail the scan — the header just falls back.
+    if (fromWorkspace) {
+      const readme = findReadmeFile(files);
+      if (readme) {
+        const displayName = extractReadmeTitle(readme.content);
+        const readmeTagline = extractReadmeTagline(readme.content);
+        if (displayName) parsedIntel.displayName = displayName;
+        if (readmeTagline) parsedIntel.readmeTagline = readmeTagline;
+      }
+      const importSource = await getWorkspaceSource(userId).catch(() => undefined);
+      if (importSource) parsedIntel.importSource = importSource;
+    }
     res.json(parsedIntel);
   } catch (error: any) {
     log.error("Project Intelligence API Error:", error);

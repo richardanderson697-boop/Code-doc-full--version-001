@@ -55,6 +55,15 @@ CREATE TABLE IF NOT EXISTS workspace_files (
   PRIMARY KEY (user_id, path)
 );
 CREATE INDEX IF NOT EXISTS idx_workspace_files_user ON workspace_files(user_id);
+CREATE TABLE IF NOT EXISTS workspace_sources (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  owner TEXT,
+  repo TEXT,
+  url TEXT,
+  filename TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 -- Password-reset tokens: only the SHA-256 hash is stored, never the raw
 -- token. Single-use (used_at) with a short expiry (expires_at).
 CREATE TABLE IF NOT EXISTS password_reset_tokens (

@@ -69,10 +69,33 @@ export function intelResultToFinalReadInput(
   const fileLedger = Array.isArray(intelResult?.fileLedger)
     ? intelResult.fileLedger
     : undefined;
+  // Header identity chain (first present wins): a caller-supplied title
+  // (the buyer entry's owner/repo or ZIP name) always wins; then the
+  // README H1 the server derived; then the recorded import source. The
+  // builder's "Reviewed project" remains the last resort only.
+  const cleanTitle = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() ? v.trim() : undefined;
+  const importSource = intelResult?.importSource;
+  const importTitle =
+    importSource?.kind === "github" &&
+    importSource?.owner &&
+    importSource?.repo
+      ? `${importSource.owner}/${importSource.repo}`
+      : importSource?.kind === "zip" &&
+          typeof importSource?.filename === "string" &&
+          importSource.filename.trim()
+        ? importSource.filename.replace(/\.zip$/i, "")
+        : undefined;
+  const resolvedTitle =
+    cleanTitle(projectTitle) ||
+    cleanTitle(intelResult?.displayName) ||
+    importTitle ||
+    undefined;
   return {
-    projectTitle,
+    projectTitle: resolvedTitle,
     completenessScore: Number(intelResult?.completenessScore) || 0,
-    applicationSummary: intelResult?.overallSummary || undefined,
+    applicationSummary:
+      intelResult?.overallSummary || intelResult?.readmeTagline || undefined,
     categoryScores: intelResult?.categoryScores || {},
     categoryEvidence,
     applicationMap,
@@ -378,6 +401,11 @@ export default function FinalReadOverlay({
             <h2 className="text-xl font-bold text-slate-900 mt-1">
               {report.projectTitle}
             </h2>
+            {report.applicationSummary && (
+              <p className="text-sm text-slate-600 mt-1 leading-relaxed">
+                {report.applicationSummary}
+              </p>
+            )}
             <p className="text-sm text-slate-500 mt-0.5">
               Completeness{" "}
               <span className={`font-bold ${scoreColor}`}>

@@ -21,6 +21,7 @@ import {
   deleteWorkspaceFile,
   clearWorkspaceFiles,
   replaceWorkspaceFiles,
+  type WorkspaceSource,
 } from "../workspace-store";
 import { readZipHeader, hasUnsafeEntryName } from "../zip-guard";
 import {
@@ -46,10 +47,12 @@ const EMPTY_WORKSPACE_ERROR = "Workspace is empty \u2014 nothing to download.";
 // Shared ZIP ingestion: validates a ZIP buffer and atomically replaces the
 // user's workspace files. Used by manual uploads and repo-URL imports.
 // Throws { status, message } on validation failure so routes can map it.
+// The origin rides with the replace: pass the new source, or nothing when
+// unknown, so a stale source can never describe replaced content.
 export async function ingestZipBuffer(
   userId: string,
   buffer: Buffer,
-  opts: { stripTopLevelDir?: boolean } = {}
+  opts: { stripTopLevelDir?: boolean; source?: WorkspaceSource | null } = {}
 ): Promise<{ fileCount: number }> {
   const fail = (status: number, message: string): never => {
     throw { status, message };
@@ -119,13 +122,13 @@ export async function ingestZipBuffer(
     if (!relPath || isIgnorableWorkspacePath(relPath) || !isWorkspaceFileExt(relPath)) continue;
     ingest.push({ path: relPath, content: entry.getData().toString("utf8") });
   }
-  await replaceWorkspaceFiles(userId, ingest);
+  await replaceWorkspaceFiles(userId, ingest, opts.source ?? null);
   return { fileCount: ingest.length };
 }
 
 // ZIP Codebase Upload, Status, and Clear Endpoints
 router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
-  const { zipBase64 } = req.body;
+  const { zipBase64, fileName } = req.body;
   if (typeof zipBase64 !== "string" || !zipBase64) {
     return res.status(400).json({ error: "No ZIP file data provided." });
   }
@@ -143,7 +146,13 @@ router.post("/api/upload-zip", requireAuth, asyncRoute(async (req: AuthedRequest
       });
     }
     const buffer = Buffer.from(zipBase64, "base64");
-    await ingestZipBuffer(userId, buffer);
+    // Record the upload filename when the client sends it; otherwise the
+    // replace clears any stale source (see ingestZipBuffer).
+    const zipSource: WorkspaceSource | null =
+      typeof fileName === "string" && fileName.trim()
+        ? { kind: "zip", filename: fileName.trim() }
+        : null;
+    await ingestZipBuffer(userId, buffer, { source: zipSource });
 
     const files = await listWorkspaceFiles(userId);
     res.json({
@@ -250,7 +259,15 @@ router.post("/api/import-repo", requireAuth, asyncRoute(async (req: AuthedReques
     });
   }
   try {
-    await ingestZipBuffer(userId, buffer, { stripTopLevelDir: true });
+    await ingestZipBuffer(userId, buffer, {
+      stripTopLevelDir: true,
+      source: {
+        kind: "github",
+        owner: parsed.owner,
+        repo: parsed.repo,
+        url: `https://github.com/${parsed.owner}/${parsed.repo}`,
+      },
+    });
     const files = await listWorkspaceFiles(userId);
     res.json({
       success: true,
