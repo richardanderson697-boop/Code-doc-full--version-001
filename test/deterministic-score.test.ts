@@ -284,17 +284,26 @@ describe("deterministic scoring", () => {
     }
   });
 
-  it("does not penalize a stateless tool for missing auth/db", () => {
+  it("marks missing auth/db N/A instead of a free 10 (Step 1: exclusion, not penalty)", () => {
     const files = [
       wf("package.json", JSON.stringify({ dependencies: { react: "18" } })),
       wf("index.html", "<div id=root></div>"),
       wf("src/App.tsx", `export function App() { const [t, setT] = React.useState(''); return <textarea value={t}/>; }`),
     ];
     const a = computeDeterministicAssessment(files, emptyPreflight());
-    expect(a.categories.authentication.note).toBe("not-in-scope");
-    expect(a.categories.databaseLayer.note).toBe("not-in-scope");
-    expect(a.categories.authentication.score).toBe(10);
-    expect(a.categories.databaseLayer.score).toBe(10);
+    expect(a.categories.authentication.applicable).toBe(false);
+    expect(a.categories.databaseLayer.applicable).toBe(false);
+    expect(a.categories.authentication.note).toBe("not-applicable");
+    expect(a.categories.databaseLayer.note).toBe("not-applicable");
+    expect(a.categories.authentication.score).toBe(0);
+    expect(a.categories.databaseLayer.score).toBe(0);
+    expect(a.categories.authentication.evidence.join(" ")).toMatch(/no evidence found/);
+    expect(a.categories.databaseLayer.evidence.join(" ")).toMatch(/no evidence found/);
+    // "Does not penalize" survives as exclusion: the total rescales over
+    // applicable categories only, so the 0s never drag it down.
+    const applicable = CATEGORY_KEYS.filter((k) => a.categories[k].applicable !== false);
+    const sum = applicable.reduce((n, k) => n + a.categories[k].score, 0);
+    expect(a.completenessScore).toBe(Math.round((sum / (applicable.length * 10)) * 100));
   });
 
   it("recognizes Firebase/Firestore as a real persistence layer", () => {
@@ -413,7 +422,9 @@ describe("finding/category reconciliation (both checks rule)", () => {
       ])
     );
     // Admin Route Exposure maps to authentication + security only.
-    expect(a.categories.databaseLayer.score).toBe(10);
+    // Step 1: databaseLayer has no db code in this fixture, so it is N/A
+    // (untouched by the finding), not the old free 10.
+    expect(a.categories.databaseLayer.applicable).toBe(false);
     expect(a.categories.externalIntegrations.score).toBe(10);
   });
 
@@ -464,7 +475,11 @@ describe("finding/category reconciliation (both checks rule)", () => {
       ])
     );
     expect(a.categories.externalIntegrations.score).toBe(10);
-    expect(a.categories.authentication.score).toBe(4);
+    // Step 1: this fixture has no auth implementation, so authentication is
+    // N/A and reconciliation skips it — the defect still surfaces as a
+    // finding/liability, the category itself is not scored.
+    expect(a.categories.authentication.applicable).toBe(false);
+    expect(a.categories.authentication.score).toBe(0);
     expect(a.categories.security.score).toBeLessThanOrEqual(4);
   });
 
@@ -525,7 +540,8 @@ describe("backgroundAutomation N/A (rule-based, never model judgment)", () => {
     expect(cat.applicable).toBe(false);
     expect(cat.score).toBe(0);
     expect(cat.note).toBe("not-applicable");
-    expect(a.applicableCount).toBe(9);
+    // Step 1: auth + db are also N/A in this bare fixture (7 = 10 − 3).
+    expect(a.applicableCount).toBe(7);
   });
 
   it("rescales the total over the applicable categories", () => {
@@ -547,7 +563,8 @@ describe("backgroundAutomation N/A (rule-based, never model judgment)", () => {
     expect(cat.applicable).not.toBe(false);
     expect(cat.note).toBe("dangling-automation");
     expect(cat.score).toBe(3);
-    expect(a.applicableCount).toBe(10);
+    // Step 1: auth + db are N/A in this fixture (8 = 10 − 2).
+    expect(a.applicableCount).toBe(8);
   });
 
   it("stays applicable (score 10) when a scheduler is implemented", () => {
@@ -579,6 +596,8 @@ describe("backgroundAutomation N/A (rule-based, never model judgment)", () => {
     const a = computeDeterministicAssessment(BARE_FILES, emptyPreflight());
     const prompt = formatAssessmentForPrompt(a);
     expect(prompt).toMatch(/backgroundAutomation: N\/A/);
-    expect(prompt).toMatch(/9 applicable/);
+    expect(prompt).toMatch(/authentication: N\/A/);
+    expect(prompt).toMatch(/databaseLayer: N\/A/);
+    expect(prompt).toMatch(/7 applicable/);
   });
 });

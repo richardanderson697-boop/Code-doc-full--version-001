@@ -297,3 +297,50 @@ describe("buildFinalReadReport needsVerification", () => {
     expect(withoutFix.businessImplication).toMatch(/not established/);
   });
 });
+
+describe("buildFinalReadReport notApplicable", () => {
+  it("excludes N/A categories from every decision bucket and lists them with the flag", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: {
+          authentication: { score: 0, applicable: false },
+          databaseLayer: { score: 0, applicable: false },
+          security: { score: 8, reason: "Solid." },
+          documentationVerified: { score: 2, reason: "Docs do not match code." },
+        },
+        findings: [],
+        missingFeatures: [],
+      })
+    );
+    const allBuckets = [...r.working, ...r.halfBuilt, ...r.liabilities].map(
+      (i) => i.title
+    );
+    expect(allBuckets).not.toContain("Authentication");
+    expect(allBuckets).not.toContain("Database layer");
+    expect(r.working.map((i) => i.title)).toContain("Security");
+    expect(r.liabilities.map((i) => i.title)).toContain("Documentation verified");
+    expect(r.notApplicable.map((i) => i.title)).toEqual([
+      "Authentication",
+      "Database layer",
+    ]);
+    for (const item of r.notApplicable) {
+      expect(item.businessImplication).toMatch(/No evidence found/);
+    }
+    expect(r.counts.working).toBe(1);
+    expect(r.counts.liabilities).toBe(1);
+  });
+
+  it("applicable wins over score: a contradictory 10 with applicable false is still N/A", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: {
+          authentication: { score: 10, applicable: false },
+        },
+        findings: [],
+        missingFeatures: [],
+      })
+    );
+    expect(r.working.map((i) => i.title)).not.toContain("Authentication");
+    expect(r.notApplicable.map((i) => i.title)).toContain("Authentication");
+  });
+});

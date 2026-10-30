@@ -22,6 +22,7 @@ import {
   CheckCircle2,
   FileWarning,
   ShieldQuestion,
+  MinusCircle,
   MessageCircle,
   FileText,
   Printer,
@@ -506,6 +507,20 @@ export default function FinalReadOverlay({
               </>
             )}
           />
+
+          {/* Not applicable — shown only when something is N/A. Collapsed
+              on screen like working/half-built, but print expands it, so
+              the PDF carries the flag too. */}
+          {report.notApplicable.length > 0 && (
+            <BucketSection
+              title="Not applicable"
+              icon={<MinusCircle className="w-4 h-4 text-slate-500" />}
+              items={report.notApplicable}
+              accent="bg-slate-100 text-slate-600"
+              defaultOpen={false}
+              subtitle="These categories had no evidence either way — they were not assessed, neither as working nor as missing."
+            />
+          )}
 
           {/* What the review could not establish — always shown */}
           <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">

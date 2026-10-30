@@ -29,6 +29,8 @@ export interface FinalReadCategoryInput {
   /** 0-10 deterministic rubric score. */
   score: number;
   reason?: string;
+  /** false = N/A: no evidence either way, excluded from every bucket. */
+  applicable?: boolean;
 }
 
 export interface FinalReadScanGaps {
@@ -127,6 +129,13 @@ export interface FinalReadReport {
    * Ordered severity-desc, then file order.
    */
   needsVerification: FinalReadBucketItem[];
+  /**
+   * Categories with no evidence either way (applicable === false). Never
+   * working, half-built, or liabilities — they were not assessed. The
+   * stakeholder UI renders these in their own "Not applicable" section
+   * with the no-evidence flag, so absence is never presented as a strength.
+   */
+  notApplicable: FinalReadBucketItem[];
   /** ISO timestamp the report object was built (rendered in the verification section header). */
   generatedAt: string;
   /** Always non-empty: the report model requires this panel to show. */
@@ -388,10 +397,25 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
   const halfBuilt: FinalReadBucketItem[] = [];
   const liabilities: FinalReadBucketItem[] = [];
   const needsVerification: FinalReadBucketItem[] = [];
+  const notApplicable: FinalReadBucketItem[] = [];
 
   const categories = input.categoryScores || {};
   for (const key of Object.keys(categories)) {
     const cat = categories[key];
+    // N/A is excluded from every decision bucket. Without this, a null/0
+    // score would bucket as a liability — presenting "not assessed" as a
+    // reason to pause, the same flattery-in-reverse as the old 10/10.
+    if (cat.applicable === false) {
+      notApplicable.push({
+        title: categoryLabel(key),
+        businessImplication: "No evidence found — this category was not assessed.",
+        severity: "info",
+        file: "",
+        line: null,
+        evidence: condenseEvidence(input.categoryEvidence?.[key]),
+      });
+      continue;
+    }
     const score = Math.max(0, Math.min(10, Math.round(Number(cat.score) || 0)));
     const item: FinalReadBucketItem = {
       title: categoryLabel(key),
@@ -479,6 +503,7 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     halfBuilt,
     liabilities,
     needsVerification,
+    notApplicable,
     generatedAt: new Date().toISOString(),
     couldNotEstablish,
     counts: {

@@ -351,8 +351,8 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
     evidence.push(ev(referenced.path, findLine(referenced.content, AUTH_REF), "references sign-in/up with no auth backend (dangling)"));
     return { score: 2, max: 10, evidence, note: "dangling-auth" };
   }
-  evidence.push("no auth code and no auth references — not in scope by design");
-  return { score: 10, max: 10, evidence, note: "not-in-scope" };
+  evidence.push("no auth code and no auth references — no evidence found");
+  return { score: 0, max: 10, evidence, note: "not-applicable", applicable: false };
 }
 
 function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
@@ -397,8 +397,8 @@ function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
     evidence.push(ev(referenced.path, findLine(referenced.content, DB_REF), "references persistence with no database code (dangling)"));
     return { score: 2, max: 10, evidence, note: "dangling-db" };
   }
-  evidence.push("no database code and no persistence references — not in scope by design");
-  return { score: 10, max: 10, evidence, note: "not-in-scope" };
+  evidence.push("no database code and no persistence references — no evidence found");
+  return { score: 0, max: 10, evidence, note: "not-applicable", applicable: false };
 }
 
 function scoreErrorHandling(sig: WorkspaceSignals): CategoryResult {
