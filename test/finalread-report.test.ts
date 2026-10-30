@@ -343,4 +343,26 @@ describe("buildFinalReadReport notApplicable", () => {
     expect(r.working.map((i) => i.title)).not.toContain("Authentication");
     expect(r.notApplicable.map((i) => i.title)).toContain("Authentication");
   });
+
+  it("row-3 (excluded-by-design) reads differently from row-4 (no evidence)", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: {
+          databaseLayer: {
+            score: 0,
+            applicable: false,
+            designDeclaration: "IN-MEMORY DATABASE (Zero PII)",
+          },
+        },
+        findings: [],
+        missingFeatures: [],
+      })
+    );
+    expect(r.working.map((i) => i.title)).not.toContain("Database layer");
+    expect(r.liabilities.map((i) => i.title)).not.toContain("Database layer");
+    expect(r.notApplicable).toHaveLength(1);
+    expect(r.notApplicable[0].businessImplication).toBe(
+      'Excluded by design: "IN-MEMORY DATABASE (Zero PII)"'
+    );
+  });
 });

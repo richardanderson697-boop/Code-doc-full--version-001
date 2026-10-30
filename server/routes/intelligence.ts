@@ -392,6 +392,7 @@ The total completenessScore is computed server-side (rescaled over the applicabl
           score: applicable ? det.score : null,
           max: 10,
           applicable,
+          designDeclaration: det.designDeclaration,
           reason:
             typeof cat.reason === "string" && cat.reason.trim().length > 0
               ? cat.reason

@@ -31,6 +31,9 @@ export interface FinalReadCategoryInput {
   reason?: string;
   /** false = N/A: no evidence either way, excluded from every bucket. */
   applicable?: boolean;
+  /** Set only on row-3 (excluded-by-design) N/A: the declared-design
+   *  quote that excluded the category. */
+  designDeclaration?: string;
 }
 
 export interface FinalReadScanGaps {
@@ -406,9 +409,14 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     // score would bucket as a liability — presenting "not assessed" as a
     // reason to pause, the same flattery-in-reverse as the old 10/10.
     if (cat.applicable === false) {
+      // Row 3 (excluded-by-design) reads differently from row 4
+      // (no-signal): the buyer sees what design decision excluded it.
+      const byDesign = cat.designDeclaration;
       notApplicable.push({
         title: categoryLabel(key),
-        businessImplication: "No evidence found — this category was not assessed.",
+        businessImplication: byDesign
+          ? `Excluded by design: "${byDesign}"`
+          : "No evidence found — this category was not assessed.",
         severity: "info",
         file: "",
         line: null,

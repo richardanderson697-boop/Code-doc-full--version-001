@@ -54,6 +54,8 @@ export interface CategoryResult {
   applicable?: boolean; // false = N/A: the category does not apply to this project
   // by rule (not by model judgment) and is excluded from totals. Undefined
   // means applicable.
+  designDeclaration?: string; // set only on row-3 (excluded-by-design)
+  // returns: the declared-design quote that excluded the category.
 }
 
 export interface MissingFeatureFact {
@@ -78,6 +80,12 @@ export interface DeterministicAssessment {
 interface FileSignals {
   path: string;
   content: string;
+  /** Original content with comments blanked to spaces, newlines kept, so
+   *  a line number found here is the same line in `content`. REF/IMPL
+   *  matchers run against this, never raw content (Fix A). */
+  strippedContent: string;
+  /** Comment spans in this file (line = start line, text without markers). */
+  comments: CommentSpan[];
   lineCount: number;
   lower: string;
   analysis: DeterministicAnalysis;
@@ -88,11 +96,119 @@ function hasWord(haystack: string, pattern: RegExp): boolean {
   return pattern.test(haystack);
 }
 
+/** One comment span: `line` is the 1-based start line, `text` is the
+ *  comment body without markers, whitespace-squeezed, trimmed. */
+export interface CommentSpan {
+  line: number;
+  text: string;
+}
+
+/**
+ * Splits content into comment-blanked code and comment spans. Comments
+ * are blanked to spaces (never deleted) so every newline survives and a
+ * line number found in `code` maps 1:1 to the original file — evidence
+ * anchors stay valid. String and template literals are preserved
+ * verbatim (a "Log in" button string is a genuine signal; `http://`
+ * inside a string is not a comment). JSX `{/* … *\/}` is covered by
+ * block-comment handling; `<!-- … -->` is blanked in every file type.
+ *
+ * Known limitations (documented, not hidden): template-literal `${…}`
+ * bodies are not descended into, so a comment-like sequence inside an
+ * interpolation is preserved as string content (safe direction: a
+ * possible missed strip, never a false match). Regex literals
+ * containing `//` or `/*` can mis-blank — a line comment misread only
+ * affects its own line; a block misread runs to the next `*\/`. Both
+ * cost a possible missed signal on those lines, never a false one.
+ */
+export function splitCodeAndComments(content: string): {
+  code: string;
+  comments: CommentSpan[];
+} {
+  const out: string[] = [];
+  const comments: CommentSpan[] = [];
+  const n = content.length;
+  let i = 0;
+  let line = 1;
+  // Blanks content[i..end), preserving newlines. Advances i past end.
+  const blankTo = (end: number) => {
+    while (i < end) {
+      if (content[i] === "\n") {
+        out.push("\n");
+        line++;
+      } else {
+        out.push(" ");
+      }
+      i++;
+    }
+  };
+  while (i < n) {
+    const ch = content[i];
+    const next = content[i + 1] ?? "";
+    if (ch === "/" && next === "/") {
+      const startLine = line;
+      let j = i + 2;
+      while (j < n && content[j] !== "\n") j++;
+      comments.push({ line: startLine, text: content.slice(i + 2, j).trim() });
+      blankTo(j);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const startLine = line;
+      const close = content.indexOf("*/", i + 2);
+      const end = close === -1 ? n : close + 2;
+      const text = content
+        .slice(i + 2, close === -1 ? n : close)
+        .replace(/\s+/g, " ")
+        .trim();
+      comments.push({ line: startLine, text });
+      blankTo(end);
+      continue;
+    }
+    if (ch === "<" && content.startsWith("<!--", i)) {
+      const startLine = line;
+      const close = content.indexOf("-->", i + 4);
+      const end = close === -1 ? n : close + 3;
+      const text = content
+        .slice(i + 4, close === -1 ? n : close)
+        .replace(/\s+/g, " ")
+        .trim();
+      comments.push({ line: startLine, text });
+      blankTo(end);
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      const quote = ch;
+      out.push(ch);
+      i++;
+      while (i < n) {
+        const c = content[i];
+        out.push(c);
+        if (c === "\\" && i + 1 < n) {
+          out.push(content[i + 1]);
+          i += 2;
+          continue;
+        }
+        if (c === "\n") line++;
+        if (c === quote) {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "\n") line++;
+    out.push(ch);
+    i++;
+  }
+  return { code: out.join(""), comments };
+}
+
 // Code-level signals (imports, declarations, route handlers): evidence that a
 // capability is IMPLEMENTED, not merely mentioned.
 const AUTH_IMPL = /(better-auth|next-auth|@clerk\/|passport|jsonwebtoken|createSession|verifyPassword|signIn\(|signOut\(|getServerSession|oauth)/i;
 const AUTH_REF = /(sign\s?-?in|log\s?-?in|sign\s?-?up|create\s?account|forgot\s?password|reset\s?password)/i;
-const DB_IMPL = /(drizzle|prisma|mongoose|typeorm|sequelize|better-sqlite3|node:sqlite|kysely|supabase|mongodb|createPool|DataSource)/i;
+const DB_IMPL = /(drizzle|prisma|mongoose|typeorm|sequelize|better-sqlite3|node:sqlite|kysely|supabase|mongodb|indexedDB|IDBDatabase|createPool|DataSource)/i;
 // Backend-as-a-service persistence: Firebase/Firestore/Realtime DB, Supabase client,
 // Appwrite, Convex, PlanetScale, Neon, Turso/libSQL, Upstash, PocketBase. These are
 // real persistence layers even though they ship no local schema/migration files.
@@ -102,6 +218,83 @@ const BAAS_IMPL = /(firebase\/firestore|firebase\/database|firebase-admin|getFir
 // live behind a wrapper the content scan cannot name.
 const BAAS_CONFIG_PATH = /(firebase|firestore|supabase|appwrite)/i;
 const DB_REF = /(database|migration|schema\.prisma|collection|table\s+users|persist)/i;
+
+/** A stated design decision, mapped to exactly one category. `quote` is
+ *  the declaring line/span text (squeezed, capped) for display;
+ *  `file`/`line` anchor it like any other evidence. Deterministic
+ *  patterns only — never model inference (Fix B). */
+export interface DesignDeclaration {
+  category: "authentication" | "databaseLayer";
+  quote: string;
+  file: string;
+  line: number;
+}
+
+// Explicit design negations only: a category noun + (no | without |
+// in-memory). The `\s?` tolerances cover natural phrasings ("no sign
+// in", "in memory database") without opening the door to vague prose.
+// "Personal use only" is deliberately NOT here — its category mapping
+// is undecided and belongs to Step 2's broader program.
+const DESIGN_DECLARATION_PATTERNS: Array<{
+  category: DesignDeclaration["category"];
+  pattern: RegExp;
+}> = [
+  {
+    category: "databaseLayer",
+    pattern: /in[ -]?memory database|no (persistent )?database|without (a )?database/i,
+  },
+  {
+    category: "authentication",
+    pattern: /no (user )?auth(entication)?|no (user )?accounts?|no (sign\s?-?in|log\s?-?in)/i,
+  },
+];
+
+/**
+ * Collects design declarations from code/UI comment spans and README
+ * lines. A span matching both tables yields one entry per category.
+ * Comment spans come from `splitCodeAndComments`; README lines are raw
+ * file lines. Only isCodeFile/isUiFile comments and README.md lines
+ * are read — prose in other docs is not treated as a declaration.
+ */
+export function extractDesignDeclarations(
+  files: Array<{ path: string; comments: CommentSpan[]; content: string }>
+): DesignDeclaration[] {
+  const out: DesignDeclaration[] = [];
+  for (const f of files) {
+    const isCodeLike = isCodeFile(f.path) || isUiFile(f.path);
+    if (isCodeLike) {
+      for (const c of f.comments) {
+        for (const { category, pattern } of DESIGN_DECLARATION_PATTERNS) {
+          if (pattern.test(c.text)) {
+            out.push({
+              category,
+              quote: c.text.slice(0, 120),
+              file: f.path,
+              line: c.line,
+            });
+          }
+        }
+      }
+    }
+    if (/(^|\/)readme\.md$/i.test(f.path)) {
+      const lines = f.content.split("\n");
+      lines.forEach((raw, idx) => {
+        const text = raw.trim();
+        for (const { category, pattern } of DESIGN_DECLARATION_PATTERNS) {
+          if (pattern.test(text)) {
+            out.push({
+              category,
+              quote: text.slice(0, 120),
+              file: f.path,
+              line: idx + 1,
+            });
+          }
+        }
+      });
+    }
+  }
+  return out;
+}
 const PAYMENT_REF = /(stripe|checkout|payment|billing|subscription)/i;
 const AUTOMATION_IMPL = /(node-cron|cron\.schedule|setInterval\s*\(|bullmq|inngest|trigger\.dev|new\s+Worker|webhook)/i;
 const AUTOMATION_REF = /(webhook|cron|schedule|worker|queue|background\sjob)/i;
@@ -121,6 +314,7 @@ function isUiFile(path: string): boolean {
 interface WorkspaceSignals {
   files: FileSignals[];
   packageJson: any | null;
+  declarations: DesignDeclaration[];
   totalEndpoints: number;
   totalStubs: number;
   totalTodos: number;
@@ -223,9 +417,12 @@ function collectSignals(files: WorkspaceFile[]): WorkspaceSignals {
         packageJson = null;
       }
     }
-    out.push({ path: f.path, content, lineCount: f.lineCount, lower, analysis, imports: extractImports(content) });
+    // Comment-blanked code for REF/IMPL matchers (Fix A); raw content
+    // stays on the object for stub-marker rules, Q&A context, and display.
+    const { code: strippedContent, comments } = splitCodeAndComments(content);
+    out.push({ path: f.path, content, strippedContent, comments, lineCount: f.lineCount, lower, analysis, imports: extractImports(content) });
   }
-  return { files: out, packageJson, totalEndpoints, totalStubs, totalTodos, tryCatchCount, totalCodeLines };
+  return { files: out, packageJson, declarations: extractDesignDeclarations(out), totalEndpoints, totalStubs, totalTodos, tryCatchCount, totalCodeLines };
 }
 
 function fileExists(sig: WorkspaceSignals, ...names: string[]): string | null {
@@ -324,20 +521,24 @@ function scoreServerStarts(sig: WorkspaceSignals): CategoryResult {
 
 function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
+  const declaration = sig.declarations.find((d) => d.category === "authentication");
   const implFiles = sig.files.filter(
     (f) =>
       isCodeFile(f.path) &&
-      (hasWord(f.content, AUTH_IMPL) || /(^|\/)(auth|session|login|signup|sign-in)(\.|-|_|\/)/i.test(f.path))
+      (hasWord(f.strippedContent, AUTH_IMPL) || /(^|\/)(auth|session|login|signup|sign-in)(\.|-|_|\/)/i.test(f.path))
   );
   // A path match alone is weak; require a code-level signal or 2+ auth files.
-  const strong = implFiles.filter((f) => hasWord(f.content, AUTH_IMPL));
+  const strong = implFiles.filter((f) => hasWord(f.strippedContent, AUTH_IMPL));
   const implemented = strong.length > 0 || implFiles.length >= 2;
 
   if (implemented) {
     const names = implFiles.slice(0, 4).map((f) => f.path);
-    const firstLine = strong.length > 0 ? findLine(strong[0].content, AUTH_IMPL) : null;
+    const firstLine = strong.length > 0 ? findLine(strong[0].strippedContent, AUTH_IMPL) : null;
     const anchoredNames = names.map((n, i) => (i === 0 && firstLine != null ? `${n}:${firstLine}` : n));
     evidence.push(`${anchoredNames.join(", ")} (auth implementation signals)`);
+    if (declaration) {
+      evidence.push(ev(declaration.file, declaration.line, `design declared: "${declaration.quote}"`));
+    }
     const stubbed = implFiles.some((f) => f.analysis.stubCount > 0 || f.analysis.todoCount > 0);
     if (stubbed) {
       evidence.push("auth code contains stubs/TODOs");
@@ -346,9 +547,17 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
     return { score: 10, max: 10, evidence };
   }
 
-  const referenced = anyFile(sig, (f) => isUiFile(f.path) && hasWord(f.content, AUTH_REF));
+  // Precedence: positive evidence > declaration > dangling inference.
+  // A declared no-auth design beats a dangling reference; it never
+  // beats real implementation (handled above).
+  if (declaration) {
+    evidence.push(ev(declaration.file, declaration.line, `design declared: "${declaration.quote}"`));
+    return { score: 0, max: 10, evidence, note: "excluded-by-design", applicable: false, designDeclaration: declaration.quote };
+  }
+
+  const referenced = anyFile(sig, (f) => isUiFile(f.path) && hasWord(f.strippedContent, AUTH_REF));
   if (referenced) {
-    evidence.push(ev(referenced.path, findLine(referenced.content, AUTH_REF), "references sign-in/up with no auth backend (dangling)"));
+    evidence.push(ev(referenced.path, findLine(referenced.strippedContent, AUTH_REF), "references sign-in/up with no auth backend (dangling)"));
     return { score: 2, max: 10, evidence, note: "dangling-auth" };
   }
   evidence.push("no auth code and no auth references — no evidence found");
@@ -357,10 +566,11 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
 
 function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
+  const declaration = sig.declarations.find((d) => d.category === "databaseLayer");
   const implFiles = sig.files.filter(
-    (f) => isCodeFile(f.path) && (hasWord(f.content, DB_IMPL) || hasWord(f.content, BAAS_IMPL))
+    (f) => isCodeFile(f.path) && (hasWord(f.strippedContent, DB_IMPL) || hasWord(f.strippedContent, BAAS_IMPL))
   );
-  const baasCode = implFiles.some((f) => hasWord(f.content, BAAS_IMPL) && !hasWord(f.content, DB_IMPL));
+  const baasCode = implFiles.some((f) => hasWord(f.strippedContent, BAAS_IMPL) && !hasWord(f.strippedContent, DB_IMPL));
   // BaaS config present (e.g. firebase-applet-config.json) even if the client call
   // sites are wrapped opaquely: persistence exists, usage unverified.
   const baasConfig = sig.files.find((f) => !isCodeFile(f.path) && BAAS_CONFIG_PATH.test(f.path));
@@ -369,7 +579,7 @@ function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
   if (implFiles.length > 0) {
     const names = implFiles.slice(0, 4).map((f) => f.path);
     const firstLine =
-      findLine(implFiles[0].content, DB_IMPL) ?? findLine(implFiles[0].content, BAAS_IMPL);
+      findLine(implFiles[0].strippedContent, DB_IMPL) ?? findLine(implFiles[0].strippedContent, BAAS_IMPL);
     const anchoredNames = names.map((n, i) => (i === 0 && firstLine != null ? `${n}:${firstLine}` : n));
     evidence.push(`${anchoredNames.join(", ")} (${baasCode ? "BaaS" : "database"} client usage)`);
     if (baasCode) {
@@ -378,6 +588,9 @@ function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
       evidence.push(`${schemaFiles[0].path} (schema/migration present)`);
     } else {
       evidence.push("no schema/migration file detected");
+    }
+    if (declaration) {
+      evidence.push(ev(declaration.file, declaration.line, `design declared: "${declaration.quote}"`));
     }
     const stubbed = implFiles.some((f) => f.analysis.stubCount > 0);
     if (stubbed) {
@@ -389,12 +602,21 @@ function scoreDatabaseLayer(sig: WorkspaceSignals): CategoryResult {
 
   if (baasConfig) {
     evidence.push(`${baasConfig.path} (BaaS persistence configured; client usage not detected in scanned files)`);
+    if (declaration) {
+      evidence.push(ev(declaration.file, declaration.line, `design declared: "${declaration.quote}"`));
+    }
     return { score: 7, max: 10, evidence };
   }
 
-  const referenced = anyFile(sig, (f) => hasWord(f.content, DB_REF));
+  // Precedence: positive evidence > declaration > dangling inference.
+  if (declaration) {
+    evidence.push(ev(declaration.file, declaration.line, `design declared: "${declaration.quote}"`));
+    return { score: 0, max: 10, evidence, note: "excluded-by-design", applicable: false, designDeclaration: declaration.quote };
+  }
+
+  const referenced = anyFile(sig, (f) => hasWord(f.strippedContent, DB_REF));
   if (referenced) {
-    evidence.push(ev(referenced.path, findLine(referenced.content, DB_REF), "references persistence with no database code (dangling)"));
+    evidence.push(ev(referenced.path, findLine(referenced.strippedContent, DB_REF), "references persistence with no database code (dangling)"));
     return { score: 2, max: 10, evidence, note: "dangling-db" };
   }
   evidence.push("no database code and no persistence references — no evidence found");
@@ -406,7 +628,7 @@ function scoreErrorHandling(sig: WorkspaceSignals): CategoryResult {
   const density = sig.totalCodeLines > 0 ? (sig.tryCatchCount / sig.totalCodeLines) * 1000 : 0;
   const boundary = anyFile(
     sig,
-    (f) => /ErrorBoundary|error\.tsx|onError/i.test(f.path) || /app\.use\(\s*\(err/i.test(f.content)
+    (f) => /ErrorBoundary|error\.tsx|onError/i.test(f.path) || /app\.use\(\s*\(err/i.test(f.strippedContent)
   );
   evidence.push(`${sig.tryCatchCount} try/catch blocks across ${sig.totalCodeLines} code lines`);
   if (boundary) {
@@ -445,7 +667,7 @@ function scoreCoreLogic(sig: WorkspaceSignals): CategoryResult {
 
 function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
-  const impl = anyFile(sig, (f) => isCodeFile(f.path) && hasWord(f.content, AUTOMATION_IMPL));
+  const impl = anyFile(sig, (f) => isCodeFile(f.path) && hasWord(f.strippedContent, AUTOMATION_IMPL));
   if (impl) {
     // Name the actual signal so the score is explainable. A webhook handler
     // is event-driven automation, but it runs in the request path — it is not
@@ -476,7 +698,7 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
     evidence.push("no scheduled jobs, queues, workers, or webhook retry/reconciliation logic");
     return { score: 6, max: 10, evidence };
   }
-  const referenced = anyFile(sig, (f) => hasWord(f.content, AUTOMATION_REF) || hasWord(f.content, PAYMENT_REF));
+  const referenced = anyFile(sig, (f) => hasWord(f.strippedContent, AUTOMATION_REF) || hasWord(f.strippedContent, PAYMENT_REF));
   // A scheduler/queue/worker dependency with no code usage yet still counts
   // as "in scope" — the rule is "no such dependency anywhere", not "no import".
   const automationDep = depNames(sig).some((d) => /(cron|bull|queue|worker|schedule|inngest|agenda)/i.test(d));
@@ -500,8 +722,8 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
 
 function scoreExternalIntegrations(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
-  const sdkFiles = sig.files.filter((f) => isCodeFile(f.path) && hasWord(f.content, EXT_SDK_USE));
-  const externalFetches = sig.files.filter((f) => /fetch\(\s*[`'"]https?:\/\//i.test(f.content));
+  const sdkFiles = sig.files.filter((f) => isCodeFile(f.path) && hasWord(f.strippedContent, EXT_SDK_USE));
+  const externalFetches = sig.files.filter((f) => /fetch\(\s*[`'"]https?:\/\//i.test(f.strippedContent));
 
   if (sdkFiles.length > 0 || externalFetches.length > 0) {
     const ordered = [...sdkFiles, ...externalFetches];
@@ -520,7 +742,7 @@ function scoreExternalIntegrations(sig: WorkspaceSignals): CategoryResult {
     return { score: 10, max: 10, evidence };
   }
 
-  const referenced = anyFile(sig, (f) => hasWord(f.content, PAYMENT_REF));
+  const referenced = anyFile(sig, (f) => hasWord(f.strippedContent, PAYMENT_REF));
   if (referenced) {
     evidence.push(ev(referenced.path, findLine(referenced.content, PAYMENT_REF), "references payments/integrations with no implementation"));
     return { score: 3, max: 10, evidence, note: "dangling-integration" };
@@ -558,7 +780,7 @@ function scorePerformance(sig: WorkspaceSignals): CategoryResult {
     score += 1;
     evidence.push("package.json build script present");
   }
-  const splitting = anyFile(sig, (f) => /React\.lazy|Suspense|import\s*\(/.test(f.content));
+  const splitting = anyFile(sig, (f) => /React\.lazy|Suspense|import\s*\(/.test(f.strippedContent));
   if (splitting) {
     score += 1;
     evidence.push(ev(splitting.path, findLine(splitting.content, /React\.lazy|Suspense|import\s*\(/), "(code-splitting/lazy loading)"));
@@ -600,7 +822,7 @@ function scoreDocumentation(sig: WorkspaceSignals): CategoryResult {
       const t = line.trim();
       if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) commentLines++;
     }
-    if (/(interface\s+\w+|type\s+\w+\s*=)/.test(f.content)) typeHits++;
+    if (/(interface\s+\w+|type\s+\w+\s*=)/.test(f.strippedContent)) typeHits++;
   }
   const commentRatio = sig.totalCodeLines > 0 ? commentLines / sig.totalCodeLines : 0;
   const commentPts = commentRatio >= 0.15 ? 3 : commentRatio >= 0.08 ? 2 : commentRatio >= 0.03 ? 1 : 0;
@@ -617,10 +839,10 @@ function scoreDocumentation(sig: WorkspaceSignals): CategoryResult {
 // ---------------------------------------------------------------------------
 
 function stripePresentWithoutWebhook(sig: WorkspaceSignals): boolean {
-  const stripeFile = anyFile(sig, (f) => /stripe/i.test(f.content));
+  const stripeFile = anyFile(sig, (f) => /stripe/i.test(f.strippedContent));
   if (!stripeFile) return false;
   const webhook = sig.files.some(
-    (f) => /webhook/i.test(f.path) || /webhook/i.test(f.content)
+    (f) => /webhook/i.test(f.path) || /webhook/i.test(f.strippedContent)
   );
   return !webhook;
 }
@@ -954,7 +1176,7 @@ export function computeDeterministicAssessment(
     capsApplied.push("CAP A (missing front door: total capped at 30)");
   } else if (sig.totalEndpoints <= 1) {
     const claimsApi = sig.files.some(
-      (f) => hasWord(f.content, AUTH_REF) || hasWord(f.content, DB_REF) || hasWord(f.content, PAYMENT_REF)
+      (f) => hasWord(f.strippedContent, AUTH_REF) || hasWord(f.strippedContent, DB_REF) || hasWord(f.strippedContent, PAYMENT_REF)
     );
     // A reference is only a hollow claim when the capability is actually
     // missing: real auth/db/integration implementations (Firebase included)
