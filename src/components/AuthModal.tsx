@@ -111,7 +111,7 @@ export default function AuthModal({ open, onClose, onAuthed, initialMode = "sign
     reset: "Set a new password",
   };
   const subtitles: Record<Mode, string> = {
-    signup: "Sign up and get 25 free credits to try deep code audits.",
+    signup: "Sign up and get 50 free credits to try deep code audits.",
     login: "Sign in to use AI audits, generation, and debugging.",
     forgot: "Enter your account email and we'll send you a reset link.",
     reset: "Choose a new password for your account.",

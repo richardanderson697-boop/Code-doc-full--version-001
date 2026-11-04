@@ -725,7 +725,7 @@ export default function App() {
               onClick={() => setAuthOpen(true)}
               className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold transition duration-150"
             >
-              Sign in
+              Sign up / Sign in
             </button>
           )}
           {hasActiveWorkspace && !isGenerating && (
