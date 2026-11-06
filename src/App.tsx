@@ -228,6 +228,16 @@ export default function App() {
       await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
     } finally {
       setUser(null);
+      // Clear everything user-owned, so the previous user's projects,
+      // workspace and registry cannot stay on screen after logout
+      // (or be inherited by the next account in this tab).
+      setProjects([]);
+      handleNewVibe();
+      setSidebarOpen(false);
+      setActiveRightTab("blueprint");
+      setRefinementInput("");
+      setWarningMessage("");
+      setPricingNotice("");
     }
   };
 
@@ -263,7 +273,10 @@ export default function App() {
     }
   };
 
-  // Load projects from server DB on mount
+  // Load projects from server DB — driven by the signed-in user, not by
+  // mount. Logging out clears the list; logging in (or switching account)
+  // refetches it, so one account's projects can never stay on screen
+  // for the next account in this tab.
   const fetchProjects = async () => {
     try {
       const response = await fetch("/api/projects");
@@ -277,8 +290,9 @@ export default function App() {
   };
 
   useEffect(() => {
-    void fetchProjects();
-  }, []);
+    if (user) void fetchProjects();
+    else setProjects([]);
+  }, [user?.id]);
 
   // Split streamed content from ====PURPOSE==== and ====CODE==== markers with robust parsing
   const splitContent = (fullText: string) => {
@@ -773,7 +787,9 @@ export default function App() {
       {/* Main Container Workspace */}
       <main id="main-content" className="flex-1 flex flex-col min-h-0 bg-slate-950 relative overflow-hidden">
         {finalreadEntryOpen ? (
-          <FinalReadEntry onExit={closeFinalReadEntry} />
+          <React.Fragment key={user?.id ?? "logged-out"}>
+            <FinalReadEntry onExit={closeFinalReadEntry} />
+          </React.Fragment>
         ) : (
           <>
         {warningMessage && (
@@ -1089,7 +1105,7 @@ export default function App() {
                     />
                   </div>
 
-                  <div className={activeRightTab === "auditor" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
+                  <div key={user?.id ?? "logged-out"} className={activeRightTab === "auditor" ? "flex-1 flex flex-col min-h-0" : "hidden"}>
                     <CodeAuditor
                       workspaceCode={activeCode}
                       isGenerating={isGenerating}

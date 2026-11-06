@@ -245,6 +245,11 @@ export default function CodeAuditor({
           setZipUploaded(false);
           setZipFiles([]);
         }
+      } else {
+        // Not signed in (or session expired): clear, don't leave the
+        // previous user's uploaded-workspace file list on screen.
+        setZipUploaded(false);
+        setZipFiles([]);
       }
     } catch (err) {
       logError("Failed to retrieve zip status", err);
