@@ -39,6 +39,46 @@ import {
   type DevHandoffFinding,
 } from "../../../shared/dev-handoff-packet";
 
+/** Deterministic findings from the intelligence run (dead payment buttons,
+ *  mocked-payment routes), guarded into audit-input shape. Anything that
+ *  is not a plain object with a non-empty title and file is dropped — the
+ *  audit input rides to the server, so junk must never reach the report
+ *  builder. Severity outside the known set reads as medium. */
+function deterministicFindings(intelResult: any): Array<{
+  severity: string;
+  title: string;
+  file: string;
+  line: number | null;
+  probe?: string;
+  evidence?: string;
+  remediation?: string;
+  unverified?: boolean;
+}> {
+  const raw = intelResult?.deterministicAssessment?.findings;
+  if (!Array.isArray(raw)) return [];
+  const out: ReturnType<typeof deterministicFindings> = [];
+  for (const f of raw) {
+    if (!f || typeof f !== "object" || Array.isArray(f)) continue;
+    const title = typeof f.title === "string" && f.title.trim() ? f.title.trim() : "";
+    const file = typeof f.file === "string" && f.file.trim() ? f.file.trim() : "";
+    if (!title || !file) continue;
+    const sev = typeof f.severity === "string" ? f.severity.toLowerCase() : "";
+    const line = typeof f.line === "number" && Number.isFinite(f.line) ? Math.round(f.line) : null;
+    out.push({
+      severity: ["critical", "high", "medium", "low", "info"].includes(sev) ? sev : "medium",
+      title,
+      file,
+      line,
+      probe: typeof f.probe === "string" && f.probe.trim() ? f.probe.trim() : undefined,
+      evidence: typeof f.evidence === "string" && f.evidence.trim() ? f.evidence.trim() : undefined,
+      remediation:
+        typeof f.remediation === "string" && f.remediation.trim() ? f.remediation.trim() : undefined,
+      unverified: f.unverified === true ? true : undefined,
+    });
+  }
+  return out;
+}
+
 /** Convert the workspace intelligence result into the overlay's audit input.
  *  Exported so the host panel (IntelligenceReport) can build it. */
 export function intelResultToFinalReadInput(
@@ -101,19 +141,27 @@ export function intelResultToFinalReadInput(
     categoryEvidence,
     applicationMap,
     fileLedger,
-    findings: (preflight?.findings || []).map((f: any) => ({
-      severity: f.severity,
-      title: f.title,
-      file: f.file,
-      line: f.line,
-      probe: f.probe,
-      evidence: f.evidence,
-      remediation: f.remediation,
-      // The verification guard routes on this flag: dropping it here
-      // would send delegated findings to liabilities on the client even
-      // though the server routes them to needsVerification.
-      unverified: f.unverified,
-    })),
+    findings: [
+      ...(preflight?.findings || []).map((f: any) => ({
+        severity: f.severity,
+        title: f.title,
+        file: f.file,
+        line: f.line,
+        probe: f.probe,
+        evidence: f.evidence,
+        remediation: f.remediation,
+        // The verification guard routes on this flag: dropping it here
+        // would send delegated findings to liabilities on the client even
+        // though the server routes them to needsVerification.
+        unverified: f.unverified,
+      })),
+      // Deterministic findings (dead payment buttons, mocked-payment
+      // routes): appended after the PreFlight findings, same shape, same
+      // bucketing. Guarded like the evidence above — only plain objects
+      // with a non-empty title and file pass through; severity is coerced
+      // to the known set (anything else reads as medium).
+      ...deterministicFindings(intelResult),
+    ],
     missingFeatures: intelResult?.missingFeatures || [],
     scanGaps: preflight
       ? {

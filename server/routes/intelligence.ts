@@ -424,6 +424,11 @@ The total completenessScore is computed server-side (rescaled over the applicabl
       evidence: Object.fromEntries(
         CATEGORY_KEYS.map((k) => [k, assessment.categories[k].evidence])
       ),
+      // Deterministic findings (dead payment buttons, mocked-payment
+      // routes): the overlay appends these to the audit input's findings
+      // so the report builder buckets them — liabilities for dead payment
+      // buttons, needs-verification for mocked payments.
+      findings: assessment.deterministicFindings,
     };
     // Citation grounding: verify every `file:line` citation in the model's
     // free-text reasons against the actual workspace files and drop what

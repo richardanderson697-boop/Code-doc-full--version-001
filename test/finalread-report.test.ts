@@ -366,3 +366,58 @@ describe("buildFinalReadReport notApplicable", () => {
     );
   });
 });
+
+describe("buildFinalReadReport deterministic findings", () => {
+  it("sends a dead payment button to liabilities with its file and line", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        findings: [
+          {
+            severity: "high",
+            title: 'Dead "Get Started" button — no handler, customers cannot complete a purchase',
+            file: "app/pricing/pricing-client.tsx",
+            line: 14,
+            probe: "Dead Action",
+            evidence: "app/pricing/pricing-client.tsx:14 <Button className=\"w-full\"> — no onClick, href, or link.",
+            remediation: "Wire the button to the checkout flow, or remove it if the plan is not purchasable.",
+          },
+        ],
+      })
+    );
+    const item = r.liabilities.find((i) => i.title.includes("Get Started"));
+    expect(item).toBeDefined();
+    expect(item!.file).toBe("app/pricing/pricing-client.tsx");
+    expect(item!.line).toBe(14);
+    expect(item!.remediation).toMatch(/Wire the button to the checkout flow/);
+  });
+
+  it("routes a mocked-payment finding to needs verification, never liabilities", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        findings: [
+          {
+            severity: "medium",
+            title: "Checkout records sales as complete with no payment provider call",
+            file: "app/api/checkout/route.ts",
+            line: 31,
+            probe: "Mocked Payment",
+            evidence: "app/api/checkout/route.ts:31 status: 'completed'",
+            remediation:
+              "This checkout records the sale as complete, but no payment provider is called in this route — confirm how payment is actually taken (card terminal, manual invoicing, cash). If nothing takes payment, the sale is recorded as paid without money moving.",
+            unverified: true,
+          },
+        ],
+      })
+    );
+    expect(r.liabilities.map((i) => i.title)).not.toContain(
+      "Checkout records sales as complete with no payment provider call"
+    );
+    const item = r.needsVerification.find((i) =>
+      i.title.includes("no payment provider call")
+    );
+    expect(item).toBeDefined();
+    expect(item!.verification).toBeDefined();
+    expect(item!.verification!.howToCheck).toMatch(/confirm how payment is actually taken/);
+    expect(item!.verification!.whatEachAnswerMeans).toMatch(/Confirmed → it becomes a liability/);
+  });
+});

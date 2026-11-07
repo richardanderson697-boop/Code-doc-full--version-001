@@ -19,8 +19,11 @@ router.post("/api/cold-audit", requireAuth, requireCredits("coldAudit"), asyncRo
     return res.status(400).json({ error: "Code content is required for auditing" });
   }
 
-  // Run the objective deterministic scan first to get fact-based clues
-  const scan = runDeterministicScan(code);
+  // Run the objective deterministic scan first to get fact-based clues.
+  // The file name rides along so extension-gated detectors (dead action
+  // elements in .tsx/.jsx, mocked payments in API routes) engage on the
+  // pasted file exactly as they would in a workspace scan.
+  const scan = runDeterministicScan(code, typeof fileName === "string" ? fileName : "");
 
   // PreFlight deterministic pass: pure-function probes over the submitted
   // file. Single-file scans skip project-level probes by nature; the path
@@ -165,6 +168,36 @@ Keep the assessment highly detailed, precise, professional, and strictly factual
           codeSnippet: item.code,
           conclusion: "Stub/mock placeholder logic detected that lacks a production-ready implementation.",
           confidence: "High"
+        });
+      }
+    });
+
+    // Add Dead Action Evidence: an interactive element with no wiring —
+    // the button or link does nothing when clicked. Payment-related ones
+    // block revenue, so they read as the stronger conclusion.
+    scan.deadActions.forEach(item => {
+      if (!parsedData.evidence.some((e: any) => e.lines === item.lines || e.codeSnippet === item.code)) {
+        parsedData.evidence.push({
+          lines: item.lines,
+          codeSnippet: item.code,
+          conclusion: item.paymentRelated
+            ? `Dead "${item.label}" button with no handler — customers cannot complete a purchase from this element.`
+            : `Dead "${item.label}" button with no handler — the element does nothing when clicked.`,
+          confidence: "High"
+        });
+      }
+    });
+
+    // Add Mocked Payment Evidence: the checkout records the sale as
+    // complete without calling any payment provider. Flagged, not
+    // asserted — a terminal/cash flow records sales the same way.
+    scan.mockedPayments.forEach(item => {
+      if (!parsedData.evidence.some((e: any) => e.lines === item.lines || e.codeSnippet === item.code)) {
+        parsedData.evidence.push({
+          lines: item.lines,
+          codeSnippet: item.code,
+          conclusion: "Checkout records the sale as complete with no payment provider call — confirm how payment is actually taken.",
+          confidence: "Medium"
         });
       }
     });

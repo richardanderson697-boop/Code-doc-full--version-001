@@ -601,3 +601,86 @@ describe("backgroundAutomation N/A (rule-based, never model judgment)", () => {
     expect(prompt).toMatch(/7 applicable/);
   });
 });
+
+describe("dead action + mocked payment detection", () => {
+  const LAYOUT = `export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (<html><body>{children}</body></html>);
+}`;
+  const PAGE = `export default function Home() { return <main>Home</main>; }`;
+  const PRICING = `'use client'
+import { Button } from '@/components/ui/button'
+export function PricingClient() {
+  return (
+    <div>
+      <Button className="w-full">Get Started</Button>
+      <Button className="w-full">Get Started</Button>
+      <Button className="w-full">Get Started</Button>
+    </div>
+  )
+}`;
+  const CHECKOUT_ROUTE = `import { NextRequest, NextResponse } from 'next/server'
+export async function POST(request: NextRequest) {
+  const { cart } = await request.json()
+  const total = cart.reduce((s: number, i: any) => s + i.price, 0)
+  await db.from('sales').insert({ total, status: 'completed' })
+  return NextResponse.json({ success: true, total })
+}`;
+
+  it("caps external integrations at 5 and emits findings for dead payment buttons + mocked checkout", () => {
+    const files = [
+      wf("app/layout.tsx", LAYOUT),
+      wf("app/page.tsx", PAGE),
+      wf("app/pricing/pricing-client.tsx", PRICING),
+      wf("app/api/checkout/route.ts", CHECKOUT_ROUTE),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.externalIntegrations.score).toBe(5);
+    expect(a.categories.externalIntegrations.evidence.join(" ")).toMatch(/Dead payment button/);
+    expect(a.capsApplied.join(" ")).toMatch(/externalIntegrations capped at 5/);
+    expect(a.deterministicFindings).toHaveLength(4);
+    const dead = a.deterministicFindings.filter((f) => f.probe === "Dead Action");
+    expect(dead).toHaveLength(3);
+    expect(dead[0].severity).toBe("high");
+    expect(dead[0].file).toBe("app/pricing/pricing-client.tsx");
+    expect(dead[0].title).toMatch(/Dead "Get Started" button/);
+    const mocked = a.deterministicFindings.filter((f) => f.probe === "Mocked Payment");
+    expect(mocked).toHaveLength(1);
+    expect(mocked[0].unverified).toBe(true);
+    expect(mocked[0].remediation).toMatch(/confirm how payment is actually taken/);
+    // Payment dead buttons are liabilities (findings), never missing
+    // features — one defect, one listing.
+    expect(a.missingFeatures.filter((m) => m.feature.includes("Get Started"))).toHaveLength(0);
+  });
+
+  it("lists a dead non-payment button as a missing feature, not a finding", () => {
+    const files = [
+      wf("app/layout.tsx", LAYOUT),
+      wf("app/page.tsx", PAGE),
+      wf(
+        "app/dashboard/inventory/inventory-client.tsx",
+        `<Button>\n  <Plus />\n  Add Part\n</Button>`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.deterministicFindings).toHaveLength(0);
+    expect(a.categories.externalIntegrations.score).toBe(10);
+    const mf = a.missingFeatures.find((m) => m.feature.includes("Add Part"));
+    expect(mf).toBeDefined();
+    expect(mf!.category).toBe("Core business / domain logic");
+    expect(mf!.evidence[0]).toMatch(/inventory-client\.tsx:/);
+  });
+
+  it("emits nothing for wired buttons", () => {
+    const files = [
+      wf("app/layout.tsx", LAYOUT),
+      wf("app/page.tsx", PAGE),
+      wf(
+        "app/dashboard/diagnostics/diagnostics-client.tsx",
+        `<Button onClick={handleDiagnosis}>Diagnose</Button>`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.deterministicFindings).toHaveLength(0);
+    expect(a.missingFeatures.filter((m) => m.feature.includes("dead"))).toHaveLength(0);
+  });
+});

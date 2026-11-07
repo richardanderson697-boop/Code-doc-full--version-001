@@ -58,6 +58,115 @@ describe("runDeterministicScan", () => {
     expect(s.endpoints[0].lines).toBe("3");
   });
 
+  // Dead action elements (Rule 1): a Button/link that promises an action
+  // but has no wiring. Automate-AI pricing page, 2026-11-07: three
+  // "Get Started" buttons, zero handlers.
+  it("flags dead pricing buttons with no handler", () => {
+    const code = `<Button className="w-full">Get Started</Button>\n<Button className="w-full">Get Started</Button>`;
+    const s = runDeterministicScan(code, "app/pricing/pricing-client.tsx");
+    expect(s.deadActionCount).toBe(2);
+    expect(s.deadActions[0].label).toBe("Get Started");
+    expect(s.deadActions[0].paymentRelated).toBe(true);
+    expect(s.deadActions[0].lines).toBe("1");
+  });
+
+  it("flags a dead non-payment button as not payment-related", () => {
+    const code = `<Button>\n  <Plus className="mr-2 h-4 w-4" />\n  Add Part\n</Button>`;
+    const s = runDeterministicScan(code, "app/dashboard/inventory/inventory-client.tsx");
+    expect(s.deadActionCount).toBe(1);
+    expect(s.deadActions[0].label).toBe("Add Part");
+    expect(s.deadActions[0].paymentRelated).toBe(false);
+  });
+
+  it("does not flag a button that forwards props with a spread", () => {
+    const code = `<button data-slot="button" className={cn(variants({ variant }))} {...props} />`;
+    const s = runDeterministicScan(code, "components/ui/button.tsx");
+    expect(s.deadActionCount).toBe(0);
+  });
+
+  it("does not flag a button with an onClick handler", () => {
+    const code = `<Button onClick={handleDiagnosis} disabled={loading || !symptoms.trim()}>Diagnose</Button>`;
+    const s = runDeterministicScan(code, "app/dashboard/diagnostics/diagnostics-client.tsx");
+    expect(s.deadActionCount).toBe(0);
+  });
+
+  it("does not flag a submit button inside a form", () => {
+    const code = `<form onSubmit={handleSubmit}>\n  <Button type="submit">Save</Button>\n</form>`;
+    const s = runDeterministicScan(code, "app/customer/request/request-client.tsx");
+    expect(s.deadActionCount).toBe(0);
+  });
+
+  it("does not flag a disabled button", () => {
+    const code = `<Button disabled>Save</Button>`;
+    const s = runDeterministicScan(code, "app/dashboard/settings/settings-client.tsx");
+    expect(s.deadActionCount).toBe(0);
+  });
+
+  it("does not flag an asChild button wrapping a link", () => {
+    const code = `<Button asChild size="lg">\n  <Link href="/customer/request">Submit Diagnostic Request</Link>\n</Button>`;
+    const s = runDeterministicScan(code, "app/customer/page.tsx");
+    expect(s.deadActionCount).toBe(0);
+  });
+
+  it("does not flag a button wrapped in a link", () => {
+    const code = `<Link href="/customer">\n  <Button variant="outline">Customer Portal</Button>\n</Link>`;
+    const s = runDeterministicScan(code, "app/page.tsx");
+    expect(s.deadActionCount).toBe(0);
+  });
+
+  it("does not flag a link with an href, but flags a bare anchor", () => {
+    const wired = runDeterministicScan(`<a href="/pricing">View pricing</a>`, "app/page.tsx");
+    expect(wired.deadActionCount).toBe(0);
+    const dead = runDeterministicScan(`<a>Click here</a>`, "app/page.tsx");
+    expect(dead.deadActionCount).toBe(1);
+    expect(dead.deadActions[0].label).toBe("Click here");
+    expect(dead.deadActions[0].paymentRelated).toBe(false);
+  });
+
+  it("does not run the JSX pass on non-JSX files", () => {
+    const s = runDeterministicScan(`// <Button>Get Started</Button>`, "server/routes/billing.ts");
+    expect(s.deadActionCount).toBe(0);
+  });
+
+  // Mocked payments (Rule 2): a checkout route that records the sale as
+  // complete without calling any payment provider.
+  const CHECKOUT_NO_PROVIDER = `import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@/lib/supabase/server'
+
+export async function POST(request: NextRequest) {
+  const { cart, paymentMethod } = await request.json()
+  const supabase = await createClient()
+  const { data: sale } = await supabase.from('sales').insert({
+    organization_id: 'org-1',
+    total: 99,
+    payment_method: paymentMethod,
+    status: 'completed',
+  }).select().single()
+  return NextResponse.json({ success: true, saleId: sale.id })
+}`;
+
+  it("flags a checkout route that marks sales complete with no provider", () => {
+    const s = runDeterministicScan(CHECKOUT_NO_PROVIDER, "app/api/checkout/route.ts");
+    expect(s.mockedPaymentCount).toBe(1);
+    expect(s.mockedPayments[0].code).toContain("status: 'completed'");
+  });
+
+  it("does not flag a checkout route that calls Stripe", () => {
+    const withStripe = `import Stripe from 'stripe'
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!)
+export async function POST(request: NextRequest) {
+  const session = await stripe.checkout.sessions.create({ mode: 'payment' })
+  await db.insert({ status: 'completed' })
+}`;
+    const s = runDeterministicScan(withStripe, "app/api/checkout/route.ts");
+    expect(s.mockedPaymentCount).toBe(0);
+  });
+
+  it("does not flag a completed status outside a checkout route", () => {
+    const s = runDeterministicScan(`const order = { status: 'completed' }`, "app/dashboard/orders/page.tsx");
+    expect(s.mockedPaymentCount).toBe(0);
+  });
+
   it("does not flag bare mock/simulated keywords in comments as stubs", () => {
     const s = runDeterministicScan(
       `// Returns simulated data for the preview pane\n// mock response shape documented here\nconst data = await fetchReal();`,

@@ -64,9 +64,29 @@ export interface MissingFeatureFact {
   evidence: string[];
 }
 
+/**
+ * A deterministic finding that is not a PreFlight probe result: a dead
+ * payment button (liability — severity high) or a mocked-payment route
+ * (flagged, not established — `unverified: true`, so the report builder
+ * routes it to "needs developer verification" instead of liabilities).
+ * Carried to the client through `deterministicAssessment.findings` and
+ * appended to the audit input's `findings` by intelResultToFinalReadInput.
+ */
+export interface DeterministicFinding {
+  severity: "high" | "medium";
+  title: string;
+  file: string;
+  line: number | null;
+  probe: string;
+  evidence: string;
+  remediation: string;
+  unverified?: boolean;
+}
+
 export interface DeterministicAssessment {
   categories: Record<CategoryKey, CategoryResult>;
   missingFeatures: MissingFeatureFact[];
+  deterministicFindings: DeterministicFinding[];
   completenessScore: number; // rescaled to 0-100 over the applicable categories
   applicableCount: number; // how many of the 10 categories apply (for "N of 10" display)
   capsApplied: string[];
@@ -881,7 +901,7 @@ function categoryForPath(path: string, content: string): string {
   const p = path.toLowerCase();
   const c = content.toLowerCase();
   if (/auth|login|session|user/i.test(p) || /auth|login/.test(c.slice(0, 200))) return CATEGORY_LABELS.authentication;
-  if (/stripe|payment|billing|checkout|webhook/i.test(p)) return CATEGORY_LABELS.externalIntegrations;
+  if (/stripe|payment|billing|checkout|pricing|webhook/i.test(p)) return CATEGORY_LABELS.externalIntegrations;
   if (/db|database|prisma|drizzle|migration|schema/i.test(p)) return CATEGORY_LABELS.databaseLayer;
   return CATEGORY_LABELS.coreLogic;
 }
@@ -956,6 +976,22 @@ function computeMissingFeatures(
   stubItems.sort(byPathLine);
   todoItems.sort(byPathLine);
 
+  // Dead action elements: an interactive element with no wiring. Payment
+  // ones are liabilities (they become deterministic findings, below), never
+  // missing features — listing them twice would double-count one defect.
+  const deadItems: { path: string; line: string; label: string }[] = [];
+  for (const f of sig.files) {
+    for (const d of f.analysis.deadActions) {
+      if (!d.paymentRelated) deadItems.push({ path: f.path, line: d.lines, label: d.label });
+    }
+  }
+  deadItems.sort(byPathLine);
+  for (const d of deadItems.slice(0, 8)) {
+    push(`Wire up the dead "${d.label}" button in ${d.path}`, categoryForPath(d.path, d.label), [
+      anchor(d.path, d.line),
+    ]);
+  }
+
   for (const s of stubItems.slice(0, 8)) {
     const f = sig.files.find((x) => x.path === s.path)!;
     push(`Finish stubbed implementation in ${s.path}`, categoryForPath(s.path, s.code), [
@@ -968,6 +1004,69 @@ function computeMissingFeatures(
   }
 
   return out.slice(0, 15);
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic findings: dead payment buttons and mocked-payment routes,
+// surfaced as report findings (not missing features) so the report builder
+// buckets them correctly — dead payment buttons as liabilities, mocked
+// payments as needs-verification (unverified: true).
+// ---------------------------------------------------------------------------
+
+function computeDeterministicFindings(sig: WorkspaceSignals): DeterministicFinding[] {
+  const out: DeterministicFinding[] = [];
+  const byPathLine = (a: { path: string; line: string }, b: { path: string; line: string }) =>
+    a.path < b.path ? -1 : a.path > b.path ? 1 : parseInt(a.line) - parseInt(b.line) || 0;
+
+  // Dead payment buttons: a liability. The button cannot do anything, so a
+  // customer cannot complete a purchase — a revenue-blocking defect, not a
+  // missing feature.
+  const deadPayment: { path: string; line: string; label: string; code: string }[] = [];
+  for (const f of sig.files) {
+    for (const d of f.analysis.deadActions) {
+      if (d.paymentRelated) {
+        deadPayment.push({ path: f.path, line: d.lines, label: d.label, code: d.code });
+      }
+    }
+  }
+  deadPayment.sort(byPathLine);
+  for (const d of deadPayment) {
+    out.push({
+      severity: "high",
+      title: `Dead "${d.label}" button — no handler, customers cannot complete a purchase`,
+      file: d.path,
+      line: parseInt(d.line) || null,
+      probe: "Dead Action",
+      evidence: `${d.path}:${d.line} ${d.code} — no onClick, href, or link: the button does nothing when clicked.`,
+      remediation: "Wire the button to the checkout flow, or remove it if the plan is not purchasable.",
+    });
+  }
+
+  // Mocked payments: flagged, never asserted. A POS/cash/terminal flow
+  // records sales the same way legitimately — the developer confirms which
+  // one it is, so this carries unverified: true and the report builder
+  // routes it to needsVerification instead of liabilities.
+  const mocked: { path: string; line: string; code: string }[] = [];
+  for (const f of sig.files) {
+    for (const m of f.analysis.mockedPayments) {
+      mocked.push({ path: f.path, line: m.lines, code: m.code });
+    }
+  }
+  mocked.sort(byPathLine);
+  for (const m of mocked) {
+    out.push({
+      severity: "medium",
+      title: "Checkout records sales as complete with no payment provider call",
+      file: m.path,
+      line: parseInt(m.line) || null,
+      probe: "Mocked Payment",
+      evidence: `${m.path}:${m.line} ${m.code}`,
+      remediation:
+        "This checkout records the sale as complete, but no payment provider is called in this route — confirm how payment is actually taken (card terminal, manual invoicing, cash). If nothing takes payment, the sale is recorded as paid without money moving.",
+      unverified: true,
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1241,29 @@ export function computeDeterministicAssessment(
     capsApplied.push("CAP C (Stripe without webhook: −4 externalIntegrations, −4 databaseLayer)");
   }
 
+  // Dead payment buttons: the payments/integrations category is docked to
+  // half-built (at most 5/10) — a customer cannot complete a purchase, so
+  // the integration cannot read as finished. A category already lower
+  // (dangling refs score 3) stays lower: this is a cap, not a floor. The
+  // evidence line names the dead button even when the score does not move,
+  // so the Q&A can retrieve it.
+  const deadPaymentActions = sig.files.flatMap((f) =>
+    f.analysis.deadActions.filter((d) => d.paymentRelated).map((d) => ({ path: f.path, ...d }))
+  );
+  if (deadPaymentActions.length > 0) {
+    const first = deadPaymentActions[0];
+    const evidenceLine = `Dead payment button: ${first.path}:${first.lines} "${first.label}" (no handler — customers cannot complete a purchase)`;
+    const before = categories.externalIntegrations.score;
+    categories.externalIntegrations = {
+      ...categories.externalIntegrations,
+      score: Math.min(before, 5),
+      evidence: [...categories.externalIntegrations.evidence, evidenceLine],
+    };
+    if (before > 5) {
+      capsApplied.push("Dead payment button(s): externalIntegrations capped at 5/10");
+    }
+  }
+
   // Finding↔category reconciliation: a critical/high finding caps every
   // rubric category it touches, so a 10/10 can never sit next to a
   // critical finding in the same category.
@@ -1198,6 +1320,7 @@ export function computeDeterministicAssessment(
   }
 
   const missingFeatures = computeMissingFeatures(sig, categories);
+  const deterministicFindings = computeDeterministicFindings(sig);
   // The total is rescaled to 0-100 over the applicable categories only, so an
   // N/A category neither inflates nor deflates the score. applicableCount is
   // exposed so the report can show "N of 10 categories applicable".
@@ -1208,7 +1331,7 @@ export function computeDeterministicAssessment(
   if (totalCap !== null) completenessScore = Math.min(completenessScore, totalCap);
   const importMap = sig.files.map((f) => ({ path: f.path, imports: f.imports.slice(0, 40) }));
 
-  return { categories, missingFeatures, completenessScore, applicableCount, capsApplied, importMap };
+  return { categories, missingFeatures, deterministicFindings, completenessScore, applicableCount, capsApplied, importMap };
 }
 
 // ---------------------------------------------------------------------------

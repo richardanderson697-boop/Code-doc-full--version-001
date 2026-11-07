@@ -16,6 +16,20 @@ export interface ScanIssue {
   code: string;
 }
 
+/**
+ * One interactive element that promises an action but has no wiring in
+ * the code — no onClick, no href, no asChild link, not a submit button in
+ * a form. Dead by construction: clicking it cannot do anything. The
+ * Automate-AI pricing page is the motivating case (three "Get Started"
+ * buttons, zero handlers, 2026-11-07).
+ */
+export interface DeadActionIssue {
+  lines: string;
+  code: string; // opening tag, trimmed, capped
+  label: string; // visible text, or "icon-only button"
+  paymentRelated: boolean;
+}
+
 export interface DeterministicAnalysis {
   endpointCount: number;
   fetchCount: number;
@@ -26,6 +40,8 @@ export interface DeterministicAnalysis {
   usesProcessEnvPort: boolean;
   anyCount: number;
   testCount: number;
+  deadActionCount: number;
+  mockedPaymentCount: number;
   // Coverage was reduced: the input was longer than the byte cap, or some
   // lines were longer than the line cap. Reported rather than hidden.
   truncated: boolean;
@@ -39,6 +55,241 @@ export interface DeterministicAnalysis {
   hardcodedPorts: ScanIssue[];
   anyUsages: ScanIssue[];
   tests: ScanIssue[];
+  deadActions: DeadActionIssue[];
+  mockedPayments: ScanIssue[];
+}
+
+// ---------------------------------------------------------------------------
+// Dead action elements (Rule 1) + mocked payments (Rule 2).
+// Spec: finalread-dead-action-mocked-payment-detection-spec.md.
+// ---------------------------------------------------------------------------
+
+const JSX_FILE = /\.(tsx|jsx)$/i;
+// A button/link label that promises a purchase, or a pricing/checkout page
+// — either makes the dead element payment-related.
+const PAYMENT_LABEL =
+  /\b(buy|checkout|pay|subscribe|upgrade|purchase|get\s+started|start\s+(free\s+)?trial)\b/i;
+const PAYMENT_PATH = /(pricing|checkout|billing|subscribe|payment)/i;
+const API_ROUTE_FILE =
+  /(^|\/)app\/api\/.+\/route\.(ts|tsx|js|jsx)$|(^|\/)pages\/api\/.+\.(ts|tsx|js|jsx)$|(^|\/)server\/routes\/.+\.(ts|js)$|(^|\/)routes\/.+\.(ts|js)$/;
+// A payment provider actually being used: an import/require of the
+// provider module, a `new Provider(` construction, or a member call
+// (`stripe.charges.create`). A bare word mention (a comment, a label)
+// does not count — that would suppress the flag on a guess. The reverse
+// error (a comment containing `stripe.charges.create` suppressing a real
+// flag) is the safe direction: a missed flag, never a false one.
+const PAYMENT_PROVIDER_USE =
+  /\bimport\s+[^;]*\b(stripe|paypal|square|paddle|lemonsqueezy|braintree)\b|\brequire\s*\([^)]*\b(stripe|paypal|square|paddle|lemonsqueezy|braintree)\b|\bnew\s+(Stripe|PayPal|Square)\s*\(|\b(stripe|paypal|square|paddle|lemonsqueezy|braintree)\s*\.\s*\w+/i;
+const COMPLETED_STATUS = /\bstatus\s*:\s*['"](completed|paid|success)['"]/;
+
+// Scan one JSX opening tag starting at `start` (`<Button`, `<button`,
+// `<a`): the tag ends at the first `>` at brace depth 0 outside quotes.
+// Bounded (2000 chars) so a malformed tag cannot run the scanner.
+function parseJsxTag(code: string, start: number): { end: number; tagText: string } | null {
+  const CAP = 2000;
+  let j = start + 1;
+  let depth = 0;
+  let q: string | null = null;
+  while (j < code.length && j - start <= CAP) {
+    const c = code[j];
+    if (q) {
+      if (c === "\\") {
+        j += 2;
+        continue;
+      }
+      if (c === q) q = null;
+      j++;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      q = c;
+      j++;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    else if (c === ">" && depth === 0) {
+      return { end: j, tagText: code.slice(start, j + 1) };
+    }
+    j++;
+  }
+  return null;
+}
+
+// True when the last opening tag of this kind in `text` comes after the
+// last closing tag — i.e. the element is still open and wraps whatever
+// follows. Window is the caller's slice (400 chars), which covers the
+// real-world shape (a Link immediately wrapping a Button); a Link opened
+// far above is a documented miss, not a silent false positive.
+function lastOpenBeforeClose(text: string, openRe: RegExp, closeTag: string): boolean {
+  let lastOpen = -1;
+  let m: RegExpExecArray | null;
+  openRe.lastIndex = 0;
+  while ((m = openRe.exec(text)) !== null) lastOpen = m.index;
+  const lastClose = text.lastIndexOf(closeTag);
+  return lastOpen !== -1 && lastOpen > lastClose;
+}
+
+function findDeadActions(code: string, filePath: string): DeadActionIssue[] {
+  if (!JSX_FILE.test(filePath)) return [];
+  const paymentPage = PAYMENT_PATH.test(filePath);
+  const out: DeadActionIssue[] = [];
+  const n = code.length;
+  let i = 0;
+  let line = 1;
+  // Scanner state: code, or inside a comment/string. Template literals
+  // are treated as strings whole, so a `<Button` inside a `${...}`
+  // interpolation is missed — safe direction, documented.
+  let state: "code" | "lineComment" | "blockComment" | "string" = "code";
+  let quote = "";
+
+  const tagNameAt = (pos: number): string | null => {
+    if (code[pos] !== "<") return null;
+    for (const name of ["Button", "button", "a"]) {
+      if (code.startsWith(name, pos + 1)) {
+        const after = code[pos + 1 + name.length] ?? "";
+        if (after === "" || /[\s>/]/.test(after)) return name;
+      }
+    }
+    return null;
+  };
+
+  while (i < n) {
+    const ch = code[i];
+    if (state === "lineComment") {
+      if (ch === "\n") {
+        state = "code";
+        line++;
+      }
+      i++;
+      continue;
+    }
+    if (state === "blockComment") {
+      if (ch === "\n") line++;
+      if (ch === "*" && code[i + 1] === "/") {
+        state = "code";
+        i += 2;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (state === "string") {
+      if (ch === "\\") {
+        i += 2;
+        continue;
+      }
+      if (ch === "\n") line++;
+      if (ch === quote) state = "code";
+      i++;
+      continue;
+    }
+    // state === "code"
+    if (ch === "/" && code[i + 1] === "/") {
+      state = "lineComment";
+      i += 2;
+      continue;
+    }
+    if (ch === "/" && code[i + 1] === "*") {
+      state = "blockComment";
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      state = "string";
+      quote = ch;
+      i++;
+      continue;
+    }
+    if (ch === "\n") {
+      line++;
+      i++;
+      continue;
+    }
+    const name = tagNameAt(i);
+    if (!name) {
+      i++;
+      continue;
+    }
+    const tagStart = i;
+    const tagLine = line;
+    const parsed = parseJsxTag(code, i);
+    if (!parsed) {
+      i++;
+      continue;
+    }
+    for (let k = i; k <= parsed.end; k++) if (code[k] === "\n") line++;
+    i = parsed.end + 1;
+    const tagText = parsed.tagText;
+
+    // A disabled button promises nothing — excluded outright.
+    if (/\bdisabled\b/.test(tagText)) continue;
+    // A props spread ({...props}, {...rest}) forwards whatever the caller
+    // passed — including onClick — so the element is wired by the caller,
+    // not dead. This is how shared components (shadcn Button renders
+    // `<Comp ... {...props} />`) stay out of the results.
+    const hasHandler =
+      /\bonClick\s*=/.test(tagText) ||
+      /\bhref\s*=/.test(tagText) ||
+      /\bonSubmit\s*=/.test(tagText) ||
+      /\{\.\.\./.test(tagText);
+    if (hasHandler) continue;
+
+    // Children (bounded window): the label, and the asChild link check.
+    const closeTag = `</${name}>`;
+    const closeIdx = code.indexOf(closeTag, parsed.end + 1);
+    const children =
+      closeIdx !== -1 && closeIdx - (parsed.end + 1) <= 2000
+        ? code.slice(parsed.end + 1, closeIdx)
+        : "";
+    const label = children
+      .replace(/<[^>]*>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 60);
+
+    const before = code.slice(Math.max(0, tagStart - 400), tagStart);
+    const wrappedInLink =
+      lastOpenBeforeClose(before, /<Link\b[^>]*\bhref\s*=/g, "</Link>") ||
+      lastOpenBeforeClose(before, /<a\b[^>]*\bhref\s*=/g, "</a>");
+    if (wrappedInLink) continue;
+    const asChildWired =
+      /\basChild\b/.test(tagText) && /<(Link|a)\b[^>]*\bhref\s*=/.test(children);
+    if (asChildWired) continue;
+    if (
+      /\btype\s*=\s*["']submit["']/.test(tagText) &&
+      lastOpenBeforeClose(before, /<form\b[^>]*>/g, "</form>")
+    ) {
+      continue;
+    }
+
+    out.push({
+      lines: String(tagLine),
+      code: tagText.replace(/\s+/g, " ").trim().slice(0, 120),
+      label: label || "icon-only button",
+      paymentRelated: PAYMENT_LABEL.test(label) || paymentPage,
+    });
+  }
+  return out;
+}
+
+function findMockedPayments(code: string, filePath: string): ScanIssue[] {
+  if (!API_ROUTE_FILE.test(filePath)) return [];
+  if (!/(checkout|payment|purchase|subscribe|billing)/i.test(filePath)) return [];
+  // A provider call anywhere in the file means payment is taken here —
+  // the route is not mocked. Checked first so the status lines below
+  // only fire on genuinely provider-free routes.
+  if (PAYMENT_PROVIDER_USE.test(code)) return [];
+  const out: ScanIssue[] = [];
+  const lines = code.split("\n");
+  lines.forEach((raw, idx) => {
+    if (raw.length > MAX_SCAN_LINE_CHARS) return;
+    const line = raw.trim();
+    if (COMPLETED_STATUS.test(line)) {
+      out.push({ lines: String(idx + 1), code: line.slice(0, 200) });
+    }
+  });
+  return out;
 }
 
 export function runDeterministicScan(code: string, filePath = ""): DeterministicAnalysis {
@@ -138,6 +389,11 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     }
   }
 
+  // Rule 1 + Rule 2 run over the whole file (element context spans
+  // lines), not in the per-line loop above.
+  const deadActions = findDeadActions(bounded, filePath);
+  const mockedPayments = findMockedPayments(bounded, filePath);
+
   return {
     truncated: bounded.length < code.length,
     skippedLines,
@@ -150,6 +406,8 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     usesProcessEnvPort,
     anyCount: anyUsages.length,
     testCount: tests.length,
+    deadActionCount: deadActions.length,
+    mockedPaymentCount: mockedPayments.length,
     endpoints,
     fetchCalls,
     todos,
@@ -157,6 +415,8 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     stubs,
     hardcodedPorts,
     anyUsages,
-    tests
+    tests,
+    deadActions,
+    mockedPayments,
   };
 }
