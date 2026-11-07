@@ -242,13 +242,24 @@ export default function FinalReadOverlay({
 }) {
   const report = useMemo(() => buildFinalReadReport(audit), [audit]);
 
-  // Q&A state
+  // Q&A state — a thread, not a single answer. Each turn keeps its
+  // question, answer, cited findings, and decline state, so follow-ups
+  // resolve against what was already said. The thread is sent with each
+  // ask as history; the server holds no conversation state. Closing the
+  // overlay ends the thread — the downloaded Q&A log is the durable record.
+  type QaTurn = {
+    question: string;
+    answer: string;
+    citedFindings: string[];
+    declined: boolean;
+    declineTier: string | null;
+    kind: "answer" | "starter" | "runtime" | "no-estimates";
+  };
   const [question, setQuestion] = useState("");
   const [qaPhase, setQaPhase] = useState<QaPhase>("idle");
-  const [qaAnswer, setQaAnswer] = useState("");
-  const [qaDeclined, setQaDeclined] = useState(false);
+  const [qaThread, setQaThread] = useState<QaTurn[]>([]);
   const [qaError, setQaError] = useState("");
-  const [speaking, setSpeaking] = useState(false);
+  const [speakingIdx, setSpeakingIdx] = useState<number | null>(null);
   const [listening, setListening] = useState(false);
 
   // Handoff state: liability findings with a file location, all checked.
@@ -291,20 +302,45 @@ export default function FinalReadOverlay({
     if (!trimmed || qaPhase === "loading") return;
     setQaPhase("loading");
     setQaError("");
-    setQaAnswer("");
-    setQaDeclined(false);
+    setQuestion("");
     stopSpeech();
-    setSpeaking(false);
+    setSpeakingIdx(null);
     try {
       const res = await apiFetch("/api/finalread/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ question: trimmed, audit }),
+        body: JSON.stringify({
+          question: trimmed,
+          audit,
+          history: qaThread.map((t) => ({
+            question: t.question,
+            answer: t.answer,
+            citedFindings: t.citedFindings,
+          })),
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Could not get an answer.");
-      setQaAnswer(String(data.answer || ""));
-      setQaDeclined(!!data.declined);
+      const kind: QaTurn["kind"] = data.starter
+        ? "starter"
+        : data.runtime
+          ? "runtime"
+          : data.noEstimates
+            ? "no-estimates"
+            : "answer";
+      setQaThread((prev) => [
+        ...prev,
+        {
+          question: trimmed,
+          answer: String(data.answer || ""),
+          citedFindings: Array.isArray(data.citedFindings)
+            ? data.citedFindings.map((c: any) => String(c))
+            : [],
+          declined: !!data.declined,
+          declineTier: typeof data.declineTier === "string" ? data.declineTier : null,
+          kind,
+        },
+      ]);
       setQaPhase("done");
     } catch (err: any) {
       setQaError(err?.message || "Could not get an answer.");
@@ -312,16 +348,17 @@ export default function FinalReadOverlay({
     }
   };
 
-  const toggleSpeak = () => {
-    if (speaking) {
+  const toggleSpeak = (idx: number, answer: string) => {
+    if (speakingIdx === idx) {
       stopSpeech();
-      setSpeaking(false);
+      setSpeakingIdx(null);
       return;
     }
-    const utterance = speakText(qaAnswer);
+    stopSpeech();
+    const utterance = speakText(answer);
     if (utterance) {
-      setSpeaking(true);
-      utterance.onend = () => setSpeaking(false);
+      setSpeakingIdx(idx);
+      utterance.onend = () => setSpeakingIdx(null);
     }
   };
 
@@ -379,6 +416,44 @@ export default function FinalReadOverlay({
       generatedAt: new Date().toISOString(),
     });
     downloadMarkdown(`finalread-handoff-${selected.length}-findings.md`, markdown);
+  };
+
+  // Session-log export: the full Q&A transcript as Markdown, generated
+  // client-side from the thread. Free, buyer-initiated, no server call.
+  // The report PDF stays Q&A-free — the log is a separate artifact.
+  const downloadQaLog = () => {
+    if (qaThread.length === 0) return;
+    const date = new Date().toISOString().slice(0, 10);
+    const lines: string[] = [];
+    lines.push("# FinalRead Q&A log");
+    lines.push(`Review: ${report.projectTitle} — ${date}`);
+    lines.push("");
+    qaThread.forEach((turn, i) => {
+      lines.push(`## Q${i + 1}: ${turn.question}`);
+      lines.push(turn.answer);
+      if (turn.citedFindings.length > 0) {
+        lines.push(`Cited: ${turn.citedFindings.join("; ")}`);
+      }
+      if (turn.declined) {
+        lines.push(turn.declineTier ? `[Declined: ${turn.declineTier}]` : "[Declined]");
+      }
+      if (turn.kind === "starter") {
+        lines.push("[Deterministic starter answer — no charge]");
+      }
+      if (turn.kind === "no-estimates") {
+        lines.push("[Fixed reply — no charge]");
+      }
+      lines.push("");
+    });
+    downloadMarkdown(`finalread-qa-log-${date}.md`, lines.join("\n"));
+  };
+
+  const startNewConversation = () => {
+    stopSpeech();
+    setSpeakingIdx(null);
+    setQaThread([]);
+    setQaError("");
+    setQaPhase("idle");
   };
 
   const scoreColor =
@@ -542,7 +617,8 @@ export default function FinalReadOverlay({
               <MessageCircle className="w-4 h-4" /> Ask about this review
             </p>
             <p className="text-xs text-slate-500 mb-3">
-              Answers come from the review above — never invented. Cost and time
+              Answers come from the review above — never invented. Ask
+              follow-ups; the conversation carries context. Cost and time
               estimates are never given, by design.
             </p>
             <div className="flex flex-wrap gap-2 mb-3">
@@ -599,28 +675,59 @@ export default function FinalReadOverlay({
             {qaPhase === "error" && (
               <p className="mt-3 text-[13px] text-rose-600">{qaError}</p>
             )}
-            {qaPhase === "done" && qaAnswer && (
-              <div className="mt-3 bg-slate-50 border border-slate-200 rounded-lg p-3">
-                <div className="flex items-start justify-between gap-2">
-                  <p className="text-[14px] text-slate-800 leading-relaxed flex-1">
-                    {qaDeclined && (
-                      <span className="font-semibold">Not covered by this review — </span>
-                    )}
-                    {qaAnswer}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={toggleSpeak}
-                    aria-label={speaking ? "Stop reading aloud" : "Read answer aloud"}
-                    className="p-2 rounded-lg text-indigo-600 hover:bg-indigo-50 shrink-0"
+            {qaThread.length > 0 && (
+              <div className="mt-3 space-y-3">
+                {qaThread.map((turn, i) => (
+                  <div
+                    key={i}
+                    className="bg-slate-50 border border-slate-200 rounded-lg p-3"
                   >
-                    {speaking ? (
-                      <Square className="w-4 h-4" />
-                    ) : (
-                      <Volume2 className="w-4 h-4" />
-                    )}
-                  </button>
-                </div>
+                    <p className="text-[13px] font-semibold text-slate-700 mb-1">
+                      {turn.question}
+                    </p>
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-[14px] text-slate-800 leading-relaxed flex-1">
+                        {turn.declined && (
+                          <span className="font-semibold">Not covered by this review — </span>
+                        )}
+                        {turn.answer}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => toggleSpeak(i, turn.answer)}
+                        aria-label={
+                          speakingIdx === i ? "Stop reading aloud" : "Read answer aloud"
+                        }
+                        className="p-2 rounded-lg text-indigo-600 hover:bg-indigo-50 shrink-0"
+                      >
+                        {speakingIdx === i ? (
+                          <Square className="w-4 h-4" />
+                        ) : (
+                          <Volume2 className="w-4 h-4" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {qaThread.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={downloadQaLog}
+                  className="flex items-center gap-1.5 px-3 py-2 text-sm font-semibold rounded-lg bg-slate-800 text-white hover:bg-slate-700"
+                >
+                  <Download className="w-4 h-4" />
+                  Download Q&A log
+                </button>
+                <button
+                  type="button"
+                  onClick={startNewConversation}
+                  className="px-3 py-2 text-sm font-semibold rounded-lg bg-white border border-slate-300 text-slate-700 hover:bg-slate-50"
+                >
+                  Start a new conversation
+                </button>
               </div>
             )}
           </div>

@@ -61,6 +61,7 @@ import {
   doubleCheckPrompt,
   pickVerificationModel,
   starterAnswer,
+  validateQaHistory,
 } from "../../shared/finalread-qa";
 
 import type { GenerateContentConfig } from "@google/genai";
@@ -104,6 +105,8 @@ function systemPrompt(context: string): string {
     `- Answer ONLY from the review below. Every claim must trace to a finding, bucket, verdict, or the warehouse ` +
     `detail (APPLICATION MAP, CATEGORY DETAIL, FILE LEDGER) in it.\n` +
     `- Cite the exact finding titles you relied on in citedFindings.\n` +
+    `- The CONVERSATION SO FAR section, when present, is prior discussion — use it to resolve follow-up references ` +
+    `("the second one you mentioned", "that"), but it is not evidence: cite only findings from THE REVIEW, never a line from the conversation.\n` +
     `- The four starter questions always map to review sections — never decline them as uncovered: ` +
     `"Is this app actually finished?" → the verdict and completeness score; ` +
     `"What's the biggest risk?" → the highest-severity liabilities; ` +
@@ -262,13 +265,24 @@ router.post(
   requireAuth,
   requireCredits("finalreadAsk"),
   asyncRoute(async (req: AuthedRequest, res) => {
-    const { question, audit } = req.body || {};
+    const { question, audit, history: rawHistory } = req.body || {};
     if (!question || typeof question !== "string" || !question.trim()) {
       return res.status(400).json({ error: "A question is required" });
     }
     if (!audit || typeof audit !== "object") {
       return res.status(400).json({ error: "An audit result is required to answer from" });
     }
+    // History is client-held and sent with each ask; the server holds no
+    // conversation state. Malformed history is rejected before any
+    // shortcut or model call. The deterministic shortcuts below ignore
+    // history entirely — a follow-up that IS a runtime question still gets
+    // the fixed runtime decline, never an answer built from the previous
+    // turn's line numbers.
+    const validated = validateQaHistory(rawHistory);
+    if (validated.ok === false) {
+      return res.status(400).json({ error: validated.error });
+    }
+    const history = validated.history;
 
     // 1. Cost/time/effort questions: fixed reply, no model call, no charge.
     if (isNoEstimatesQuestion(question)) {
@@ -310,14 +324,16 @@ router.post(
         declined: true,
         answer: RUNTIME_DECLINE_REPLY,
         citedFindings: [],
+        declineTier: "runtime",
         runtime: true,
       });
     }
 
     // 3. Grounded model call with retries. Failed attempts are never charged.
     // The question rides into the context so question-matching warehouse
-    // lines survive the runaway ceiling ahead of unrelated lines.
-    const prompt = systemPrompt(buildQaContext(report, question));
+    // lines survive the runaway ceiling ahead of unrelated lines; the
+    // conversation rides in after the report, under its own cap.
+    const prompt = systemPrompt(buildQaContext(report, question, history));
     let parsed: any = null;
     let lastResponse: any = null;
     let modelName = "";
@@ -393,6 +409,7 @@ router.post(
           declined: true,
           answer: RUNTIME_DECLINE_REPLY,
           citedFindings: [],
+          declineTier: "runtime",
           runtime: true,
         });
       } else if (parsed.declineTier === "unknown") {
@@ -410,6 +427,7 @@ router.post(
             declined: true,
             answer: outcome.answer,
             citedFindings: [],
+            declineTier: "unknown",
           });
         }
       } else {
@@ -417,6 +435,7 @@ router.post(
           declined: true,
           answer: formatUnknownDecline(false),
           citedFindings: [],
+          declineTier: "unknown",
         });
       }
     }

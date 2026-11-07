@@ -596,6 +596,118 @@ export function selectWarehouseLines(
   return out;
 }
 
+/** Multi-turn conversation history: prior Q&A turns the client holds and
+ *  sends with each ask. The server stays stateless — no conversation store.
+ *  History is context only, never evidence: a follow-up answer's citations
+ *  are still validated against the rebuilt report, never against history. */
+export interface QaHistoryTurn {
+  question: string;
+  answer: string;
+  citedFindings: string[];
+}
+
+export const QA_HISTORY_MAX_TURNS = 6;
+export const QA_HISTORY_MAX_CHARS = 24000;
+const QA_HISTORY_MAX_QUESTION_CHARS = 2000;
+const QA_HISTORY_MAX_ANSWER_CHARS = 20000;
+const QA_HISTORY_MAX_CITATIONS = 100;
+const QA_HISTORY_MAX_CITATION_CHARS = 500;
+const QA_HISTORY_TRUNCATION_NOTE =
+  "(earlier conversation omitted for size — the thread continues above)";
+
+/** Strict shape check for client-sent history. Anything malformed is
+ *  rejected by the route with 400 before any shortcut or model call. */
+export function validateQaHistory(
+  value: unknown
+): { ok: true; history: QaHistoryTurn[] } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, history: [] };
+  if (!Array.isArray(value)) {
+    return { ok: false, error: "History must be a list of previous questions and answers" };
+  }
+  const history: QaHistoryTurn[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return { ok: false, error: "Each history entry must be a question and answer" };
+    }
+    const { question, answer, citedFindings } = entry as Record<string, unknown>;
+    if (
+      typeof question !== "string" ||
+      !question.trim() ||
+      question.length > QA_HISTORY_MAX_QUESTION_CHARS
+    ) {
+      return { ok: false, error: "Each history entry needs a question" };
+    }
+    if (
+      typeof answer !== "string" ||
+      !answer.trim() ||
+      answer.length > QA_HISTORY_MAX_ANSWER_CHARS
+    ) {
+      return { ok: false, error: "Each history entry needs an answer" };
+    }
+    if (!Array.isArray(citedFindings) || citedFindings.length > QA_HISTORY_MAX_CITATIONS) {
+      return { ok: false, error: "Each history entry needs a list of cited findings" };
+    }
+    for (const c of citedFindings) {
+      if (typeof c !== "string" || c.length > QA_HISTORY_MAX_CITATION_CHARS) {
+        return { ok: false, error: "Each history entry needs a list of cited findings" };
+      }
+    }
+    history.push({
+      question: question.trim(),
+      answer: answer.trim(),
+      citedFindings: citedFindings.map((c) => String(c)),
+    });
+  }
+  return { ok: true, history };
+}
+
+/** Conversation lines for the prompt, under the history budget. Most recent
+ *  turns first for retention — oldest drop first when the budget binds. A
+ *  turn stays intact (question with its answer); history lines matching the
+ *  current question survive ahead of unrelated ones, the same question-aware
+ *  retention as the warehouse. Returns [] when there is no history, so the
+ *  context is exactly what it was before. */
+export function selectHistoryLines(
+  history: QaHistoryTurn[],
+  question?: string,
+  budget: number = QA_HISTORY_MAX_CHARS
+): string[] {
+  const turns = history.slice(-QA_HISTORY_MAX_TURNS).reverse();
+  const terms = question ? questionTerms(question) : [];
+  const blocks = turns.map((t) => {
+    const lines = [`Q: ${t.question}`, `A: ${t.answer}`];
+    if (t.citedFindings.length > 0) lines.push(`Cited: ${t.citedFindings.join("; ")}`);
+    return lines;
+  });
+  let ordered: string[];
+  if (terms.length === 0) {
+    ordered = blocks.flat();
+  } else {
+    const first: string[] = [];
+    const rest: string[] = [];
+    for (const block of blocks) {
+      if (block.some((l) => warehouseLineMatches(l, terms))) first.push(...block);
+      else rest.push(...block);
+    }
+    ordered = [...first, ...rest];
+  }
+  const contentBudget = budget - (QA_HISTORY_TRUNCATION_NOTE.length + 1);
+  const out: string[] = [];
+  let used = 0;
+  let truncated = false;
+  for (const line of ordered) {
+    const cost = line.length + 1; // the joining newline
+    if (used + cost > contentBudget) {
+      truncated = true;
+      break;
+    }
+    out.push(line);
+    used += cost;
+  }
+  if (truncated) out.push(QA_HISTORY_TRUNCATION_NOTE);
+  return out;
+}
+
 /** Compact, citable context for the model prompt: verdict, bucket titles,
  *  and the liability details, followed by the warehouse sections — the
  *  deep analysis (application map, the assessor's raw category reasons,
@@ -606,7 +718,11 @@ export function selectWarehouseLines(
  *  evidence so "which?" questions have specifics to stand on — the prompt
  *  tells the model to use the anchors for precision but never quote raw
  *  file paths to the stakeholder. Still excludes code and file contents. */
-export function buildQaContext(report: FinalReadReport, question?: string): string {
+export function buildQaContext(
+  report: FinalReadReport,
+  question?: string,
+  history: QaHistoryTurn[] = []
+): string {
   const lines: string[] = [];
   lines.push(`PROJECT: ${report.projectTitle}`);
   if (report.applicationSummary) {
@@ -664,6 +780,19 @@ export function buildQaContext(report: FinalReadReport, question?: string): stri
   const warehouse = selectWarehouseLines(report, question);
   if (warehouse.length > 0) {
     lines.push(...warehouse);
+  }
+
+  // Conversation history, after the report context so the report always
+  // wins the retention budget. Labelled as prior discussion, never as
+  // findings — the prompt tells the model to resolve follow-up references
+  // against it but cite only the review. No history → no section at all.
+  const historyLines = selectHistoryLines(history, question);
+  if (historyLines.length > 0) {
+    lines.push("CONVERSATION SO FAR:");
+    lines.push(
+      "Prior questions and answers with this stakeholder — use them to resolve follow-up references (\"the second one\", \"that\"), but they are NOT report findings: never cite them as evidence and never treat them as established facts. Cite only findings from THE REVIEW above."
+    );
+    lines.push(...historyLines);
   }
   return lines.join("\n");
 }

@@ -23,6 +23,10 @@ import {
   pickVerificationModel,
   doubleCheckPrompt,
   starterAnswer,
+  validateQaHistory,
+  selectHistoryLines,
+  QA_HISTORY_MAX_TURNS,
+  QA_HISTORY_MAX_CHARS,
 } from "../shared/finalread-qa";
 import { buildFinalReadReport } from "../shared/finalread-report";
 import { intelResultToFinalReadInput } from "../src/components/auditor/FinalReadOverlay";
@@ -899,5 +903,115 @@ describe("needsVerification in Q&A", () => {
       "POST /api/billing/hook — handler delegated out of this file, auth could not be verified",
     ]);
     expect(report.liabilities).toEqual([]);
+  });
+});
+
+describe("validateQaHistory", () => {
+  const turn = {
+    question: "What's the biggest risk?",
+    answer: "The hardcoded secret.",
+    citedFindings: ["Hardcoded secret"],
+  };
+
+  it("accepts missing history as an empty thread", () => {
+    expect(validateQaHistory(undefined)).toEqual({ ok: true, history: [] });
+    expect(validateQaHistory(null)).toEqual({ ok: true, history: [] });
+  });
+
+  it("accepts a well-formed turn", () => {
+    expect(validateQaHistory([turn])).toEqual({ ok: true, history: [turn] });
+  });
+
+  it("rejects a non-list, a non-object entry, and missing fields", () => {
+    expect(validateQaHistory("nope").ok).toBe(false);
+    expect(validateQaHistory([42]).ok).toBe(false);
+    expect(validateQaHistory([{ question: "q" }]).ok).toBe(false);
+    expect(validateQaHistory([{ ...turn, citedFindings: "nope" }]).ok).toBe(false);
+    expect(validateQaHistory([{ ...turn, citedFindings: [1] }]).ok).toBe(false);
+  });
+
+  it("rejects oversize fields", () => {
+    expect(validateQaHistory([{ ...turn, question: "x".repeat(2001) }]).ok).toBe(false);
+    expect(validateQaHistory([{ ...turn, answer: "x".repeat(20001) }]).ok).toBe(false);
+  });
+});
+
+describe("selectHistoryLines", () => {
+  function turn(n: number) {
+    return {
+      question: `Question ${n} about authentication`,
+      answer: `Answer ${n} about the login.`,
+      citedFindings: ["Hardcoded secret"],
+    };
+  }
+
+  it("returns nothing with no history", () => {
+    expect(selectHistoryLines([])).toEqual([]);
+  });
+
+  it(`keeps only the last ${QA_HISTORY_MAX_TURNS} turns, most recent first`, () => {
+    const history = Array.from({ length: 8 }, (_, i) => turn(i + 1));
+    const text = selectHistoryLines(history).join("\n");
+    expect(text).toMatch(/Q: Question 8 about authentication/);
+    expect(text).toMatch(/Q: Question 3 about authentication/);
+    expect(text).not.toMatch(/Q: Question 2 about authentication/);
+    expect(text).not.toMatch(/Q: Question 1 about authentication/);
+  });
+
+  it("drops older turns under a small budget, with the truncation note", () => {
+    const history = [turn(1), turn(2)];
+    const text = selectHistoryLines(history, undefined, 120).join("\n");
+    expect(text).toMatch(/Q: Question 2 about authentication/);
+    expect(text).toMatch(/earlier conversation omitted/);
+    expect(text).not.toMatch(/Q: Question 1 about authentication/);
+  });
+
+  it("keeps a question-matching turn ahead of a newer unrelated one", () => {
+    const history = [
+      { question: "Is authentication real?", answer: "Yes, sign-in works.", citedFindings: [] },
+      { question: "What about the colors?", answer: "Blue.", citedFindings: [] },
+    ];
+    const text = selectHistoryLines(history, "authentication").join("\n");
+    expect(text.indexOf("Is authentication real?")).toBeLessThan(
+      text.indexOf("What about the colors?")
+    );
+  });
+
+  it("never exceeds the character budget", () => {
+    const history = Array.from({ length: 6 }, (_, i) => ({
+      question: `Question ${i} ${"x".repeat(500)}`,
+      answer: `Answer ${i} ${"y".repeat(500)}`,
+      citedFindings: [] as string[],
+    }));
+    const text = selectHistoryLines(history).join("\n");
+    expect(text.length).toBeLessThanOrEqual(QA_HISTORY_MAX_CHARS);
+  });
+});
+
+describe("buildQaContext conversation", () => {
+  const turn = {
+    question: "What's the biggest risk?",
+    answer: "The hardcoded secret.",
+    citedFindings: ["Hardcoded secret"],
+  };
+
+  it("adds a labelled conversation section after the report", () => {
+    const ctx = buildQaContext(sampleReport(), "What about the second one?", [turn]);
+    expect(ctx).toMatch(/CONVERSATION SO FAR/);
+    expect(ctx).toMatch(/NOT report findings/);
+    expect(ctx).toMatch(/Q: What's the biggest risk\?/);
+    expect(ctx.indexOf("COMPLETENESS:")).toBeLessThan(ctx.indexOf("CONVERSATION SO FAR:"));
+  });
+
+  it("adds nothing without history", () => {
+    expect(buildQaContext(sampleReport(), "What about the second one?")).not.toMatch(
+      /CONVERSATION SO FAR/
+    );
+  });
+
+  it("a history-only title is still an unknown citation", () => {
+    expect(unknownCitations(["Quantum flux capacitor"], sampleReport())).toEqual([
+      "Quantum flux capacitor",
+    ]);
   });
 });

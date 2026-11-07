@@ -43,6 +43,7 @@ import finalreadRouter from "../server/routes/finalread";
 import {
   PARTIAL_DECLINE_PREFIX,
   RUNTIME_DECLINE_REPLY,
+  NO_ESTIMATES_REPLY,
   FREE_DECLINE_REPHRASE_NOTE,
   DOUBLE_CHECKED_DECLINE_PREFIX,
 } from "../shared/finalread-qa";
@@ -327,6 +328,107 @@ describe("finalread ask double-check", () => {
     expect(res.body.declined).toBe(true);
     expect(res.body.answer).toContain(FREE_DECLINE_REPHRASE_NOTE);
     expect(res.body.answer).not.toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+});
+
+describe("finalread ask multi-turn conversation", () => {
+  const history = [
+    {
+      question: "What's the biggest risk?",
+      answer: "The biggest risk is the hardcoded secret.",
+      citedFindings: ["Hardcoded secret"],
+    },
+  ];
+
+  it("carries prior turns into the model prompt, after the report, and charges once", async () => {
+    firstCall(groundedCandidate());
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "What about the second finding?", audit, history });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    const contents = String(mockedFallback.mock.calls[0][0].contents);
+    expect(contents).toMatch(/CONVERSATION SO FAR/);
+    expect(contents).toMatch(/Q: What's the biggest risk\?/);
+    expect(contents).toMatch(/A: The biggest risk is the hardcoded secret\./);
+    expect(contents.indexOf("COMPLETENESS:")).toBeLessThan(
+      contents.indexOf("CONVERSATION SO FAR:")
+    );
+    expect(mockedCharge).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects malformed history with 400 and makes no model call", async () => {
+    for (const bad of [
+      "nope",
+      [{ question: 1, answer: "x", citedFindings: [] }],
+      [{ question: "q" }],
+    ]) {
+      const res = await request(app())
+        .post("/api/finalread/ask")
+        .send({ question: "Is this app finished?", audit, history: bad });
+      expect(res.status).toBe(400);
+    }
+    expect(mockedFallback).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("still gives a runtime follow-up the fixed decline, free, with no model call", async () => {
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "What happens if the server goes down?", audit, history });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(true);
+    expect(res.body.answer).toBe(RUNTIME_DECLINE_REPLY);
+    expect(res.body.declineTier).toBe("runtime");
+    expect(mockedFallback).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("still answers a starter pill deterministically as a follow-up, free", async () => {
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "What's the biggest risk?", audit, history });
+    expect(res.status).toBe(200);
+    expect(res.body.starter).toBe(true);
+    expect(res.body.declined).toBe(false);
+    expect(mockedFallback).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("still gives a no-estimates follow-up the fixed reply, free", async () => {
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "How much would it cost to fix?", audit, history });
+    expect(res.status).toBe(200);
+    expect(res.body.noEstimates).toBe(true);
+    expect(res.body.answer).toBe(NO_ESTIMATES_REPLY);
+    expect(mockedFallback).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("declines free when a follow-up answer cites a finding that only exists in history", async () => {
+    const phantomHistory = [
+      {
+        question: "Is there a flux capacitor?",
+        answer: "Yes, the flux capacitor is the biggest risk.",
+        citedFindings: ["Quantum flux capacitor"],
+      },
+    ];
+    firstCall({
+      answer: "The flux capacitor is the biggest risk.",
+      citedFindings: ["Quantum flux capacitor"],
+      insufficientContext: false,
+    });
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({
+        question: "Tell me more about the flux capacitor.",
+        audit,
+        history: phantomHistory,
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(true);
     expect(mockedCharge).not.toHaveBeenCalled();
   });
 });
