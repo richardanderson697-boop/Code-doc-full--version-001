@@ -14,7 +14,7 @@
 // Report structure is intentionally unchanged: the JSON shape the UI renders
 // is identical; only the provenance of the numbers changes.
 
-import { runDeterministicScan, type DeterministicAnalysis } from "./deterministic-scan";
+import { runDeterministicScan, DELIVERY_PROVIDER_USE, type DeterministicAnalysis } from "./deterministic-scan";
 import type { PreFlightReport, PreFlightFinding } from "../shared/preflight-types";
 import type { WorkspaceFile } from "./workspace";
 
@@ -906,6 +906,32 @@ function categoryForPath(path: string, content: string): string {
   return CATEGORY_LABELS.coreLogic;
 }
 
+// A module-scope mutable store holding user-submitted data: `let store =
+// [...]` (or a typed array) mutated by a handler (.unshift/.push). The
+// declaration must start at column 0 — a list declared inside a function
+// body is indented, and a local list is not a store. A static config array
+// or a sample-data seed alone never fires — mutation is the discriminator.
+// Approximation, documented: a mutation with a hardcoded value would also
+// match, but a module-scope array mutated in a server file is a store in
+// practice.
+const STORE_DECL = /^(let|const)\s+([A-Za-z_$][\w$]*)\s*(?::\s*[\w$<>\[\].]+\s*)?=\s*\[/;
+function findInMemoryStores(sig: WorkspaceSignals): { path: string; line: number; name: string }[] {
+  const out: { path: string; line: number; name: string }[] = [];
+  for (const f of sig.files) {
+    if (!isCodeFile(f.path)) continue;
+    const lines = f.strippedContent.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const m = STORE_DECL.exec(lines[i]);
+      if (!m) continue;
+      const name = m[2];
+      const mutation = new RegExp(`\\b${name}\\s*\\.\\s*(unshift|push)\\s*\\(|\\b${name}\\s*\\[`);
+      if (!mutation.test(f.strippedContent)) continue;
+      out.push({ path: f.path, line: i + 1, name });
+    }
+  }
+  return out;
+}
+
 function computeMissingFeatures(
   sig: WorkspaceSignals,
   categories: Record<CategoryKey, CategoryResult>
@@ -933,6 +959,53 @@ function computeMissingFeatures(
   const dbCat = categories.databaseLayer;
   if (dbCat.note === "dangling-db") {
     push("Add database persistence layer", CATEGORY_LABELS.databaseLayer, dbCat.evidence);
+  }
+  // In-memory-only user data: the category is N/A ("no database code and
+  // no persistence references") while the app holds user-submitted data in
+  // server memory. The stores are the evidence — the category's silence
+  // was the gap. Same feature as dangling-db, so the dedupe keeps one.
+  // The N/A note already rules out DB/BaaS implementations; only file
+  // writes are left to check.
+  if (dbCat.note === "not-applicable") {
+    const stores = findInMemoryStores(sig);
+    const writesFiles = sig.files.some(
+      (f) => isCodeFile(f.path) && /writeFile|appendFile|createWriteStream/i.test(f.strippedContent)
+    );
+    if (stores.length > 0 && !writesFiles) {
+      push(
+        "Add database persistence layer",
+        CATEGORY_LABELS.databaseLayer,
+        stores.map(
+          (s) => `${s.path}:${s.line} ${s.name} (in-memory store, mutated by a handler, no persistence layer)`
+        )
+      );
+    }
+  }
+
+  // UI delivery claims with no sending code: copy asserting a completed
+  // delivery while no delivery provider exists anywhere in the repo. Same
+  // repo-wide provider check as Rule A. Capped at 5 — the same claim
+  // repeated across screens is one problem, not five findings.
+  const repoHasDeliveryProvider = sig.files.some(
+    (f) => isCodeFile(f.path) && DELIVERY_PROVIDER_USE.test(f.strippedContent)
+  );
+  if (!repoHasDeliveryProvider) {
+    const claims: { path: string; line: string; code: string }[] = [];
+    for (const f of sig.files) {
+      for (const c of f.analysis.deliveryClaims) {
+        claims.push({ path: f.path, line: c.lines, code: c.code });
+      }
+    }
+    claims.sort((a, b) =>
+      a.path < b.path ? -1 : a.path > b.path ? 1 : parseInt(a.line) - parseInt(b.line) || 0
+    );
+    for (const c of claims.slice(0, 5)) {
+      const quote = c.code.replace(/\s+/g, " ").trim().slice(0, 80);
+      push(`Claimed delivery with no sending code — "${quote}"`, CATEGORY_LABELS.externalIntegrations, [
+        `${c.path}:${c.line} "${quote}"`,
+        "no email/SMS provider in the repo",
+      ]);
+    }
   }
   const autoCat = categories.backgroundAutomation;
   if (autoCat.note === "dangling-automation") {
@@ -1065,6 +1138,39 @@ function computeDeterministicFindings(sig: WorkspaceSignals): DeterministicFindi
         "This checkout records the sale as complete, but no payment provider is called in this route — confirm how payment is actually taken (card terminal, manual invoicing, cash). If nothing takes payment, the sale is recorded as paid without money moving.",
       unverified: true,
     });
+  }
+
+  // Mocked notifications: the same shape as mocked payments, a different
+  // outcome. A notification recorded as delivered with no delivery
+  // provider anywhere in the repo. The provider check is repo-wide — a
+  // provider usually lives in a shared module, unlike a checkout route.
+  // Flagged, never asserted: the delivery could be made by another
+  // service the scan can't see, so this carries unverified: true and the
+  // report builder routes it to needsVerification instead of liabilities.
+  const repoHasDeliveryProvider = sig.files.some(
+    (f) => isCodeFile(f.path) && DELIVERY_PROVIDER_USE.test(f.strippedContent)
+  );
+  if (!repoHasDeliveryProvider) {
+    const mockedNotif: { path: string; line: string; code: string }[] = [];
+    for (const f of sig.files) {
+      for (const m of f.analysis.mockedNotifications) {
+        mockedNotif.push({ path: f.path, line: m.lines, code: m.code });
+      }
+    }
+    mockedNotif.sort(byPathLine);
+    for (const m of mockedNotif) {
+      out.push({
+        severity: "medium",
+        title: "Notification marked delivered with no delivery provider call",
+        file: m.path,
+        line: parseInt(m.line) || null,
+        probe: "Mocked Notification",
+        evidence: `${m.path}:${m.line} ${m.code}`,
+        remediation:
+          "This notification is recorded as delivered, but no email/SMS provider is called in this repo — confirm whether the notification is actually sent (provider, webhook, or manual process). If nothing sends it, the status is only a log entry.",
+        unverified: true,
+      });
+    }
   }
   return out;
 }

@@ -42,6 +42,8 @@ export interface DeterministicAnalysis {
   testCount: number;
   deadActionCount: number;
   mockedPaymentCount: number;
+  mockedNotificationCount: number;
+  deliveryClaimCount: number;
   // Coverage was reduced: the input was longer than the byte cap, or some
   // lines were longer than the line cap. Reported rather than hidden.
   truncated: boolean;
@@ -57,6 +59,8 @@ export interface DeterministicAnalysis {
   tests: ScanIssue[];
   deadActions: DeadActionIssue[];
   mockedPayments: ScanIssue[];
+  mockedNotifications: ScanIssue[];
+  deliveryClaims: ScanIssue[];
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +85,106 @@ const API_ROUTE_FILE =
 const PAYMENT_PROVIDER_USE =
   /\bimport\s+[^;]*\b(stripe|paypal|square|paddle|lemonsqueezy|braintree)\b|\brequire\s*\([^)]*\b(stripe|paypal|square|paddle|lemonsqueezy|braintree)\b|\bnew\s+(Stripe|PayPal|Square)\s*\(|\b(stripe|paypal|square|paddle|lemonsqueezy|braintree)\s*\.\s*\w+/i;
 const COMPLETED_STATUS = /\bstatus\s*:\s*['"](completed|paid|success)['"]/;
+
+// ---------------------------------------------------------------------------
+// Mocked notifications (Rule A) + UI delivery claims (Rule C).
+// Spec: finalread-mocked-delivery-detection-spec.md. The Whistle-stop
+// cleaning app is the motivating case (2026-11-07): the success screen
+// tells the customer their photos "have been sent directly to our
+// administrator", while the server only writes NotificationLogs with
+// status 'Delivered' into an in-memory array — no email/SMS provider
+// anywhere in the repo.
+// ---------------------------------------------------------------------------
+
+// A delivery provider actually being used: an import/require of the
+// provider module, a `new Provider(` construction, or a member call
+// (`transporter.sendMail`, `twilio.messages.create`). Same shape as
+// PAYMENT_PROVIDER_USE. Exported: the score layer applies this repo-wide
+// (a provider usually lives in a shared module, unlike a checkout route),
+// so the scan emits candidates and the score layer filters them.
+export const DELIVERY_PROVIDER_USE =
+  /\bimport\s+[^;]*\b(nodemailer|smtp|resend|sendgrid|mailgun|postmark|ses|twilio|vonage|nexmo|firebase-admin|web-push)\b|\brequire\s*\([^)]*\b(nodemailer|smtp|resend|sendgrid|mailgun|postmark|ses|twilio|vonage|nexmo|firebase-admin|web-push)\b|\bnew\s+(Twilio|Vonage|SES)\s*\(|\b(nodemailer|transporter|resend|sendgrid|mailgun|postmark|ses|twilio|vonage|nexmo|messaging)\s*\.\s*\w+/i;
+const DELIVERED_STATUS = /\bstatus\s*:\s*['"](Delivered|Sent|delivered|sent)['"]/;
+const NOTIFICATION_CHANNEL = /\bchannel\s*:\s*['"](EMAIL|SMS|PUSH|email|sms|push)['"]/i;
+const NOTIFICATION_TYPE = /\w*(Notification|Notif)\w*/;
+
+// A notification recorded as delivered: a status assignment inside a
+// notification/message object — the surrounding literal must mention a
+// delivery channel or a notification type name. The channel/type context
+// is mandatory: a bare `status: 'Delivered'` on an order or shipment
+// object is a business state, not a delivery claim, and must NOT fire.
+// Candidates only: the score layer drops them when any file in the repo
+// uses a delivery provider. No file restriction — a notification log can
+// live in a route, a service, or a store.
+// Two guards against noise, both learned from the Whistle-stop run
+// (2026-11-07): a type union (`status: 'Sent' | 'Delivered'` in an
+// interface) is a declaration, not a recorded delivery — skipped by the
+// pipe check below; seed/fixture/sample data files describe example rows,
+// not app behavior — skipped by path.
+const SEED_DATA_FILE = /(^|\/)(seed|sample|mock|fixture|initialdata)/i;
+function findMockedNotifications(code: string, filePath: string): ScanIssue[] {
+  if (SEED_DATA_FILE.test(filePath)) return [];
+  const out: ScanIssue[] = [];
+  const lines = code.split("\n");
+  lines.forEach((raw, idx) => {
+    if (raw.length > MAX_SCAN_LINE_CHARS) return;
+    const line = raw.trim();
+    if (!DELIVERED_STATUS.test(line)) return;
+    // A union type (`status: 'Sent' | 'Delivered'`) is a declaration,
+    // not a status being recorded — the pipe after the quoted value
+    // gives it away.
+    if (/['"]\s*\|/.test(line)) return;
+    // The object literal holding the status: up to 20 lines back covers
+    // the Whistle-stop shape (channel ~4 lines above the status line).
+    // A comment mentioning "notification" nearby can create a candidate;
+    // the provider filter and the unverified disposition absorb that.
+    const window = lines.slice(Math.max(0, idx - 20), idx + 1).join("\n");
+    if (!NOTIFICATION_CHANNEL.test(window) && !NOTIFICATION_TYPE.test(window)) return;
+    out.push({ lines: String(idx + 1), code: line.slice(0, 200) });
+  });
+  return out;
+}
+
+// UI copy asserting a completed delivery — exact past-tense phrases only.
+// A future promise ("we'll send your quote") does NOT fire: a phrase
+// preceded by a future auxiliary (will/shall/'ll + optional be) is
+// skipped. Candidates only: the score layer drops them when any file in
+// the repo uses a delivery provider. UI copy only — JSX/TSX files — so a
+// server response message is not a claim under this rule.
+const DELIVERY_CLAIM_PHRASES = [
+  "has been sent",
+  "have been sent",
+  "sent directly to",
+  "sent to our administrator",
+  "notification dispatched",
+  "dispatched to",
+];
+const FUTURE_AUX_BEFORE = /\b(will|shall|'ll)\s+(be\s+)?$/i;
+
+function findDeliveryClaims(code: string, filePath: string): ScanIssue[] {
+  if (!JSX_FILE.test(filePath)) return [];
+  const out: ScanIssue[] = [];
+  const lines = code.split("\n");
+  lines.forEach((raw, idx) => {
+    if (raw.length > MAX_SCAN_LINE_CHARS) return;
+    const line = raw.trim();
+    const lower = line.toLowerCase();
+    for (const phrase of DELIVERY_CLAIM_PHRASES) {
+      const at = lower.indexOf(phrase);
+      if (at < 0) continue;
+      // Future-tense guard: "will be sent directly to your door" is a
+      // promise about the future, not a claim of a completed delivery.
+      const before = lower.slice(Math.max(0, at - 25), at);
+      if (FUTURE_AUX_BEFORE.test(before)) continue;
+      // The issue's code starts at the claim itself, so the finding's
+      // title and evidence lead with the asserted delivery, not with
+      // whatever text precedes it on the line.
+      out.push({ lines: String(idx + 1), code: line.slice(at, at + 200) });
+      break; // one issue per line, even if two phrases match it
+    }
+  });
+  return out;
+}
 
 // Scan one JSX opening tag starting at `start` (`<Button`, `<button`,
 // `<a`): the tag ends at the first `>` at brace depth 0 outside quotes.
@@ -390,9 +494,11 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
   }
 
   // Rule 1 + Rule 2 run over the whole file (element context spans
-  // lines), not in the per-line loop above.
+  // lines), not in the per-line loop above. Rules A + C likewise.
   const deadActions = findDeadActions(bounded, filePath);
   const mockedPayments = findMockedPayments(bounded, filePath);
+  const mockedNotifications = findMockedNotifications(bounded, filePath);
+  const deliveryClaims = findDeliveryClaims(bounded, filePath);
 
   return {
     truncated: bounded.length < code.length,
@@ -408,6 +514,8 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     testCount: tests.length,
     deadActionCount: deadActions.length,
     mockedPaymentCount: mockedPayments.length,
+    mockedNotificationCount: mockedNotifications.length,
+    deliveryClaimCount: deliveryClaims.length,
     endpoints,
     fetchCalls,
     todos,
@@ -418,5 +526,7 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     tests,
     deadActions,
     mockedPayments,
+    mockedNotifications,
+    deliveryClaims,
   };
 }
