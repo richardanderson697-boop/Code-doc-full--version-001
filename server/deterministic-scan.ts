@@ -445,7 +445,16 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
 
     // 3. TODOs / FIXMEs / BUGs
     const isComment = line.startsWith("//") || line.startsWith("/*") || line.startsWith("*");
-    if (isComment && /\b(TODO|FIXME|BUG)\b/i.test(line)) {
+    // Test files are fixtures, not unfinished code — a marker inside a
+    // template-string fake route in a test file is the test doing its job.
+    // (Same principle as the section-5 test-file exemption below.)
+    const isTestFile = /(^|\/)(__tests__|__test__|tests?|testdata|cypress|e2e|playwright|__mocks__|mocks?)\/|\.(test|spec)\.[jt]sx?$/i.test(filePath);
+    // The marker must LEAD the comment (Oct 28 stub-detector spec):
+    // a header like "Add Todo Evidence" is code about markers, not a
+    // marker, and prose that happens to contain the word bug mid-sentence
+    // is not a marker either.
+    const commentText = line.replace(/^(\/\/|\/\*|\*)\s*/, "");
+    if (isComment && !isTestFile && /^(TODO|FIXME|BUG)\b/i.test(commentText)) {
       todos.push({ lines: String(lineNum), code: line });
     }
 
@@ -460,15 +469,26 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     // NOTE: bare keywords ("mock", "simulated", ...) in *comments* are not
     // stubs — a comment describing simulated data is documentation, not
     // unfinished code. Only an explicit TODO: implement marker in a comment
-    // counts as a stub signal.
+    // counts as a stub signal, and the marker must lead the comment — a
+    // mid-sentence mention does not count.
     // NOTE: mock declarations in *test* files are fixtures, not unfinished
     // code — `const mockBlueprint = {...}` in orchestration.test.ts is the
     // test doing its job.
     const isMockDataFile = /(^|\/)(mock|mocks|fixture|fixtures|seed|seeds|stub|stubs)[^/]*\.(ts|tsx|js|jsx)$/i.test(filePath);
-    const isTestFile = /(^|\/)(__tests__|__test__|tests?|testdata|cypress|e2e|playwright|__mocks__|mocks?)\/|\.(test|spec)\.[jt]sx?$/i.test(filePath);
-    const isMockDeclaration = !isMockDataFile && !isTestFile && (/\b(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock/i.test(line) || /\bconst\s+temp/i.test(line));
+    // Trailing word boundary (Oct 28 stub-detector spec): `const tempDeck`,
+    // `const temperature`, and `const mocked` are real identifiers, not
+    // temporary placeholders — only the exact two-word declaration
+    // counts. (isTestFile is defined above section 3; reused here.)
+    // Disclosed extension, found during the build: the named fixture list
+    // below matched its own definition line (the line lists mockUsers and
+    // friends as regex source), so the list is anchored to a declaration
+    // keyword too — a bare use of a fixture name is not a declaration.
+    const isMockDeclaration = !isMockDataFile && !isTestFile && (/\b(const|let|var)\s+(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock\b/i.test(line) || /\bconst\s+temp\b/i.test(line));
     const isEmptyFunction = /=>\s*\{\s*\}/.test(line) || /function\s*\w*\s*\(\s*\)\s*\{\s*\}/.test(line);
-    const isTodoImplement = /TODO:\s*implement/i.test(line);
+    // Lead-anchor (Oct 28 stub-detector spec): the marker must lead the
+    // comment. A definitional comment that mentions the marker
+    // mid-sentence does not count.
+    const isTodoImplement = /^TODO:\s*implement/i.test(commentText);
 
     if ((isComment && isTodoImplement) || isMockDeclaration || (isEmptyFunction && !line.includes("export") && line.toLowerCase().includes("handler"))) {
       stubs.push({ lines: String(lineNum), code: line });
