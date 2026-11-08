@@ -374,7 +374,7 @@ describe("buildFinalReadReport deterministic findings", () => {
         findings: [
           {
             severity: "high",
-            title: 'Dead "Get Started" button — no handler, customers cannot complete a purchase',
+            title: 'Dead "Get Started" button — no handler',
             file: "app/pricing/pricing-client.tsx",
             line: 14,
             probe: "Dead Action",

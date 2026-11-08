@@ -105,6 +105,7 @@ function systemPrompt(context: string): string {
     `- Answer ONLY from the review below. Every claim must trace to a finding, bucket, verdict, or the warehouse ` +
     `detail (APPLICATION MAP, CATEGORY DETAIL, FILE LEDGER) in it.\n` +
     `- Cite the exact finding titles you relied on in citedFindings.\n` +
+    `- Before deciding nothing bears on the question, expand the question's terms BOTH ways and search the whole review again — the review often names a thing differently from the question: product/internal names ↔ plain descriptions, technical API names ↔ plain descriptions, architecture wording ↔ the property asked about (for example, "mocked" or "fake" ↔ a dead checkout button, no payment provider call, a sale recorded as complete). If any part of the review establishes any part of an answer, use the "partial" tier — never decline as unknown on wording alone.\n` +
     `- The CONVERSATION SO FAR section, when present, is prior discussion — use it to resolve follow-up references ` +
     `("the second one you mentioned", "that"), but it is not evidence: cite only findings from THE REVIEW, never a line from the conversation.\n` +
     `- The four starter questions always map to review sections — never decline them as uncovered: ` +

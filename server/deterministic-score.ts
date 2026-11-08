@@ -1033,7 +1033,7 @@ function computeDeterministicFindings(sig: WorkspaceSignals): DeterministicFindi
   for (const d of deadPayment) {
     out.push({
       severity: "high",
-      title: `Dead "${d.label}" button — no handler, customers cannot complete a purchase`,
+      title: `Dead "${d.label}" button — no handler`,
       file: d.path,
       line: parseInt(d.line) || null,
       probe: "Dead Action",

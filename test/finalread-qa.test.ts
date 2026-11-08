@@ -222,6 +222,78 @@ describe("unknownCitations", () => {
   });
 });
 
+describe("unknownCitations title shortening", () => {
+  // 2026-11-07: the Automate-AI live miss — Q1's answer was discarded
+  // because the model cited a shortened dead-button title and the check
+  // demanded the full title verbatim.
+  function paymentReport() {
+    return buildFinalReadReport({
+      projectTitle: "Automate-AI-v4",
+      completenessScore: 62,
+      categoryScores: {
+        externalIntegrations: {
+          score: 3,
+          reason: "billing/payment processing referenced is unhandled.",
+        },
+      },
+      findings: [
+        {
+          severity: "high",
+          title: 'Dead "Get Started" button — no handler',
+          file: "app/pricing/pricing-client.tsx",
+          line: 18,
+          probe: "Dead Action",
+        },
+        {
+          severity: "medium",
+          title: "Checkout records sales as complete with no payment provider call",
+          file: "app/api/checkout/route.ts",
+          line: 39,
+          probe: "Mocked Payment",
+          unverified: true,
+        },
+      ],
+    });
+  }
+
+  it("passes a shortened citation that is a contiguous run of a title's words", () => {
+    const report = paymentReport();
+    expect(
+      unknownCitations(
+        [
+          'Dead "Get Started" button — no handler',
+          "Dead Get Started button",
+          "Get Started button",
+          "Checkout records sales as complete with no payment provider call",
+        ],
+        report
+      )
+    ).toEqual([]);
+  });
+
+  it("still fails a paraphrase that is not a run inside any title", () => {
+    const report = paymentReport();
+    expect(
+      unknownCitations(["payments are mocked", "the checkout never charges"], report)
+    ).toEqual(["payments are mocked", "the checkout never charges"]);
+  });
+
+  it("still fails single words and non-contiguous word sets", () => {
+    const report = paymentReport();
+    expect(unknownCitations(["button", "dead button"], report)).toEqual([
+      "button",
+      "dead button",
+    ]);
+  });
+
+  it("still fails invented titles", () => {
+    const report = paymentReport();
+    expect(
+      unknownCitations(["Hardcoded secret in the database layer"], report)
+    ).toEqual(["Hardcoded secret in the database layer"]);
+  });
+});
+
 describe("unknownCitations category lines", () => {
   // Category bucket items as the report builder makes them: title is the
   // category label, implication starts with the label + score head.

@@ -208,12 +208,39 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
       .replace(/^["']+|["']+$/g, "")
       .replace(/[:;,]+$/g, "")
       .trim();
+  // Words of a normalized string, punctuation stripped, for the shortening
+  // rule below: a citation's words must run contiguously inside a title's
+  // words. Stripping punctuation matters — the dead-button title carries
+  // quotes ("Get Started"), so a raw substring check would miss
+  // "Get Started button" even though it is plainly a piece of that title.
+  const wordsOf = (s: string): string[] =>
+    norm(s)
+      .replace(/[^\p{L}\p{N}]+/gu, " ")
+      .trim()
+      .split(" ")
+      .filter(Boolean);
+  const containsRun = (hay: string[], needle: string[]): boolean => {
+    if (needle.length === 0 || needle.length > hay.length) return false;
+    for (let i = 0; i + needle.length <= hay.length; i++) {
+      let ok = true;
+      for (let j = 0; j < needle.length; j++) {
+        if (hay[i + j] !== needle[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  };
   const basename = (p: string): string => {
     const parts = String(p || "").split("/");
     return parts[parts.length - 1] || "";
   };
 
   const titles = new Set<string>();
+  // Titles as word sequences, for the shortening rule below (2026-11-07).
+  const titleWords: string[][] = [];
   for (const item of [
     ...report.liabilities,
     ...report.halfBuilt,
@@ -221,7 +248,10 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
     ...report.needsVerification,
   ]) {
     const n = norm(item.title);
-    if (n) titles.add(n);
+    if (n) {
+      titles.add(n);
+      titleWords.push(wordsOf(n));
+    }
   }
 
   const identifiers = new Set<string>();
@@ -309,6 +339,20 @@ export function unknownCitations(citedTitles: string[], report: FinalReadReport)
       continue;
     }
     if (n.split(" ").length >= 2 && fields.some((f) => f.includes(n))) {
+      continue;
+    }
+    // Rule (2026-11-07, Q&A citation fix): a citation may shorten a real
+    // title — its words, in order, as a contiguous run inside the title's
+    // words, at least 2 words — but it may not invent one. The dead-button
+    // titles are long; a model citing "Dead Get Started button" cites the
+    // finding, not a phantom. Single words still fail, and a paraphrase
+    // whose words don't run inside any real title ("payments are mocked")
+    // still fails.
+    const citedWords = wordsOf(n);
+    if (
+      citedWords.length >= 2 &&
+      titleWords.some((tw) => containsRun(tw, citedWords))
+    ) {
       continue;
     }
     if (categoryLines.has(n)) continue;

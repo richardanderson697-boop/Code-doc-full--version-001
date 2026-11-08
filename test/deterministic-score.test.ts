@@ -642,7 +642,7 @@ export async function POST(request: NextRequest) {
     expect(dead).toHaveLength(3);
     expect(dead[0].severity).toBe("high");
     expect(dead[0].file).toBe("app/pricing/pricing-client.tsx");
-    expect(dead[0].title).toMatch(/Dead "Get Started" button/);
+    expect(dead[0].title).toBe('Dead "Get Started" button — no handler');
     const mocked = a.deterministicFindings.filter((f) => f.probe === "Mocked Payment");
     expect(mocked).toHaveLength(1);
     expect(mocked[0].unverified).toBe(true);
