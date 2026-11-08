@@ -61,6 +61,7 @@ import {
   doubleCheckPrompt,
   pickVerificationModel,
   starterAnswer,
+  paymentAnswer,
   validateQaHistory,
 } from "../../shared/finalread-qa";
 
@@ -310,6 +311,22 @@ router.post(
       return res.json({
         answer: starter.answer,
         citedFindings: starter.citedFindings,
+        declined: false,
+        starter: true,
+      });
+    }
+
+    // 2b-ii. Payment questions: deterministic from the report, same shape
+    // as the starters, so the client needs no new handling. The model
+    // proved it can't answer these reliably — it cites its own paraphrase
+    // of the conclusion instead of a finding title, and the citation
+    // check discards the answer. Fires only when the report has payment
+    // evidence; otherwise the question falls through to the model.
+    const payment = paymentAnswer(question, report);
+    if (payment) {
+      return res.json({
+        answer: payment.answer,
+        citedFindings: payment.citedFindings,
         declined: false,
         starter: true,
       });

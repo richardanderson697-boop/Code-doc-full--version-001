@@ -5,6 +5,8 @@ import {
   isNoEstimatesQuestion,
   NO_ESTIMATES_REPLY,
   isRuntimeQuestion,
+  isPaymentQuestion,
+  paymentAnswer,
   unknownCitations,
   buildQaContext,
   WAREHOUSE_CONTEXT_BUDGET,
@@ -291,6 +293,152 @@ describe("unknownCitations title shortening", () => {
     expect(
       unknownCitations(["Hardcoded secret in the database layer"], report)
     ).toEqual(["Hardcoded secret in the database layer"]);
+  });
+});
+
+describe("paymentAnswer", () => {
+  // 2026-11-07: the model kept declining payment questions on
+  // Automate-AI-v4 by citing its own paraphrase, so payment questions get
+  // a deterministic answer composed from the report's own findings.
+  const DEAD = (line: number) => ({
+    severity: "high" as const,
+    title: 'Dead "Get Started" button — no handler',
+    file: "app/pricing/pricing-client.tsx",
+    line,
+    probe: "Dead Action",
+    evidence: `app/pricing/pricing-client.tsx:${line} <Button> — no onClick, href, or link.`,
+    remediation:
+      "Wire the button to the checkout flow, or remove it if the plan is not purchasable.",
+  });
+  const MOCKED = {
+    severity: "medium" as const,
+    title: "Checkout records sales as complete with no payment provider call",
+    file: "app/api/checkout/route.ts",
+    line: 39,
+    probe: "Mocked Payment",
+    unverified: true as const,
+    evidence: "app/api/checkout/route.ts:39 status: 'completed'",
+    remediation:
+      "confirm how payment is actually taken (card terminal, manual invoicing, cash)",
+  };
+  function paymentReport() {
+    return buildFinalReadReport({
+      projectTitle: "Automate-AI-v4",
+      completenessScore: 62,
+      categoryScores: {
+        externalIntegrations: {
+          score: 3,
+          reason: "billing/payment processing referenced is unhandled.",
+        },
+      },
+      findings: [DEAD(18), DEAD(28), DEAD(38), MOCKED],
+    });
+  }
+  function deadOnlyReport() {
+    return buildFinalReadReport({
+      projectTitle: "Automate-AI-v4",
+      completenessScore: 62,
+      categoryScores: { externalIntegrations: { score: 3 } },
+      findings: [DEAD(18)],
+    });
+  }
+  function mockedOnlyReport() {
+    return buildFinalReadReport({
+      projectTitle: "Automate-AI-v4",
+      completenessScore: 62,
+      categoryScores: { externalIntegrations: { score: 3 } },
+      findings: [MOCKED],
+    });
+  }
+  function wiredPaymentsReport() {
+    return buildFinalReadReport({
+      projectTitle: "Shop App",
+      completenessScore: 85,
+      categoryScores: { externalIntegrations: { score: 8 } },
+      findings: [
+        { severity: "high", title: "Hardcoded secret", file: "src/c.ts", line: 1 },
+      ],
+    });
+  }
+
+  it("classifies the four live payment questions and variants", () => {
+    for (const q of [
+      "does this application accept payments",
+      "does it collect payments",
+      "Are payments mocked?",
+      "our payments mocked?",
+      "does the app take card payments?",
+      "is the checkout mocked?",
+      "does it process payments?",
+    ]) {
+      expect(isPaymentQuestion(q)).toBe(true);
+    }
+  });
+
+  it("does not classify unrelated or FinalRead-purchase questions", () => {
+    for (const q of [
+      "how do I pay for this review",
+      "how much does the review cost",
+      "can I buy the report",
+      "does it collect user data",
+      "is the login real",
+      "does it work",
+    ]) {
+      expect(isPaymentQuestion(q)).toBe(false);
+    }
+  });
+
+  it("answers the both-evidence shape with server-set exact citations", () => {
+    const report = paymentReport();
+    const ans = paymentAnswer("does this application accept payments", report);
+    expect(ans).not.toBeNull();
+    expect(ans!.answer).toMatch(/No working payment path was found/);
+    expect(ans!.answer).toMatch(/"Get Started" button \(3 buttons\) does nothing when clicked/);
+    expect(ans!.answer).toMatch(/flagged, not established/);
+    expect(ans!.answer).toMatch(/confirm how payment is actually taken/);
+    expect(ans!.citedFindings).toEqual([
+      'Dead "Get Started" button — no handler',
+      'Dead "Get Started" button — no handler',
+      'Dead "Get Started" button — no handler',
+      "Checkout records sales as complete with no payment provider call",
+    ]);
+    // Citations pass the validator by construction.
+    expect(unknownCitations(ans!.citedFindings, report)).toEqual([]);
+  });
+
+  it("answers dead-only without the flagged framing", () => {
+    const report = deadOnlyReport();
+    const ans = paymentAnswer("does it collect payments", report);
+    expect(ans).not.toBeNull();
+    expect(ans!.answer).toMatch(/"Get Started" button does nothing when clicked/);
+    expect(ans!.answer).not.toMatch(/flagged, not established/);
+    expect(ans!.citedFindings).toEqual(['Dead "Get Started" button — no handler']);
+  });
+
+  it("answers mocked-only as flagged, never as established", () => {
+    const report = mockedOnlyReport();
+    const ans = paymentAnswer("Are payments mocked?", report);
+    expect(ans).not.toBeNull();
+    expect(ans!.answer).toMatch(/flagged, not established/);
+    expect(ans!.answer).toMatch(/It could be a mocked payment/);
+    expect(ans!.answer).toMatch(/confirm how payment is actually taken/);
+    expect(ans!.answer).not.toMatch(/No working payment path was found/);
+    expect(ans!.citedFindings).toEqual([
+      "Checkout records sales as complete with no payment provider call",
+    ]);
+    expect(unknownCitations(ans!.citedFindings, report)).toEqual([]);
+  });
+
+  it("returns null with no payment evidence, so the question reaches the model", () => {
+    const report = wiredPaymentsReport();
+    expect(paymentAnswer("does this application accept payments", report)).toBeNull();
+    expect(paymentAnswer("does it collect payments", report)).toBeNull();
+  });
+
+  it("returns null for non-payment questions even with payment evidence", () => {
+    const report = paymentReport();
+    expect(paymentAnswer("what's the biggest risk?", report)).toBeNull();
+    expect(paymentAnswer("is the login real", report)).toBeNull();
   });
 });
 

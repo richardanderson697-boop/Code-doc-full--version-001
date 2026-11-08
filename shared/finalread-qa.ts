@@ -52,6 +52,99 @@ export function isRuntimeQuestion(question: string): boolean {
   return RUNTIME_PATTERNS.some((p) => p.test(q));
 }
 
+/** Payment questions — answered deterministically from the report, never
+ *  by the model. The model proved it can't answer these reliably: asked
+ *  "does this application accept payments" it answers with its own
+ *  paraphrase of the conclusion ("no working payment flow") and cites the
+ *  paraphrase, so the citation check discards the answer — three live
+ *  declines on Automate-AI-v4 (2026-11-07) before this existed. The
+ *  classifier needs BOTH a payment object and an app-payment verb, so
+ *  "is the login real" and "does it work" don't fire; the exclusions keep
+ *  questions about buying FinalRead itself out. */
+const PAYMENT_OBJECT_PATTERN =
+  /\b(pay|payments?|checkout|billing|cards?|stripe)\b/i;
+const PAYMENT_VERB_PATTERN =
+  /\b(accept|collect|take|charge|process|mock|fake|real|work|handle)(s|d|ing|ed)?\b/i;
+const PAYMENT_EXCLUSIONS = [
+  /\bpay(ing)? for\b.{0,20}\b(review|report|assessment|audit)\b/i,
+  /\bpay(ing)? for this\b/i,
+  /\bbuy\b.{0,20}\b(review|report)\b/i,
+];
+
+export function isPaymentQuestion(question: string): boolean {
+  const q = question || "";
+  if (PAYMENT_EXCLUSIONS.some((p) => p.test(q))) return false;
+  return PAYMENT_OBJECT_PATTERN.test(q) && PAYMENT_VERB_PATTERN.test(q);
+}
+
+/** Dead payment buttons in the report: liabilities whose title matches the
+ *  stable format the deterministic build produces. The report's bucket
+ *  items carry no probe, so the title is the contract. */
+const DEAD_PAYMENT_TITLE = /^Dead ".+" button — no handler$/;
+const DEAD_PAYMENT_LABEL = /^Dead "(.+)" button — no handler$/;
+
+/** The deterministic payment answer: composed from the report's own
+ *  findings, citations set server-side to the exact titles, so the
+ *  citation check passes by construction. Fires ONLY when the report has
+ *  payment evidence — dead payment buttons, a mocked-payment
+ *  verification item, or both. No evidence returns null and the question
+ *  falls through to the model: an app with wired payments must never get
+ *  a deterministic "no payments" answer. The answer states what the
+ *  findings establish, never more — never a blanket verdict about payment
+ *  paths the scan didn't examine. */
+export function paymentAnswer(
+  question: string,
+  report: FinalReadReport
+): { answer: string; citedFindings: string[] } | null {
+  if (!isPaymentQuestion(question)) return null;
+  const dead = report.liabilities.filter((l) =>
+    DEAD_PAYMENT_TITLE.test(l.title || "")
+  );
+  const mocked = report.needsVerification.filter((it) =>
+    (it.verification?.whatWeSaw || "").includes("(Mocked Payment)")
+  );
+  if (dead.length === 0 && mocked.length === 0) return null;
+
+  const citedFindings = [
+    ...dead.map((d) => d.title),
+    ...mocked.map((m) => m.title),
+  ];
+  const parts: string[] = [];
+  if (dead.length > 0) {
+    // Group by button label so three identical "Get Started" buttons
+    // read as one button, not three findings.
+    const labels = new Map<string, number>();
+    for (const d of dead) {
+      const m = DEAD_PAYMENT_LABEL.exec(d.title || "");
+      const label = m ? m[1] : d.title;
+      labels.set(label, (labels.get(label) || 0) + 1);
+    }
+    const named = [...labels.entries()].map(([label, n]) =>
+      n > 1 ? `the "${label}" button (${n} buttons)` : `the "${label}" button`
+    );
+    const joined =
+      named.length === 1
+        ? named[0]
+        : named.slice(0, -1).join(", ") + " and " + named[named.length - 1];
+    parts.push(
+      `No working payment path was found in the buttons the review examined: ${joined} does nothing when clicked.`
+    );
+  }
+  if (mocked.length > 0) {
+    const first = mocked[0];
+    const howToCheck =
+      first.verification?.howToCheck ||
+      "Ask a developer to confirm how payment is actually taken.";
+    const check = howToCheck.endsWith(".") ? howToCheck : `${howToCheck}.`;
+    parts.push(
+      `The checkout was also flagged as recording sales as complete with no payment provider call — flagged, not established. ` +
+        `It could be a mocked payment, or a legitimate card-terminal, cash, or manual flow. ` +
+        `A developer needs to check it — ${check}`
+    );
+  }
+  return { answer: parts.join(" "), citedFindings };
+}
+
 /** The four starter pills: answered deterministically from the report —
  *  no model call, no charge, and they can never decline. A model asked
  *  "what's the biggest risk?" can talk itself into declining; the report
