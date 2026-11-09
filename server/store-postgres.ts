@@ -75,6 +75,29 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash ON password_reset_tokens(token_hash);
+-- FinalRead $199 bundle: re-scan entitlements (2 per purchase, 90-day
+-- expiry, separate from the credit balance) and the minimal frozen-version
+-- record (version id + content hash + buyer + purchase). See
+-- server/finalread-rescans.ts.
+CREATE TABLE IF NOT EXISTS finalread_rescan_entitlements (
+  id SERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  stripe_event_id TEXT UNIQUE NOT NULL,
+  pack_id TEXT NOT NULL,
+  remaining INTEGER NOT NULL,
+  purchased_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rescan_entitlements_user ON finalread_rescan_entitlements(user_id);
+CREATE TABLE IF NOT EXISTS finalread_review_versions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  purchase_stripe_event_id TEXT,
+  content_hash TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_review_versions_user ON finalread_review_versions(user_id);
 `;
 
 /** Minimal pool surface; real pg.Pool and pg-mem's pool both satisfy it. */

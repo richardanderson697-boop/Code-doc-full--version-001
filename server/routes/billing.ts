@@ -6,6 +6,10 @@ import https from "https";
 import { asyncRoute } from "../async-route";
 import { requireAuth, AuthedRequest } from "../middleware/requireAuth";
 import { addCredits } from "../credits";
+import {
+  FINALREAD_RESCAN_PACK_ID,
+  grantRescanEntitlements,
+} from "../finalread-rescans";
 import { getDb } from "../store";
 import { normalizeEmail, validEmail } from "../auth";
 import { log } from "../logger";
@@ -61,7 +65,7 @@ export function getPacks(): Pack[] {
       priceCents: 19900,
       credits: 400,
       priceId: process.env.PRICE_FINALREAD,
-      tagline: "One complete diligence review with Q&A and developer handoff",
+      tagline: "One complete review with Q&A, developer handoff, and 2 re-scans after fixes",
       audience: "finalread",
     },
   ];
@@ -305,8 +309,11 @@ router.post("/api/billing/checkout", requireAuth, asyncRoute(async (req: AuthedR
       success_url: `${base}/?checkout=success&pack=${pack.id}`,
       cancel_url: `${base}/?checkout=cancelled`,
       client_reference_id: req.user!.id,
+      // Grant amounts live in server code (getPacks), not in Stripe
+      // metadata: the webhook derives the grant from packId alone, so a
+      // tampered or missing credits value can never over-grant. Metadata
+      // carries only the identity the webhook needs (userId + packId).
       "metadata[userId]": req.user!.id,
-      "metadata[credits]": String(pack.credits),
       "metadata[packId]": pack.id,
       customer_email: req.user!.email,
     });
@@ -369,12 +376,23 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
       return res.json({ received: true, skipped: "unpaid" });
     }
     const userId = session.metadata?.userId || session.client_reference_id;
-    const credits = Number(session.metadata?.credits ?? 0);
     const eventId = event.id;
-    if (!userId || !credits) {
-      log.warn("Stripe webhook: completed session missing userId/credits metadata");
+    // Grants come from server code, never from Stripe metadata: the pack
+    // is looked up by packId in getPacks(), so a tampered or missing
+    // metadata credits value grants exactly the server-defined amounts —
+    // or fails closed (unknown pack), never over-grants.
+    const pack = getPacks().find((p) => p.id === (session.metadata?.packId ?? ""));
+    if (!userId || !pack) {
+      log.warn("Stripe webhook: completed session missing userId/packId metadata");
       return res.json({ received: true, skipped: "missing metadata" });
     }
+    const credits = pack.credits;
+    // The purchase date is the Stripe event time when present (the 90-day
+    // re-scan expiry runs from it); the webhook receipt time otherwise.
+    const purchasedAt =
+      typeof event.created === "number" && Number.isFinite(event.created)
+        ? new Date(event.created * 1000)
+        : new Date();
     // The user can be gone when the event arrives (e.g. the database was
     // replaced between checkout and delivery). Crediting blindly would attach
     // the purchase to nobody, so park the credits against the customer email
@@ -391,6 +409,9 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
             ? "INSERT INTO pending_credits (email, credits, pack_id, stripe_event_id, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (stripe_event_id) DO NOTHING"
             : "INSERT OR IGNORE INTO pending_credits (email, credits, pack_id, stripe_event_id, created_at) VALUES ($1, $2, $3, $4, $5)";
         await db.run(parkSql, [email, credits, session.metadata?.packId ?? null, eventId, new Date().toISOString()]);
+        // A parked $199 purchase claims its 2 re-scan entitlements when
+        // the credits are claimed (claimPendingCredits), keyed to the same
+        // Stripe event id — the park row carries the pack id for that.
         log.error(
           `Stripe webhook: user ${userId} missing; parked ${credits} credits for ${email} (Stripe ${eventId})`
         );
@@ -402,7 +423,13 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
       return res.json({ received: true, skipped: "user_missing_no_email" });
     }
     // addCredits is idempotent on the Stripe event id: safe to retry.
-    const balance = await addCredits(userId, credits, `credit pack: ${session.metadata?.packId ?? "pack"}`, `stripe:${eventId}`);
+    const balance = await addCredits(userId, credits, `credit pack: ${pack.id}`, `stripe:${eventId}`);
+    // A $199 purchase also grants its 2 re-scan entitlements, separate
+    // from the credit balance. Idempotent on the Stripe event id, so a
+    // webhook retry cannot double-grant.
+    if (pack.id === FINALREAD_RESCAN_PACK_ID) {
+      await grantRescanEntitlements(userId, pack.id, eventId, purchasedAt);
+    }
     log.info(`Credited ${credits} to user ${userId} (Stripe ${eventId}); balance now ${balance}`);
   }
 

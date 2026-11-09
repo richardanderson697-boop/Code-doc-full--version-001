@@ -74,7 +74,7 @@ export default function PricingModal({ open, onClose, notice, audience }: Props)
         </div>
         <p className="text-xs text-slate-400 mb-5">
           {audience === "finalread"
-            ? "One FinalRead Review pack covers a complete diligence cycle: the full report, stakeholder Q&A, and the developer handoff packet. Credits never expire."
+            ? "One FinalRead Review pack covers a complete diligence cycle: the full report, stakeholder Q&A, and the developer handoff packet. Includes 2 re-scans: after the seller's developer fixes the findings, run the review again on the new version — twice, within 90 days. Credits never expire."
             : "1 credit = 1¢ of AI compute. A deep workspace audit runs about 10–30 credits; quick chats are 1–3. Credits never expire."}
         </p>
         {notice && (

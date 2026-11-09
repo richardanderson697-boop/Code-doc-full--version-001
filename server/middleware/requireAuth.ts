@@ -25,6 +25,35 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
 
 // 402 when the balance is below the tier minimum. The true cost is metered
 // and deducted after the Gemini call completes.
+//
+// checkCredits is the same check as a value, for routes that gate inside
+// the handler (the intelligence route decides the gate after resolving the
+// files: an entitlement-covered re-scan and an identical-code re-run skip
+// the gate entirely, so the middleware form cannot express it).
+export type CreditCheck =
+  | { ok: true }
+  | {
+      ok: false;
+      body: { error: string; code: string; balance: number; required: number };
+    };
+
+export async function checkCredits(userId: string, tier: CreditTier): Promise<CreditCheck> {
+  const min = MIN_CREDITS[tier];
+  const balance = await getBalance(userId);
+  if (balance < min) {
+    return {
+      ok: false,
+      body: {
+        error: `Not enough credits for this action (needs ~${min}). Top up to continue.`,
+        code: "INSUFFICIENT_CREDITS",
+        balance,
+        required: min,
+      },
+    };
+  }
+  return { ok: true };
+}
+
 export function requireCredits(tier: CreditTier) {
   return async (req: AuthedRequest, res: Response, next: NextFunction): Promise<void> => {
     try {
@@ -32,15 +61,11 @@ export function requireCredits(tier: CreditTier) {
         res.status(401).json({ error: "Sign in required", code: "AUTH_REQUIRED" });
         return;
       }
-      const min = MIN_CREDITS[tier];
-      const balance = await getBalance(req.user.id);
-      if (balance < min) {
-        res.status(402).json({
-          error: `Not enough credits for this action (needs ~${min}). Top up to continue.`,
-          code: "INSUFFICIENT_CREDITS",
-          balance,
-          required: min,
-        });
+      const check = await checkCredits(req.user.id, tier);
+      // NB: `check.ok === false` (not `!check.ok`): this codebase is not
+      // strict-mode, and the truthiness form does not narrow the union.
+      if (check.ok === false) {
+        res.status(402).json(check.body);
         return;
       }
       next();

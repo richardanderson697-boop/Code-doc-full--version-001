@@ -136,9 +136,11 @@ describe("stripe webhook: missing user", () => {
 
   it("signup claims parked credits onto the new account", async () => {
     const app = buildApp();
-    // park 400 for claimme@x.io via a ghost user id
+    // park 400 for claimme@x.io via a ghost user id (a real starter
+    // checkout sends credits "400" with packId "starter"; the grant comes
+    // from the pack definition in server code, not the metadata)
     const park = fakeReqRes(
-      webhookEvent({ customer_email: "claimme@x.io", metadata: { userId: "ghost-2", credits: "400", packId: "builder" } })
+      webhookEvent({ customer_email: "claimme@x.io", metadata: { userId: "ghost-2", credits: "400", packId: "starter" } })
     );
     await handleStripeWebhook(park.req, park.res);
     expect(await pendingFor("claimme@x.io")).toHaveLength(1);

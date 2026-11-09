@@ -27,6 +27,15 @@ export interface SharedReview {
   intelStatus: SharedReviewIntelStatus;
   /** Scan failure message, when intelStatus is "error". */
   intelError?: string;
+  /**
+   * The server's frozen-version id for this review (billing spec §3.2),
+   * when the review was created by a FinalRead entry scan. The entry
+   * sends it back on a re-run so the server can tell a re-scan of changed
+   * code (one entitlement) from a re-run of unchanged code (free) — and
+   * so the first re-run after an adopted workspace scan still links to
+   * the review. Workspace-originated reviews never carry one.
+   */
+  finalreadReviewId?: string;
 }
 
 /** A workspace upload starts a review with no scan result yet. */
@@ -40,19 +49,38 @@ export function createWorkspaceReview(title: string): SharedReview {
 }
 
 /** A completed entry (buyer-flow) scan creates its review with the result. */
-export function createEntryReview(title: string, intelResult: any): SharedReview {
+export function createEntryReview(
+  title: string,
+  intelResult: any,
+  finalreadReviewId?: string
+): SharedReview {
   return {
     source: "entry",
     title: title && title.trim() ? title : "Your codebase",
     intelResult: intelResult ?? null,
     intelStatus: "done",
+    ...(finalreadReviewId ? { finalreadReviewId } : {}),
   };
 }
 
 /** Record a finished scan into an existing review. Source and title are
- *  preserved — a scan never re-originates a review. */
-export function withIntelResult(review: SharedReview, intelResult: any): SharedReview {
-  const next = { ...review, intelResult: intelResult ?? null, intelStatus: "done" as const };
+ *  preserved — a scan never re-originates a review. A fresh frozen-version
+ *  id from the server replaces the old one; an absent one keeps it. */
+export function withIntelResult(
+  review: SharedReview,
+  intelResult: any,
+  finalreadReviewId?: string
+): SharedReview {
+  const next = {
+    ...review,
+    intelResult: intelResult ?? null,
+    intelStatus: "done" as const,
+    ...(finalreadReviewId
+      ? { finalreadReviewId }
+      : review.finalreadReviewId
+        ? { finalreadReviewId: review.finalreadReviewId }
+        : {}),
+  };
   delete next.intelError;
   return next;
 }
@@ -71,7 +99,15 @@ export function withIntelStatus(
   status: SharedReviewIntelStatus
 ): SharedReview {
   if (status === "loading") {
-    return { source: review.source, title: review.title, intelResult: null, intelStatus: "loading" };
+    return {
+      source: review.source,
+      title: review.title,
+      intelResult: null,
+      intelStatus: "loading",
+      // A re-scan keeps its frozen-version id: starting a scan clears the
+      // result, not the review's identity.
+      ...(review.finalreadReviewId ? { finalreadReviewId: review.finalreadReviewId } : {}),
+    };
   }
   return { ...review, intelStatus: status };
 }

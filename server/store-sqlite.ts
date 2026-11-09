@@ -76,6 +76,25 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_hash ON password_reset_tokens(token_hash);
+CREATE TABLE IF NOT EXISTS finalread_rescan_entitlements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  stripe_event_id TEXT NOT NULL UNIQUE,
+  pack_id TEXT NOT NULL,
+  remaining INTEGER NOT NULL,
+  purchased_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rescan_entitlements_user ON finalread_rescan_entitlements(user_id);
+CREATE TABLE IF NOT EXISTS finalread_review_versions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  purchase_stripe_event_id TEXT,
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_versions_user ON finalread_review_versions(user_id);
 `;
 
 function toSqlite(sql: string): string {

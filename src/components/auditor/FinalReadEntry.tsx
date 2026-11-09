@@ -163,10 +163,19 @@ export default function FinalReadEntry({
     setError("");
     setNotice("");
     try {
+      // Every scan run from this entry is a FinalRead review: the first
+      // run says so (`finalread: true`) and the server freezes the
+      // version, handing back a review id; a re-run names that id so the
+      // server can tell changed code (one re-scan entitlement) from
+      // unchanged code (free, no re-scan). The workspace scan never sends
+      // either — it is the developer view, paid with credits.
+      const existingReviewId = sharedReview?.finalreadReviewId;
       const response = await apiFetch("/api/project-intelligence", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify(
+          existingReviewId ? { finalreadReviewId: existingReviewId } : { finalread: true }
+        ),
       });
       const contentType = response.headers.get("content-type") || "";
       if (!contentType.includes("application/json")) {
@@ -181,15 +190,30 @@ export default function FinalReadEntry({
         );
       }
       const parsed = await response.json();
+      // Unchanged code is not a re-scan: keep the existing report and
+      // tell the buyer, instead of replacing it with a fresh scan.
+      if (parsed.codeUnchanged) {
+        setNotice(
+          "The code hasn't changed since the last review — no re-scan needed. Your previous report still stands."
+        );
+        setPhase("idle");
+        return;
+      }
+      const reviewId =
+        typeof parsed.finalreadReviewId === "string" && parsed.finalreadReviewId
+          ? parsed.finalreadReviewId
+          : undefined;
       setIntelResult(parsed);
       // The finished scan becomes the shared review: re-entering the entry
       // restores the report without re-uploading or re-scanning. A scan run
       // on an existing review ("preserve") keeps its origin — a workspace
       // review stays workspace-originated, so the toggle stays available.
+      // The server's frozen-version id rides along, so a later re-run can
+      // name it.
       const next =
         origin === "preserve" && sharedReview
-          ? withIntelResult(sharedReview, parsed)
-          : createEntryReview(title, parsed);
+          ? withIntelResult(sharedReview, parsed, reviewId)
+          : createEntryReview(title, parsed, reviewId);
       onSharedReviewChange?.(next);
       setPhase("done");
     } catch (e: any) {
@@ -424,8 +448,7 @@ export default function FinalReadEntry({
         <div className="bg-indigo-500/10 border border-indigo-500/25 rounded-xl px-4 py-3 mb-8 flex items-center justify-center gap-2 text-center">
           <p className="text-xs text-indigo-200">
             <span className="font-bold text-sm text-indigo-100">$199</span>
-            {"  "}· one complete review · 400 credits, and the review is the
-            only thing they can be spent on here
+            {"  "}· one complete review · includes 2 re-scans after fixes
           </p>
         </div>
 

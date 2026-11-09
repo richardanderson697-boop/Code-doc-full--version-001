@@ -21,8 +21,19 @@ import {
 } from "../deterministic-score";
 import { verifyReportCitations, repairImportMap } from "../citation-verify";
 import { log } from "../logger";
-import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
+import { requireAuth, checkCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
+import {
+  consumeRescanEntitlement,
+  createReviewVersion,
+  findLatestFinalReadPurchase,
+  findUsableEntitlement,
+  getReviewVersion,
+  hashReviewContent,
+  updateReviewVersionHash,
+  type RescanEntitlementRow,
+  type ReviewVersionRow,
+} from "../finalread-rescans";
 
 const router = Router();
 
@@ -34,7 +45,13 @@ const MAX_INTEL_FILE_BYTES = 1024 * 1024;
 const MAX_INTEL_TOTAL_BYTES = 5 * 1024 * 1024;
 
 
-router.post("/api/project-intelligence", requireAuth, requireCredits("intelligence"), asyncRoute(async (req: AuthedRequest, res) => {
+// The credit gate lives INSIDE this handler, not in requireCredits
+// middleware: a FinalRead re-scan covered by an entitlement — or a re-run
+// of unchanged code — skips the gate entirely, and that decision needs
+// the resolved files (the content hash) before it can be made. The gate
+// itself is unchanged (min balance 40, same 402 shape) for every
+// credit-charged run.
+router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   // Hoisted so the error path can return it: the deterministic scan runs
   // before the model call, so a model outage should still hand the client
   // the findings instead of a bare error (same contract as cold-audit).
@@ -115,6 +132,64 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
         notEnoughFiles: true,
         error: "Not enough files to run scan on your codebase. Upload a ZIP of your codebase, select a file, or generate code first!"
       });
+    }
+
+    // FinalRead re-scan decision (billing spec §3.2). A call from the
+    // FinalRead entry carries `finalread: true` on the first review, or
+    // `finalreadReviewId` on a re-run of a review the server already
+    // froze. Workspace scans never send either and never touch this.
+    //
+    // - Identical code (hash matches the frozen version) is not a re-scan:
+    //   no model call, no charge, no entitlement consumed — the buyer is
+    //   told the code is unchanged and the previous report still stands.
+    // - Changed code with a usable entitlement is covered: no credit gate,
+    //   no charge; one entitlement is consumed when the scan succeeds
+    //   (at the charge site below, mirroring the existing charge-on-model-
+    //   success behavior — a failed scan consumes nothing).
+    // - Changed code without one falls back to the normal credit path.
+    const body = (req.body as any) ?? {};
+    const finalreadReviewId =
+      typeof body.finalreadReviewId === "string" && body.finalreadReviewId.trim()
+        ? body.finalreadReviewId.trim()
+        : undefined;
+    const isFinalReadCall = body.finalread === true || finalreadReviewId !== undefined;
+    let frozenVersion: ReviewVersionRow | undefined;
+    let usableEntitlement: RescanEntitlementRow | undefined;
+    let rescanCovered = false;
+    // The hash of exactly the files this scan grades, reused by the
+    // frozen-version bookkeeping after a successful scan.
+    let contentHash: string | undefined;
+    if (isFinalReadCall) {
+      contentHash = hashReviewContent(files);
+      if (finalreadReviewId) {
+        const found = await getReviewVersion(finalreadReviewId);
+        // Another buyer's review id is not this buyer's review: treat the
+        // call as a first review (a fresh frozen record), never as a
+        // re-scan of someone else's code.
+        if (found && found.user_id === userId) frozenVersion = found;
+      }
+      if (frozenVersion) {
+        if (contentHash === frozenVersion.content_hash) {
+          return res.status(200).json({
+            codeUnchanged: true,
+            finalreadReviewId: frozenVersion.id,
+            message:
+              "The code hasn't changed since the last review — no re-scan needed. Your previous report still stands.",
+          });
+        }
+        usableEntitlement = await findUsableEntitlement(userId);
+        rescanCovered = usableEntitlement !== undefined;
+      }
+    }
+
+    // The credit gate, for credit-charged runs only. Entitlement-covered
+    // re-scans skip it (a buyer with 0 credits and a re-scan left can
+    // still re-scan); identical-code re-runs never reach here.
+    if (!rescanCovered) {
+      const check = await checkCredits(userId, "intelligence");
+      // NB: `check.ok === false` (not `!check.ok`): this codebase is not
+      // strict-mode, and the truthiness form does not narrow the union.
+      if (check.ok === false) return res.status(402).json(check.body);
     }
 
     const totalFiles = files.length;
@@ -373,8 +448,24 @@ The total completenessScore is computed server-side (rescaled over the applicabl
         responseSchema: INTEL_SCHEMA as any,
       },
     });
-    const intelBalance = await chargeForCall(req.user!.id, extractUsage(intelResponse), modelName, "project intelligence");
-    if (intelBalance != null) res.set("X-Credits-Balance", String(intelBalance));
+    // Payment for the run: an entitlement-covered re-scan consumes one
+    // entitlement instead of charging credits (atomic decrement — a lost
+    // race falls back to the credit charge below). Every other run charges
+    // the metered cost as before. A failed model call never reaches here,
+    // so neither a charge nor a consumption happens on an outage.
+    let intelBalance: number | null = null;
+    let rescanEntitlementUsed = false;
+    let rescanEntitlementsRemaining: number | undefined;
+    if (rescanCovered && usableEntitlement) {
+      rescanEntitlementUsed = await consumeRescanEntitlement(usableEntitlement.id);
+      if (rescanEntitlementUsed) {
+        rescanEntitlementsRemaining = usableEntitlement.remaining - 1;
+      }
+    }
+    if (!rescanEntitlementUsed) {
+      intelBalance = await chargeForCall(req.user!.id, extractUsage(intelResponse), modelName, "project intelligence");
+      if (intelBalance != null) res.set("X-Credits-Balance", String(intelBalance));
+    }
 
     const responseText = intelResponse.text || "";
     let cleanText = responseText.trim();
@@ -469,6 +560,25 @@ The total completenessScore is computed server-side (rescaled over the applicabl
       }
       const importSource = await getWorkspaceSource(userId).catch(() => undefined);
       if (importSource) parsedIntel.importSource = importSource;
+    }
+    // FinalRead frozen-version bookkeeping, after a successful scan only.
+    // A re-scan's new code becomes the frozen version; a first review
+    // freezes its first version and hands the client the review id so
+    // later re-runs can name it. A failed scan never reaches here, so a
+    // failed re-scan never advances the frozen version or spends anything.
+    if (isFinalReadCall && contentHash) {
+      if (frozenVersion) {
+        await updateReviewVersionHash(frozenVersion.id, contentHash);
+        parsedIntel.finalreadReviewId = frozenVersion.id;
+      } else {
+        const purchaseEventId = await findLatestFinalReadPurchase(userId);
+        const version = await createReviewVersion(userId, purchaseEventId, contentHash);
+        parsedIntel.finalreadReviewId = version.id;
+      }
+      parsedIntel.rescanEntitlementUsed = rescanEntitlementUsed;
+      if (rescanEntitlementsRemaining !== undefined) {
+        parsedIntel.rescanEntitlementsRemaining = rescanEntitlementsRemaining;
+      }
     }
     res.json(parsedIntel);
   } catch (error: any) {

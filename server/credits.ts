@@ -4,6 +4,10 @@ import { getDb, type PendingCreditRow } from "./store";
 import { log } from "./logger";
 import { PRIMARY_MODEL, FALLBACK_MODEL } from "./gemini";
 import { CLAUDE_HAIKU_MODEL, CLAUDE_SONNET_MODEL } from "./anthropic";
+import {
+  FINALREAD_RESCAN_PACK_ID,
+  grantRescanEntitlements,
+} from "./finalread-rescans";
 
 interface ModelRate {
   inputPerMillion: number;
@@ -116,8 +120,8 @@ export async function claimPendingCredits(userId: string, email: string): Promis
   const cleanEmail = email.trim().toLowerCase();
   if (!cleanEmail) return 0;
   const db = getDb();
-  const rows = await db.all<PendingCreditRow>(
-    "SELECT id, credits, pack_id, stripe_event_id FROM pending_credits WHERE email = $1",
+  const rows = await db.all<PendingCreditRow & { created_at: string }>(
+    "SELECT id, credits, pack_id, stripe_event_id, created_at FROM pending_credits WHERE email = $1",
     [cleanEmail]
   );
   let claimed = 0;
@@ -131,6 +135,20 @@ export async function claimPendingCredits(userId: string, email: string): Promis
         ref
       );
       if (balance !== null) {
+        // A parked $199 purchase claims its 2 re-scan entitlements too:
+        // the buyer paid for the bundle, and the park row is the only
+        // record of the purchase. Granted before the row is deleted, and
+        // idempotent on the Stripe event id, so a retried claim cannot
+        // double-grant. The purchase date is the park date (webhook time).
+        if (row.pack_id === FINALREAD_RESCAN_PACK_ID && row.stripe_event_id) {
+          const purchasedAt = row.created_at ? new Date(row.created_at) : new Date();
+          await grantRescanEntitlements(
+            userId,
+            FINALREAD_RESCAN_PACK_ID,
+            row.stripe_event_id,
+            Number.isNaN(purchasedAt.getTime()) ? new Date() : purchasedAt
+          );
+        }
         await db.run("DELETE FROM pending_credits WHERE id = $1", [row.id]);
         claimed += row.credits;
       }

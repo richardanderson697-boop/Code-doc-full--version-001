@@ -25,6 +25,7 @@ import {
   workspaceHeaderTitle,
   type SharedReview,
 } from "./utils/sharedReview";
+import { pricingAudienceFor } from "./utils/pricing-audience";
 
 export default function App() {
   const [projects, setProjects] = useState<VibeProject[]>([]);
@@ -167,7 +168,11 @@ export default function App() {
   // became a trap: both views showed $199-only with no way back to the
   // three consumer packs. Deriving from the entry state removes it, and
   // exiting the entry restores consumer pricing on its own.
-  const pricingAudience = finalreadEntryOpen ? "finalread" : undefined;
+  // Plus the sales-home rule (billing spec §3.3): on getfinalread.com (or
+  // the staging host) the visitor is a FinalRead buyer, so pricing
+  // defaults to the FinalRead list even before the entry opens — a buyer
+  // there never sees the consumer packs. The homepage itself is unchanged.
+  const pricingAudience = pricingAudienceFor(finalreadEntryOpen, window.location.hostname);
   // One-time cleanup of the pre-view-following sticky flag, so old browsers
   // don't carry a dead key that could confuse a future reader.
   useEffect(() => {
