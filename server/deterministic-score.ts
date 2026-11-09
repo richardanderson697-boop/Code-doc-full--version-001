@@ -81,12 +81,24 @@ export interface DeterministicFinding {
   evidence: string;
   remediation: string;
   unverified?: boolean;
+  /** e.g. "GET /api/admin/metrics" — set by the fabricated-status
+   *  finder so the §5 calibration can match it against the PreFlight
+   *  no-auth finding for the same route. */
+  route?: string;
 }
 
 export interface DeterministicAssessment {
   categories: Record<CategoryKey, CategoryResult>;
   missingFeatures: MissingFeatureFact[];
   deterministicFindings: DeterministicFinding[];
+  /** PreFlight findings after the fabricated-status calibration (§5): a
+   *  no-auth finding on a route whose handler returns only hardcoded
+   *  values is reframed (critical → high) with the fabrication named.
+   *  Callers that serve the findings (intelligence route) use this list
+   *  so the prompt digest, the report, and the Q&A all see one
+   *  calibrated view. Identical to the input report's findings when
+   *  nothing matched. */
+  calibratedPreflightFindings: PreFlightFinding[];
   completenessScore: number; // rescaled to 0-100 over the applicable categories
   applicableCount: number; // how many of the 10 categories apply (for "N of 10" display)
   capsApplied: string[];
@@ -855,6 +867,107 @@ function scorePerformance(sig: WorkspaceSignals): CategoryResult {
   return { score, max: 10, evidence };
 }
 
+// ---------------------------------------------------------------------------
+// README-vs-repo truth check (README-truth spec §3). The README is the
+// buyer's first read of the project; when it names paths that do not
+// exist and a stack the code never uses, the documentation is describing
+// a different app. That caps Documentation at 4/10 — a cap, not a
+// deduction, so a README that is otherwise long and the code that is
+// otherwise typed still counts.
+//
+// What counts as a claim: an inline-backticked token in README.md or
+// docs/**/*.md that looks like a project path (apps/, packages/,
+// infrastructure/, docs/, services/, libs/) or a *.yml/*.yaml/*.example
+// file. Fenced code blocks are stripped first — they are commands
+// (cd apps/api, docker-compose up), not architecture claims, and a
+// fence-spanning match could invent a path that was never named.
+// What counts as a technology: a fixed vocabulary, matched on a word
+// boundary (case-insensitive); "react native" is a phrase, never the
+// word "react" alone. A tech counts as present when it appears in
+// package.json dependencies, in an import specifier, or (docker only)
+// as a Dockerfile / docker-compose file in the repo.
+// ---------------------------------------------------------------------------
+
+const README_TECH_VOCABULARY: { name: string; pattern: RegExp }[] = [
+  { name: "nestjs", pattern: /\bnestjs\b/i },
+  { name: "typeorm", pattern: /\btypeorm\b/i },
+  { name: "prisma", pattern: /\bprisma\b/i },
+  { name: "postgresql", pattern: /\bpostgres(?:ql)?\b/i },
+  { name: "redis", pattern: /\bredis\b/i },
+  { name: "react native", pattern: /\breact\s+native\b/i },
+  { name: "openai", pattern: /\bopenai\b/i },
+  { name: "anthropic", pattern: /\banthropic\b/i },
+  { name: "stripe", pattern: /\bstripe\b/i },
+  { name: "docker", pattern: /\bdocker\b/i },
+  { name: "aws", pattern: /\baws\b/i },
+];
+
+const CLAIMED_PATH =
+  /^(apps|packages|infrastructure|docs|services|libs)\/[\w./-]+$/i;
+const CLAIMED_FILE = /\.(yml|yaml|example)$/i;
+
+function extractClaimedPaths(docsText: string): string[] {
+  const noFences = docsText.replace(/```[\s\S]*?```/g, "");
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of noFences.matchAll(/`([^`]+)`/g)) {
+    const token = m[1].trim().replace(/\/$/, "");
+    if (!token || seen.has(token)) continue;
+    if (CLAIMED_PATH.test(token) || CLAIMED_FILE.test(token)) {
+      seen.add(token);
+      out.push(token);
+    }
+  }
+  return out;
+}
+
+function repoHasPath(sig: WorkspaceSignals, claimed: string): boolean {
+  return sig.files.some(
+    (f) =>
+      f.path === claimed ||
+      f.path.endsWith("/" + claimed) ||
+      f.path.startsWith(claimed + "/") ||
+      f.path.includes("/" + claimed + "/")
+  );
+}
+
+function techIsPresent(sig: WorkspaceSignals, tech: string): boolean {
+  // Normalize away case and separators so "react native" matches the
+  // "react-native" package and "@prisma/client" matches "prisma".
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const n = norm(tech);
+  if (
+    tech === "docker" &&
+    sig.files.some((f) => /(^|\/)(Dockerfile|docker-compose\.ya?ml)$/i.test(f.path))
+  ) {
+    return true;
+  }
+  if (depNames(sig).some((d) => { const dn = norm(d); return dn === n || dn.startsWith(n); })) {
+    return true;
+  }
+  return sig.files.some((f) =>
+    f.imports.some((spec) => { const s = norm(spec); return s === n || s.startsWith(n); })
+  );
+}
+
+function readmeTruthMismatch(sig: WorkspaceSignals): {
+  missingPaths: string[];
+  absentTechs: string[];
+} {
+  const docFiles = sig.files.filter(
+    (f) => /(^|\/)README\.md$/i.test(f.path) || /(^|\/)docs\/.+\.md$/i.test(f.path)
+  );
+  if (docFiles.length === 0) return { missingPaths: [], absentTechs: [] };
+  const docsText = docFiles.map((f) => f.content).join("\n");
+  const missingPaths = extractClaimedPaths(docsText).filter(
+    (p) => !repoHasPath(sig, p)
+  );
+  const absentTechs = README_TECH_VOCABULARY.filter(
+    (t) => t.pattern.test(docsText) && !techIsPresent(sig, t.name)
+  ).map((t) => t.name);
+  return { missingPaths, absentTechs };
+}
+
 function scoreDocumentation(sig: WorkspaceSignals): CategoryResult {
   const evidence: string[] = [];
   let score = 0;
@@ -890,6 +1003,25 @@ function scoreDocumentation(sig: WorkspaceSignals): CategoryResult {
   const typePts = typeHits >= 5 ? 3 : typeHits >= 2 ? 2 : typeHits >= 1 ? 1 : 0;
   score += typePts;
   evidence.push(`${typeHits} files with TypeScript interfaces/type aliases → +${typePts}`);
+
+  // README-vs-repo mismatch (§3): the README names paths and a stack
+  // the code does not have, so Documentation cannot read as finished.
+  // The note is the signal; the cap is applied in
+  // computeDeterministicAssessment, where capsApplied is recorded.
+  const { missingPaths, absentTechs } = readmeTruthMismatch(sig);
+  if (missingPaths.length >= 2 || absentTechs.length >= 3) {
+    if (missingPaths.length > 0) {
+      evidence.push(
+        `README names ${missingPaths.length} path(s) that do not exist: ${missingPaths.slice(0, 4).join(", ")}`
+      );
+    }
+    if (absentTechs.length > 0) {
+      evidence.push(
+        `README names ${absentTechs.length} technologie(s) not in the code: ${absentTechs.slice(0, 4).join(", ")}`
+      );
+    }
+    return { score: Math.min(10, score), max: 10, evidence, note: "readme-mismatch" };
+  }
   return { score: Math.min(10, score), max: 10, evidence };
 }
 
@@ -1211,6 +1343,38 @@ function computeDeterministicFindings(sig: WorkspaceSignals): DeterministicFindi
       });
     }
   }
+
+  // Fabricated status responses (README-truth spec §4): the same shape
+  // as mocked payments / mocked notifications, a different outcome. A
+  // route handler returns an all-literal object carrying a status word
+  // ('Healthy') with no query or check behind it — the values are
+  // constants presented as live metrics. Flagged, never asserted: the
+  // endpoint may be documented as static/demo data, so this carries
+  // unverified: true and the report builder routes it to
+  // needsVerification instead of liabilities. The route (when the
+  // finder determined it) rides on the finding so §5 can match it
+  // against the PreFlight no-auth finding for the same route.
+  const fabricated: { path: string; line: string; code: string; route?: string; statusSignal: string }[] = [];
+  for (const f of sig.files) {
+    for (const s of f.analysis.fabricatedStatus) {
+      fabricated.push({ path: f.path, line: s.lines, code: s.code, route: s.route, statusSignal: s.statusSignal });
+    }
+  }
+  fabricated.sort(byPathLine);
+  for (const s of fabricated) {
+    out.push({
+      severity: "medium",
+      title: "Endpoint returns hardcoded values presented as live metrics",
+      file: s.path,
+      line: parseInt(s.line) || null,
+      probe: "Fabricated Status",
+      evidence: `${s.path}:${s.line} ${s.code} — values are literals with no query or check behind them (status signal: ${s.statusSignal})`,
+      remediation:
+        "Confirm whether these values are ever computed from real state (database, queue, provider). If they are constants, either compute them or label the endpoint as static/demo data — a buyer reading this dashboard will believe the system is live.",
+      unverified: true,
+      route: s.route,
+    });
+  }
   return out;
 }
 
@@ -1307,6 +1471,44 @@ const PROBE_CATEGORY_MAP: Record<string, CategoryKey[]> = {
   "Python Security": ["security"],
 };
 
+// ---------------------------------------------------------------------------
+// Fabricated-status calibration (README-truth spec §5). A PreFlight
+// no-auth finding on a route whose handler returns only hardcoded values
+// overstates the exposure — the data is fake constants, so the headline
+// is the fabrication, not a live leak. Reframe the finding (critical →
+// high) so the Security cap follows the table (6, not 4) and the report
+// shows why. Score-layer only: the vendored auth probe is never edited.
+// Pure: returns a new findings array; the input report is untouched.
+// ---------------------------------------------------------------------------
+
+// The auth probe's no-auth title shape: "GET /api/admin/metrics without
+// auth check" (method, then the route path it attributed the finding to).
+const NO_AUTH_TITLE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (\S+) without auth check$/;
+
+function calibrateNoAuthFindings(
+  preflight: PreFlightReport,
+  deterministicFindings: DeterministicFinding[]
+): PreFlightFinding[] {
+  const fabricatedRoutes = new Set(
+    deterministicFindings
+      .filter((f) => f.probe === "Fabricated Status" && f.route)
+      .map((f) => f.route as string)
+  );
+  if (fabricatedRoutes.size === 0) return preflight.findings;
+  return preflight.findings.map((f) => {
+    if (f.probe !== "API Route Auth" || f.severity !== "critical") return f;
+    const m = NO_AUTH_TITLE.exec(f.title);
+    if (!m) return f;
+    const route = `${m[1]} ${m[2]}`;
+    if (!fabricatedRoutes.has(route)) return f;
+    return {
+      ...f,
+      severity: "high",
+      title: `${route} without auth check — handler returns only hardcoded values`,
+    };
+  });
+}
+
 function reconcileFindingCaps(
   categories: Record<CategoryKey, CategoryResult>,
   preflight: PreFlightReport,
@@ -1360,6 +1562,16 @@ export function computeDeterministicAssessment(
   const sig = collectSignals(files);
   const capsApplied: string[] = [];
 
+  // Deterministic findings first: the fabricated-status findings
+  // calibrate the PreFlight no-auth findings (§5), and the caps below
+  // must see the calibrated severity — so the findings are computed
+  // before the categories, not after them as before.
+  const deterministicFindings = computeDeterministicFindings(sig);
+  const calibratedPreflight: PreFlightReport = {
+    ...preflight,
+    findings: calibrateNoAuthFindings(preflight, deterministicFindings),
+  };
+
   const categories: Record<CategoryKey, CategoryResult> = {
     serverStarts: scoreServerStarts(sig),
     authentication: scoreAuthentication(sig),
@@ -1368,10 +1580,30 @@ export function computeDeterministicAssessment(
     coreLogic: scoreCoreLogic(sig),
     backgroundAutomation: scoreBackgroundAutomation(sig),
     externalIntegrations: scoreExternalIntegrations(sig),
-    security: scoreSecurity(sig, preflight),
+    security: scoreSecurity(sig, calibratedPreflight),
     performance: scorePerformance(sig),
     documentationVerified: scoreDocumentation(sig),
   };
+
+  // README-vs-repo mismatch (§3): the README describes paths and a stack
+  // the code does not have, so Documentation cannot read as finished —
+  // cap at 4/10. The README length / comment / interface points still
+  // count; the cap is what changes. Recorded in capsApplied like the
+  // other deterministic caps.
+  if (categories.documentationVerified.note === "readme-mismatch") {
+    const before = categories.documentationVerified.score;
+    categories.documentationVerified = {
+      ...categories.documentationVerified,
+      score: Math.min(before, 4),
+      evidence: [
+        ...categories.documentationVerified.evidence,
+        "README-vs-repo mismatch: Documentation capped at 4/10",
+      ],
+    };
+    if (before > 4) {
+      capsApplied.push("README describes paths/technologies not in the repo: Documentation capped at 4/10");
+    }
+  }
 
   // CAP C (broken loop / missing webhooks): deterministic deduction.
   if (stripePresentWithoutWebhook(sig)) {
@@ -1412,7 +1644,7 @@ export function computeDeterministicAssessment(
   // Finding↔category reconciliation: a critical/high finding caps every
   // rubric category it touches, so a 10/10 can never sit next to a
   // critical finding in the same category.
-  reconcileFindingCaps(categories, preflight, capsApplied);
+  reconcileFindingCaps(categories, calibratedPreflight, capsApplied);
 
   // CAP A / CAP B scale the total; largest-remainder keeps ints exact.
   // N/A categories are excluded from scaling entirely (they stay 0 and the
@@ -1465,7 +1697,6 @@ export function computeDeterministicAssessment(
   }
 
   const missingFeatures = computeMissingFeatures(sig, categories);
-  const deterministicFindings = computeDeterministicFindings(sig);
   // The total is rescaled to 0-100 over the applicable categories only, so an
   // N/A category neither inflates nor deflates the score. applicableCount is
   // exposed so the report can show "N of 10 categories applicable".
@@ -1476,7 +1707,7 @@ export function computeDeterministicAssessment(
   if (totalCap !== null) completenessScore = Math.min(completenessScore, totalCap);
   const importMap = sig.files.map((f) => ({ path: f.path, imports: f.imports.slice(0, 40) }));
 
-  return { categories, missingFeatures, deterministicFindings, completenessScore, applicableCount, capsApplied, importMap };
+  return { categories, missingFeatures, deterministicFindings, calibratedPreflightFindings: calibratedPreflight.findings, completenessScore, applicableCount, capsApplied, importMap };
 }
 
 // ---------------------------------------------------------------------------

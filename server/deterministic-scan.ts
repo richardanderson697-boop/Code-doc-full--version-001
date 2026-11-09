@@ -44,6 +44,7 @@ export interface DeterministicAnalysis {
   mockedPaymentCount: number;
   mockedNotificationCount: number;
   deliveryClaimCount: number;
+  fabricatedStatusCount: number;
   // Coverage was reduced: the input was longer than the byte cap, or some
   // lines were longer than the line cap. Reported rather than hidden.
   truncated: boolean;
@@ -61,6 +62,7 @@ export interface DeterministicAnalysis {
   mockedPayments: ScanIssue[];
   mockedNotifications: ScanIssue[];
   deliveryClaims: ScanIssue[];
+  fabricatedStatus: FabricatedStatusIssue[];
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +398,436 @@ function findMockedPayments(code: string, filePath: string): ScanIssue[] {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Fabricated status responses (README-truth spec §4). A route handler
+// returns a res.json/res.send object whose values are all literals, with a
+// key matching /status|health/i carrying a status word ('Healthy',
+// 'ok', 'connected') — constants presented as live metrics, with no
+// query or check behind them. The RentStream pattern:
+//   res.json({ activeUsers: 1452, bookingsToday: 89,
+//              systemHealth: 'Healthy', databaseStatus: 'Connected' });
+// The numbers are invented; the strings are constants. A buyer reading
+// that dashboard believes the system is live.
+//
+// The response is NOT literal-checked when the file is a seed/fixture/
+// sample/mock or a test — those are data, not claims — and a bare
+// liveness route (/health, /ping, ...) is excluded: answering "up" is
+// what it is for. What is NOT covered in v1: counts-only responses
+// with no status signal (a numeric body with no status word is not a
+// live-metrics claim; see spec §4 "Open question 3"), and a status
+// string computed from real state — the literal-only check lets it
+// through, which is the right direction (it is at least computed).
+// ---------------------------------------------------------------------------
+
+export interface FabricatedStatusIssue {
+  /** "line" or "start-end". */
+  lines: string;
+  code: string;
+  /** e.g. "GET /api/admin/metrics" when the route registration was found. */
+  route?: string;
+  /** The exact status signal found, e.g. `systemHealth: 'Healthy'`. */
+  statusSignal: string;
+}
+
+// A status key carrying one of these words is presented as a live state,
+// not a count or an id.
+const STATUS_WORDS = ["healthy", "ok", "connected", "operational", "online", "up", "live"];
+const STATUS_KEY = /status|health/i;
+const STATUS_WORD = new RegExp(`^['"\`](?:${STATUS_WORDS.join("|")})['"\`]$`, "i");
+
+// Bare liveness endpoints answer "up" by design; a constant there is not
+// a live-metrics claim.
+const LIVENESS_PATHS = new Set(["/health", "/healthz", "/ready", "/live", "/ping"]);
+
+// A res.json/res.send with an inline object literal as its argument.
+const RESPONSE_CALL =
+  /(?:\bres|\bresponse)\s*\.\s*(?:json|send)\s*\(\s*(\{)/g;
+const ROUTE_REGISTRATION =
+  /\b(?:app|router)\s*\.\s*(get|post|put|patch|delete|head|options)\s*\(\s*['"`]([^'"`]+)['"`]/g;
+const TEST_FILE = /\.(?:test|spec)\.[jt]sx?$/i;
+
+// Brace-match from the opening brace at `open`, returning the index just
+// past the matching close. Strings, template literals (with ${...}
+// interpolation) and nested brackets are honoured. Returns -1 when the
+// object never closes — the file is truncated and nothing may be said.
+function matchObjectLiteral(text: string, open: number): number {
+  const stack: string[] = [];
+  let state: "code" | "sq" | "dq" | "tq" = "code";
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (state === "sq") {
+      if (ch === "\\") i++;
+      else if (ch === "'") state = "code";
+      continue;
+    }
+    if (state === "dq") {
+      if (ch === "\\") i++;
+      else if (ch === '"') state = "code";
+      continue;
+    }
+    if (state === "tq") {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === "`") {
+        state = "code";
+        continue;
+      }
+      if (ch === "$" && text[i + 1] === "{") {
+        stack.push("${");
+        state = "code";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'") state = "sq";
+    else if (ch === '"') state = "dq";
+    else if (ch === "`") state = "tq";
+    else if (ch === "(" || ch === "[" || ch === "{") stack.push(ch);
+    else if (ch === ")" || ch === "]" || ch === "}") {
+      const kind = stack.pop();
+      if (kind === "${") {
+        state = "tq";
+        continue;
+      }
+      if (stack.length === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+// Split the interior of an object literal on its top-level commas,
+// honouring strings, template literals and nested brackets. Returns
+// null on unbalanced input.
+function splitTopLevelCommas(s: string): string[] | null {
+  const parts: string[] = [];
+  const stack: string[] = [];
+  let state: "code" | "sq" | "dq" | "tq" = "code";
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (state === "sq") {
+      if (ch === "\\") i++;
+      else if (ch === "'") state = "code";
+      continue;
+    }
+    if (state === "dq") {
+      if (ch === "\\") i++;
+      else if (ch === '"') state = "code";
+      continue;
+    }
+    if (state === "tq") {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === "`") {
+        state = "code";
+        continue;
+      }
+      if (ch === "$" && s[i + 1] === "{") {
+        stack.push("${");
+        state = "code";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'") state = "sq";
+    else if (ch === '"') state = "dq";
+    else if (ch === "`") state = "tq";
+    else if (ch === "(" || ch === "[" || ch === "{") stack.push(ch);
+    else if (ch === ")" || ch === "]" || ch === "}") {
+      const kind = stack.pop();
+      if (kind === undefined) return null;
+      if (kind === "${") state = "tq";
+    } else if (ch === "," && stack.length === 0) {
+      parts.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (state !== "code" || stack.length !== 0) return null;
+  parts.push(s.slice(start));
+  return parts;
+}
+
+// The first colon at brace depth 0, outside strings — the key/value
+// separator of one top-level field. -1 when the field has no colon
+// (a spread or a shorthand with no value of its own).
+function firstTopLevelColon(s: string): number {
+  const stack: string[] = [];
+  let state: "code" | "sq" | "dq" | "tq" = "code";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (state === "sq") {
+      if (ch === "\\") i++;
+      else if (ch === "'") state = "code";
+      continue;
+    }
+    if (state === "dq") {
+      if (ch === "\\") i++;
+      else if (ch === '"') state = "code";
+      continue;
+    }
+    if (state === "tq") {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === "`") {
+        state = "code";
+        continue;
+      }
+      if (ch === "$" && s[i + 1] === "{") {
+        stack.push("${");
+        state = "code";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'") state = "sq";
+    else if (ch === '"') state = "dq";
+    else if (ch === "`") state = "tq";
+    else if (ch === "(" || ch === "[" || ch === "{") stack.push(ch);
+    else if (ch === ")" || ch === "]" || ch === "}") {
+      const kind = stack.pop();
+      if (kind === "${") state = "tq";
+    } else if (ch === ":" && stack.length === 0) return i;
+  }
+  return -1;
+}
+
+// A value that is a constant, not a computation: a number, a quoted
+// string, a boolean, null. Everything else — an identifier, a member
+// access, a call, a template literal (it interpolates something), a
+// nested object or array — is at least computed, so the response is not
+// fabricated by this rule.
+function isLiteralValue(value: string): boolean {
+  const v = value.trim();
+  if (v === "true" || v === "false" || v === "null") return true;
+  if (/^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(v)) return true;
+  const m = /^(['"`])(.*)\1$/.exec(v);
+  // A template literal interpolates — computed, not constant.
+  if (m && m[1] === "`") return false;
+  return m !== null;
+}
+
+// Whether the `/` at `i` starts a regex literal rather than division.
+// The previous significant token decides: after an operator, an opening
+// bracket, a comma, a colon, a semicolon, a `}` (block close), or a
+// return-like keyword, a `/` opens a regex; after an operand (identifier,
+// number, string end, `)`, `]`) it divides. The standard heuristic —
+// without it, a regex containing quotes (e.g. /^['"`]|['"`]$/g)
+// toggles the string states and the stripper desyncs for the rest of
+// the file, blanking real code as "string" and missing real comments.
+const REGEX_KEYWORDS = new Set([
+  "return", "typeof", "case", "delete", "void", "in", "of",
+  "instanceof", "new", "yield", "await", "else", "do",
+]);
+
+function isRegexStart(text: string, i: number): boolean {
+  let j = i - 1;
+  while (j >= 0 && /\s/.test(text[j])) j--;
+  if (j < 0) return true;
+  const prev = text[j];
+  if ("(,=:[!&|?{};*+-/%^~<>".includes(prev)) return true;
+  if (prev === "}") return true;
+  if (/[A-Za-z0-9_$]/.test(prev)) {
+    let k = j;
+    while (k >= 0 && /[A-Za-z0-9_$]/.test(text[k])) k--;
+    return REGEX_KEYWORDS.has(text.slice(k + 1, j + 1));
+  }
+  return false;
+}
+
+// The index just past a regex literal starting at `i` (text[i] === '/'),
+// flags included. Escapes and [...] classes are honoured, so a `/`
+// inside a class never ends the regex. Bails at a newline — an
+// unterminated regex must not swallow the rest of the file.
+function skipRegex(text: string, i: number): number {
+  let j = i + 1;
+  let inClass = false;
+  while (j < text.length) {
+    const c = text[j];
+    if (c === "\\") {
+      j += 2;
+      continue;
+    }
+    if (c === "[") inClass = true;
+    else if (c === "]") inClass = false;
+    else if (c === "/" && !inClass) {
+      j++;
+      while (j < text.length && /[a-z]/i.test(text[j])) j++;
+      return j;
+    } else if (c === "\n") return j;
+    j++;
+  }
+  return j;
+}
+// newline, so a commented-out res.json — a doc example, a disabled
+// handler — never reads as a live endpoint. Strings and template
+// literals are left intact (a "//" inside a string is not a comment);
+// ${...} interpolation is scanned as code, so a comment inside one is
+// still blanked. The returned string is the same length as the input,
+// so every index and line number found here maps 1:1 to the original.
+function stripCommentsToSpaces(text: string): string {
+  const out = text.split("");
+  let state: "code" | "sq" | "dq" | "tq" | "line" | "block" = "code";
+  const stack: string[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (state === "line") {
+      if (ch === "\n") state = "code";
+      else out[i] = " ";
+      continue;
+    }
+    if (state === "block") {
+      if (ch === "*" && text[i + 1] === "/") {
+        out[i] = " ";
+        out[i + 1] = " ";
+        i++;
+        state = "code";
+      } else if (ch !== "\n") out[i] = " ";
+      continue;
+    }
+    if (state === "sq") {
+      if (ch === "\\") i++;
+      else if (ch === "'") state = "code";
+      continue;
+    }
+    if (state === "dq") {
+      if (ch === "\\") i++;
+      else if (ch === '"') state = "code";
+      continue;
+    }
+    if (state === "tq") {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === "`") {
+        state = "code";
+        continue;
+      }
+      if (ch === "$" && text[i + 1] === "{") {
+        stack.push("${");
+        state = "code";
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'") state = "sq";
+    else if (ch === '"') state = "dq";
+    else if (ch === "`") state = "tq";
+    else if (ch === "/" && text[i + 1] === "/") {
+      out[i] = " ";
+      out[i + 1] = " ";
+      i++;
+      state = "line";
+    } else if (ch === "/" && text[i + 1] === "*") {
+      out[i] = " ";
+      out[i + 1] = " ";
+      i++;
+      state = "block";
+    } else if (ch === "/" && isRegexStart(text, i)) {
+      // A regex literal is code, not a comment — but its contents must
+      // not toggle the string states (a quote inside /['"]/ would
+      // desync the stripper for the rest of the file). Skip it whole.
+      i = skipRegex(text, i) - 1;
+    } else if (ch === "(" || ch === "[" || ch === "{") stack.push(ch);
+    else if (ch === ")" || ch === "]" || ch === "}") {
+      const kind = stack.pop();
+      if (kind === "${") state = "tq";
+    }
+  }
+  return out.join("");
+}
+
+// The 1-based line number of a character index in the file.
+function lineOf(text: string, index: number): string {
+  return String(text.slice(0, index).split("\n").length);
+}
+
+export function findFabricatedStatus(code: string, filePath: string): FabricatedStatusIssue[] {
+  if (SEED_DATA_FILE.test(filePath) || TEST_FILE.test(filePath)) return [];
+
+  // Scan comment-stripped text: a commented-out res.json is a doc
+  // example or a disabled handler, not a live endpoint. Positions are
+  // preserved, so indices and line numbers map 1:1 to the original;
+  // the evidence snippet is sliced from the original text.
+  const text = stripCommentsToSpaces(code);
+
+  // The route each response call belongs to: the nearest registration
+  // before it. A response on a bare liveness route is not a claim.
+  const routes: { index: number; route: string }[] = [];
+  ROUTE_REGISTRATION.lastIndex = 0;
+  let reg: RegExpExecArray | null;
+  while ((reg = ROUTE_REGISTRATION.exec(text)) !== null) {
+    routes.push({ index: reg.index, route: `${reg[1].toUpperCase()} ${reg[2]}` });
+  }
+  const routeAt = (index: number): string | undefined => {
+    let found: string | undefined;
+    for (const r of routes) {
+      if (r.index > index) break;
+      found = r.route;
+    }
+    return found;
+  };
+  const routePathOf = (route: string | undefined): string | undefined =>
+    route ? route.split(" ")[1] : undefined;
+
+  const out: FabricatedStatusIssue[] = [];
+  RESPONSE_CALL.lastIndex = 0;
+  let call: RegExpExecArray | null;
+  while ((call = RESPONSE_CALL.exec(text)) !== null) {
+    const braceIndex = text.indexOf("{", call.index);
+    const end = matchObjectLiteral(text, braceIndex);
+    if (end === -1) continue;
+    const fields = splitTopLevelCommas(text.slice(braceIndex + 1, end - 1));
+    if (!fields || fields.length < 2) continue;
+
+    // Every field must be a key with a literal value. A spread, a
+    // shorthand, or a computed value means the response is at least
+    // partly computed — not fabricated by this rule.
+    const parsed: { key: string; value: string }[] = [];
+    let allLiteral = true;
+    for (const field of fields) {
+      const trimmed = field.trim();
+      if (!trimmed) continue;
+      const colon = firstTopLevelColon(trimmed);
+      if (colon === -1) {
+        allLiteral = false;
+        break;
+      }
+      const key = trimmed.slice(0, colon).trim().replace(/^['"`]|['"`]$/g, "");
+      const value = trimmed.slice(colon + 1);
+      if (!isLiteralValue(value)) {
+        allLiteral = false;
+        break;
+      }
+      parsed.push({ key, value });
+    }
+    if (!allLiteral || parsed.length < 2) continue;
+
+    const signal = parsed.find(
+      (f) => STATUS_KEY.test(f.key) && STATUS_WORD.test(f.value.trim())
+    );
+    if (!signal) continue;
+
+    const route = routeAt(call.index);
+    const routePath = routePathOf(route);
+    if (routePath && LIVENESS_PATHS.has(routePath)) continue;
+
+    out.push({
+      lines: lineOf(text, call.index),
+      code: code.slice(braceIndex, Math.min(end, braceIndex + 120)).replace(/\s+/g, " ").trim(),
+      route,
+      statusSignal: `${signal.key}: ${signal.value.trim()}`,
+    });
+  }
+  return out;
+}
+
 export function runDeterministicScan(code: string, filePath = ""): DeterministicAnalysis {
   // Truncate before splitting: past the byte cap the extra input adds no
   // useful evidence and only costs backtracking time.
@@ -519,6 +951,7 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
   const mockedPayments = findMockedPayments(bounded, filePath);
   const mockedNotifications = findMockedNotifications(bounded, filePath);
   const deliveryClaims = findDeliveryClaims(bounded, filePath);
+  const fabricatedStatus = findFabricatedStatus(bounded, filePath);
 
   return {
     truncated: bounded.length < code.length,
@@ -536,6 +969,7 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     mockedPaymentCount: mockedPayments.length,
     mockedNotificationCount: mockedNotifications.length,
     deliveryClaimCount: deliveryClaims.length,
+    fabricatedStatusCount: fabricatedStatus.length,
     endpoints,
     fetchCalls,
     todos,
@@ -548,5 +982,6 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
     mockedPayments,
     mockedNotifications,
     deliveryClaims,
+    fabricatedStatus,
   };
 }

@@ -39,6 +39,7 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
   // before the model call, so a model outage should still hand the client
   // the findings instead of a bare error (same contract as cold-audit).
   let preflight: PreFlightReport | undefined;
+  let calibratedPreflight: PreFlightReport | undefined;
   try {
     let files: WorkspaceFile[] = [];
     const userId = req.user!.id;
@@ -123,6 +124,18 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
     // security/quality findings the LLM report can cite as ground truth.
     preflight = runPreFlightScan(files.map(f => ({ path: f.path, content: f.content })));
 
+    // Deterministic assessment: the 10 category scores, the missing-features
+    // list, and the total are computed from scan evidence (pure functions —
+    // identical input always yields identical numbers). The model explains
+    // these facts; it does not invent or adjust them. Computed before the
+    // prompt digest because the assessment calibrates the PreFlight
+    // findings (README-truth spec §5: a no-auth finding on a route whose
+    // handler returns only hardcoded values is reframed critical → high),
+    // and the digest, the report, and the Q&A must all see the same
+    // calibrated view.
+    const assessment = computeDeterministicAssessment(files, preflight);
+    calibratedPreflight = { ...preflight, findings: assessment.calibratedPreflightFindings };
+
     // Build workspace context string for Gemini
     let workspaceContext = `You are evaluating a React/TypeScript project with ${totalFiles} file(s) totaling ${totalLines} line(s) of code.\n\n`;
     files.forEach(f => {
@@ -131,13 +144,8 @@ router.post("/api/project-intelligence", requireAuth, requireCredits("intelligen
       workspaceContext += f.content;
       workspaceContext += `\n---------------------------------------------\n\n`;
     });
-    workspaceContext += `\n---\n${formatFindingsForPrompt(preflight)}\nWhen scoring the "security" category, weigh these deterministic findings; cite them by file and line in the reason instead of guessing.\n`;
+    workspaceContext += `\n---\n${formatFindingsForPrompt(calibratedPreflight)}\nWhen scoring the "security" category, weigh these deterministic findings; cite them by file and line in the reason instead of guessing.\n`;
 
-    // Deterministic assessment: the 10 category scores, the missing-features
-    // list, and the total are computed from scan evidence (pure functions —
-    // identical input always yields identical numbers). The model explains
-    // these facts; it does not invent or adjust them.
-    const assessment = computeDeterministicAssessment(files, preflight);
     workspaceContext += `\n---\n${formatAssessmentForPrompt(assessment)}\n`;
 
     const INTEL_SYSTEM_PROMPT = `You are VibeCoder Project Intelligence Engine, an elite full-workspace software architect. 
@@ -377,8 +385,10 @@ The total completenessScore is computed server-side (rescaled over the applicabl
     }
 
     const parsedIntel = JSON.parse(cleanText);
-    // Attach the deterministic report for the dedicated UI panel.
-    parsedIntel.preflight = preflight;
+    // Attach the deterministic report for the dedicated UI panel — the
+    // calibrated findings (§5), so the panel shows the reframed no-auth
+    // finding, not the uncalibrated critical.
+    parsedIntel.preflight = calibratedPreflight;
 
     // Enforce determinism: the served report always carries the computed
     // scores and missing-feature list, even if the model drifted. The model's
@@ -465,7 +475,7 @@ The total completenessScore is computed server-side (rescaled over the applicabl
     log.error("Project Intelligence API Error:", error);
     res.status(500).json({
       error: formatGeminiError(error),
-      ...(preflight ? { preflight } : {}),
+      ...(calibratedPreflight ? { preflight: calibratedPreflight } : preflight ? { preflight } : {}),
     });
   }
 }));
