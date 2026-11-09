@@ -17,6 +17,11 @@
 import { runDeterministicScan, DELIVERY_PROVIDER_USE, type DeterministicAnalysis } from "./deterministic-scan";
 import type { PreFlightReport, PreFlightFinding } from "../shared/preflight-types";
 import type { WorkspaceFile } from "./workspace";
+import {
+  downgradeMiddlewareGatedNoAuthFindings,
+  NO_AUTH_TITLE,
+  type VerifiedRouteGate,
+} from "./route-middleware-auth";
 
 export const CATEGORY_KEYS = [
   "serverStarts",
@@ -561,7 +566,7 @@ function scoreServerStarts(sig: WorkspaceSignals): CategoryResult {
   return { score: 2, max: 10, evidence };
 }
 
-function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
+function scoreAuthentication(sig: WorkspaceSignals, verifiedGates: VerifiedRouteGate[] = []): CategoryResult {
   const evidence: string[] = [];
   const declaration = sig.declarations.find((d) => d.category === "authentication");
   const implFiles = sig.files.filter(
@@ -587,6 +592,26 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
       return { score: 5, max: 10, evidence };
     }
     return { score: 10, max: 10, evidence };
+  }
+
+  // Route-level gates (middleware-auth spec §3): a verified route-level
+  // gate is real protection but not user accounts or sessions, so it scores
+  // low (3 — above the 2 for dangling, since there IS a real gate, well
+  // below the 5 for a stubbed implementation) with wording that says what
+  // exists. Positive code evidence beats a possibly-stale doc declaration
+  // (the README may describe the pre-fix state), so this sits above the
+  // declaration branch.
+  if (verifiedGates.length > 0) {
+    const first = verifiedGates[0];
+    evidence.push(
+      `route-level ${first.mechanism} check on ${first.method} ${first.route} (${first.middlewareName}, ${first.file}:${first.line}); no user accounts or sessions`
+    );
+    for (const g of verifiedGates.slice(1, 3)) {
+      evidence.push(
+        `route-level ${g.mechanism} check on ${g.method} ${g.route} (${g.middlewareName}, ${g.file}:${g.line})`
+      );
+    }
+    return { score: 3, max: 10, evidence, note: "route-level-gate" };
   }
 
   // Precedence: positive evidence > declaration > dangling inference.
@@ -1481,9 +1506,8 @@ const PROBE_CATEGORY_MAP: Record<string, CategoryKey[]> = {
 // Pure: returns a new findings array; the input report is untouched.
 // ---------------------------------------------------------------------------
 
-// The auth probe's no-auth title shape: "GET /api/admin/metrics without
-// auth check" (method, then the route path it attributed the finding to).
-const NO_AUTH_TITLE = /^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (\S+) without auth check$/;
+// The auth probe's no-auth title shape lives in route-middleware-auth.ts
+// (shared with the middleware-gate resolution); see NO_AUTH_TITLE there.
 
 function calibrateNoAuthFindings(
   preflight: PreFlightReport,
@@ -1567,14 +1591,24 @@ export function computeDeterministicAssessment(
   // must see the calibrated severity — so the findings are computed
   // before the categories, not after them as before.
   const deterministicFindings = computeDeterministicFindings(sig);
+  // Route-middleware auth (middleware-auth spec §3): a no-auth finding
+  // whose route is gated by a verified middleware is downgraded to needs
+  // developer verification (never deleted) BEFORE the calibration below —
+  // the downgraded title no longer matches NO_AUTH_TITLE, so the
+  // calibration does not touch it. The verified gates also feed the auth
+  // category (a route-level gate alone scores 3, not 0).
+  const middlewareResolution = downgradeMiddlewareGatedNoAuthFindings(files, preflight.findings);
   const calibratedPreflight: PreFlightReport = {
     ...preflight,
-    findings: calibrateNoAuthFindings(preflight, deterministicFindings),
+    findings: calibrateNoAuthFindings(
+      { ...preflight, findings: middlewareResolution.findings },
+      deterministicFindings
+    ),
   };
 
   const categories: Record<CategoryKey, CategoryResult> = {
     serverStarts: scoreServerStarts(sig),
-    authentication: scoreAuthentication(sig),
+    authentication: scoreAuthentication(sig, middlewareResolution.gates),
     databaseLayer: scoreDatabaseLayer(sig),
     errorHandling: scoreErrorHandling(sig),
     coreLogic: scoreCoreLogic(sig),
