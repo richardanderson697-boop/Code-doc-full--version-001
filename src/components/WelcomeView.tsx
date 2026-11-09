@@ -22,13 +22,15 @@ import {
 import { VibeProject } from "../types";
 import { logError } from "../utils/logger";
 import { initialTabFromSearch } from "../utils/tabDeepLink";
+import { titleFromRepoUrl, titleFromZipName } from "../utils/sharedReview";
 import MultiFileBuilder, { MultiFileInfo } from "./MultiFileBuilder";
 
 interface WelcomeViewProps {
   onGenerate: (prompt: string) => void;
   onMultiFileComplete: (info: MultiFileInfo) => void;
   onAuditExternalCode: (code: string) => void;
-  onUploadZipCodebase: (files: { path: string; lineCount: number }[]) => void;
+  // title is the ZIP filename or owner/repo — the shared review title.
+  onUploadZipCodebase: (files: { path: string; lineCount: number }[], title?: string) => void;
   isLoading: boolean;
   savedCount: number;
   onOpenRegistry: () => void;
@@ -79,7 +81,7 @@ export default function WelcomeView({
       }
       const parsed = await response.json();
       setRepoUrl("");
-      onUploadZipCodebase(parsed.files || []);
+      onUploadZipCodebase(parsed.files || [], titleFromRepoUrl(url));
     } catch (e: any) {
       setZipError(e.message || "An error occurred during repo import.");
     } finally {
@@ -191,7 +193,7 @@ export default function WelcomeView({
           }
 
           const parsed = await response.json();
-          onUploadZipCodebase(parsed.files || []);
+          onUploadZipCodebase(parsed.files || [], titleFromZipName(file.name));
         } catch (e: any) {
           setZipError(e.message || "An error occurred during upload or extraction.");
         } finally {

@@ -47,6 +47,15 @@ import {
 } from "lucide-react";
 import { motion } from "motion/react";
 import { logError } from "../utils/logger";
+import {
+  createWorkspaceReview,
+  titleFromRepoUrl,
+  titleFromZipName,
+  withIntelError,
+  withIntelResult,
+  withIntelStatus,
+  type SharedReview,
+} from "../utils/sharedReview";
 import { tryDownloadWorkspaceZip } from "../utils/downloadWorkspace";
 import type { PreFlightReport } from "../../shared/preflight-types";
 import { AuditResult } from "./auditor/types";
@@ -64,6 +73,13 @@ interface CodeAuditorProps {
   // hidden (CSS), so the workspace file list must refresh when the tab is
   // opened — otherwise it shows the state from first mount forever.
   isActive?: boolean;
+  // Shared FinalRead review (held in App): the intelligence result lives
+  // here so toggling to the FinalRead entry shows the same report without
+  // re-scanning. Only workspace-originated reviews are adopted or written;
+  // an entry-originated (buyer) review is never surfaced in the workspace.
+  sharedReview?: SharedReview | null;
+  onSharedReviewChange?: (next: SharedReview | null) => void;
+  projectTitle?: string;
 }
 
 export default function CodeAuditor({
@@ -71,7 +87,10 @@ export default function CodeAuditor({
   isGenerating = false,
   highlightedLine,
   onHighlightLine,
-  isActive = true
+  isActive = true,
+  sharedReview = null,
+  onSharedReviewChange,
+  projectTitle = "Your codebase",
 }: CodeAuditorProps) {
   const [code, setCode] = useState(workspaceCode || "");
   const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
@@ -84,10 +103,19 @@ export default function CodeAuditor({
   // Two Modes: "cold-read" | "project-intelligence"
   const [auditMode, setAuditMode] = useState<"cold-read" | "project-intelligence">("cold-read");
 
-  // Project Intelligence states
-  const [intelStatus, setIntelStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
-  const [intelResult, setIntelResult] = useState<any | null>(null);
-  const [intelError, setIntelError] = useState("");
+  // Project Intelligence states — mirrored into the shared review held in
+  // App, so the FinalRead entry renders the same report without re-scanning.
+  // On remount (toggling back from the entry) the local state re-adopts the
+  // shared review, so the workspace returns exactly as it was left.
+  const [intelStatus, setIntelStatus] = useState<"idle" | "loading" | "done" | "error">(() =>
+    sharedReview?.source === "workspace" ? sharedReview.intelStatus : "idle"
+  );
+  const [intelResult, setIntelResult] = useState<any | null>(() =>
+    sharedReview?.source === "workspace" ? sharedReview.intelResult : null
+  );
+  const [intelError, setIntelError] = useState(() =>
+    sharedReview?.source === "workspace" ? sharedReview.intelError ?? "" : ""
+  );
 
   // Step 2 score source: the user chooses what gets graded. "workspace" is
   // the whole uploaded workspace, "selected" is the file picked in Step 1,
@@ -298,6 +326,9 @@ export default function CodeAuditor({
           setAuditMode("project-intelligence");
           setIntelResult(null);
           setIntelStatus("idle");
+          // A workspace upload starts a shared review, so the FinalRead
+          // entry can adopt it without re-uploading.
+          onSharedReviewChange?.(createWorkspaceReview(titleFromZipName(file.name)));
         } catch (e: any) {
           setZipError(e.message || "An error occurred during upload or extraction.");
         } finally {
@@ -347,6 +378,8 @@ export default function CodeAuditor({
       setAuditMode("project-intelligence");
       setIntelResult(null);
       setIntelStatus("idle");
+      // A workspace repo import starts a shared review, as a ZIP upload does.
+      onSharedReviewChange?.(createWorkspaceReview(titleFromRepoUrl(url)));
     } catch (e: any) {
       setZipError(e.message || "An error occurred during repository import.");
     } finally {
@@ -366,6 +399,9 @@ export default function CodeAuditor({
         setZipUploaded(false);
         setIntelResult(null);
         setIntelStatus("idle");
+        // Clearing the upload clears the shared review too — there is no
+        // workspace review left for the entry to adopt.
+        onSharedReviewChange?.(null);
       } else {
         const errData = await response.json().catch(() => ({}));
         throw new Error(errData.error || "Failed to clear on server.");
@@ -645,6 +681,12 @@ export default function CodeAuditor({
     setIntelError("");
     setIntelResult(null);
     setIntelPreflight(null);
+    // A workspace scan supersedes whatever review is shared — including an
+    // entry-originated one, which grades different code — and starts fresh
+    // in "loading", so no stale report can be shown as this scan's result.
+    onSharedReviewChange?.(
+      withIntelStatus(createWorkspaceReview(projectTitle), "loading")
+    );
 
     // The server grades exactly what we send: nothing is ever inferred.
     // "workspace" sends nothing (server uses the whole uploaded workspace),
@@ -680,14 +722,15 @@ export default function CodeAuditor({
       const parsed = await response.json();
       setIntelResult(parsed);
       setIntelStatus("done");
+      onSharedReviewChange?.(withIntelResult(createWorkspaceReview(projectTitle), parsed));
     } catch (e: any) {
       const isFetchError = e.message && e.message.toLowerCase().includes("failed to fetch");
-      setIntelError(
-        isFetchError
-          ? "Failed to fetch. This usually occurs when the backend server is temporarily compiling or restarting after a code change. Please wait a moment and try clicking the scan button again."
-          : e.message || "Auditor connection timed out or returned invalid response."
-      );
+      const message = isFetchError
+        ? "Failed to fetch. This usually occurs when the backend server is temporarily compiling or restarting after a code change. Please wait a moment and try clicking the scan button again."
+        : e.message || "Auditor connection timed out or returned invalid response.";
+      setIntelError(message);
       setIntelStatus("error");
+      onSharedReviewChange?.(withIntelError(createWorkspaceReview(projectTitle), message));
     }
   };
 

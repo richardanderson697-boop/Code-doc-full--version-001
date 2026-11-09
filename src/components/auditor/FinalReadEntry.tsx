@@ -23,6 +23,16 @@ import {
 import FinalReadOverlay, {
   intelResultToFinalReadInput,
 } from "./FinalReadOverlay";
+import {
+  createEntryReview,
+  reviewHasReport,
+  showDeveloperWorkspaceToggle,
+  titleFromRepoUrl,
+  titleFromZipName,
+  withIntelResult,
+  type SharedReview,
+  type SharedReviewSource,
+} from "../../utils/sharedReview";
 
 type Phase = "idle" | "uploading" | "scanning" | "done" | "error";
 
@@ -54,7 +64,19 @@ const DELIVERABLES = [
   },
 ];
 
-export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
+export default function FinalReadEntry({
+  onExit,
+  sharedReview = null,
+  onSharedReviewChange,
+}: {
+  onExit: () => void;
+  // The shared review held in App. When it exists, the entry adopts it
+  // instead of asking for another upload — toggling never re-scans or
+  // re-charges. An entry-originated review is recorded here too (so
+  // re-entering restores the report), but it never sets App workspace state.
+  sharedReview?: SharedReview | null;
+  onSharedReviewChange?: (next: SharedReview | null) => void;
+}) {
   // Buyer-facing tab title while the FinalRead entry is open; restore on exit.
   useEffect(() => {
     const prev = document.title;
@@ -76,6 +98,15 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
   const [balance, setBalance] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const stageTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Adopted mode is decided at mount: the entry opened onto a review that
+  // already exists in the shared state. It is never re-derived while
+  // mounted, so closing a just-finished ingest report returns to the
+  // ingest hero instead of re-showing the adopted report.
+  const [adoptedAtMount] = useState(() => reviewHasReport(sharedReview));
+  const [continueAtMount] = useState(
+    () => sharedReview != null && !reviewHasReport(sharedReview)
+  );
 
   // Everything the buyer does here is FinalRead: every credit gate in this
   // flow offers the FinalRead price list instead of consumer packs.
@@ -126,7 +157,7 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
     return false;
   };
 
-  const runReview = async (title: string) => {
+  const runReview = async (title: string, origin: SharedReviewSource | "preserve") => {
     setProjectTitle(title);
     setPhase("scanning");
     setError("");
@@ -151,6 +182,15 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
       }
       const parsed = await response.json();
       setIntelResult(parsed);
+      // The finished scan becomes the shared review: re-entering the entry
+      // restores the report without re-uploading or re-scanning. A scan run
+      // on an existing review ("preserve") keeps its origin — a workspace
+      // review stays workspace-originated, so the toggle stays available.
+      const next =
+        origin === "preserve" && sharedReview
+          ? withIntelResult(sharedReview, parsed)
+          : createEntryReview(title, parsed);
+      onSharedReviewChange?.(next);
       setPhase("done");
     } catch (e: any) {
       if (e instanceof AuthRequiredError) {
@@ -204,8 +244,8 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
             errData.error || "The archive couldn't be opened. Please check it's a valid .zip."
           );
         }
-        const title = file.name.replace(/\.zip$/i, "") || "Your codebase";
-        await runReview(title);
+        const title = titleFromZipName(file.name);
+        await runReview(title, "entry");
       } catch (e: any) {
         if (e instanceof AuthRequiredError || e instanceof CreditsRequiredError) {
           setPhase("idle");
@@ -244,10 +284,9 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
             errData.error || "That repository couldn't be fetched. Please check the URL."
           );
         }
-        const m = url.match(/github\.com\/([^/]+\/[^/?#]+)/i);
-        const title = m ? m[1].replace(/\.git$/i, "") : "Your codebase";
+        const title = titleFromRepoUrl(url);
         setRepoUrl("");
-        await runReview(title);
+        await runReview(title, "entry");
       } catch (e: any) {
         if (e instanceof AuthRequiredError || e instanceof CreditsRequiredError) {
           setPhase("idle");
@@ -298,6 +337,19 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
     );
   }
 
+  // Adopted mode: the entry opened onto a finished shared review, so the
+  // report renders immediately — no upload, no second scan, no new charge.
+  // Closing it returns to the workspace (the review came from there), not
+  // to this entry's upload hero.
+  if (adoptedAtMount && sharedReview?.intelResult) {
+    return (
+      <FinalReadOverlay
+        audit={intelResultToFinalReadInput(sharedReview.intelResult, sharedReview.title)}
+        onClose={onExit}
+      />
+    );
+  }
+
   const working = phase === "uploading" || phase === "scanning";
 
   return (
@@ -305,13 +357,26 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
       <div className="max-w-3xl mx-auto px-4 py-8 md:py-12 select-text">
         {/* Top bar */}
         <div className="flex items-center justify-between mb-8">
-          <button
-            type="button"
-            onClick={onExit}
-            className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300 transition"
-          >
-            <ArrowLeft className="w-3.5 h-3.5" /> Back
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onExit}
+              className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-300 transition"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" /> Back
+            </button>
+            {/* Visible only for workspace-originated reviews: a buyer who
+                only ever used the entry has no workspace and sees no toggle. */}
+            {showDeveloperWorkspaceToggle(sharedReview) && (
+              <button
+                type="button"
+                onClick={onExit}
+                className="flex items-center gap-1.5 text-xs font-medium text-indigo-300 bg-indigo-500/10 border border-indigo-500/25 hover:bg-indigo-500/20 rounded-lg px-2.5 py-1.5 transition"
+              >
+                Developer workspace
+              </button>
+            )}
+          </div>
           <span className="text-[11px] font-bold uppercase tracking-widest text-indigo-400">
             FinalRead
           </span>
@@ -363,6 +428,61 @@ export default function FinalReadEntry({ onExit }: { onExit: () => void }) {
             only thing they can be spent on here
           </p>
         </div>
+
+        {/* Continue: a shared review exists but has no finished report yet
+            (uploaded in the workspace, or a scan still running / failed).
+            Offer to run or resume it — never ask for a second upload. */}
+        {continueAtMount && phase === "idle" && sharedReview && (
+          <div className="bg-slate-900 border border-indigo-500/25 rounded-2xl p-5 md:p-6 shadow-xl space-y-3 mb-8">
+            <h2 className="text-sm font-bold text-slate-200">
+              Your review of {sharedReview.title} is already here
+            </h2>
+            {sharedReview.intelResult ? (
+              <>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  The report is ready — no need to upload the codebase again.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setProjectTitle(sharedReview.title);
+                    setIntelResult(sharedReview.intelResult);
+                    setPhase("done");
+                  }}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-500 hover:bg-indigo-400 text-white text-xs font-bold rounded-xl transition"
+                >
+                  View your report
+                </button>
+              </>
+            ) : sharedReview.intelStatus === "loading" ? (
+              <p className="text-xs text-slate-400 leading-relaxed">
+                The review is still running in the workspace — your report
+                will appear here when it's ready. Re-open this page to see it.
+              </p>
+            ) : (
+              <>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  It was uploaded in the developer workspace, so there's no
+                  need to upload it again. Run the review once and it will be
+                  shared with both views.
+                </p>
+                {sharedReview.intelError && (
+                  <p className="text-xs text-rose-300 bg-rose-500/10 border border-rose-500/20 rounded-lg px-3 py-2">
+                    The last scan didn't finish: {sharedReview.intelError}
+                  </p>
+                )}
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void runReview(sharedReview.title, "preserve")}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-500 hover:bg-indigo-400 text-white text-xs font-bold rounded-xl transition disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  Run the review
+                </button>
+              </>
+            )}
+          </div>
+        )}
 
         {working ? (
           /* Honest progress: one scan in flight, staged status lines */

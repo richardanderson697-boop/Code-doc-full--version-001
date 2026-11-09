@@ -19,6 +19,12 @@ import { logError } from "./utils/logger";
 import { apiFetch, fetchMe, notifyBalance, AuthRequiredError, CreditsRequiredError } from "./utils/apiFetch";
 import { detectInAppBrowser } from "./utils/inAppBrowser";
 import InAppBrowserBanner from "./components/InAppBrowserBanner";
+import {
+  createWorkspaceReview,
+  footerBrandFor,
+  workspaceHeaderTitle,
+  type SharedReview,
+} from "./utils/sharedReview";
 
 export default function App() {
   const [projects, setProjects] = useState<VibeProject[]>([]);
@@ -30,6 +36,11 @@ export default function App() {
   const [activePurpose, setActivePurpose] = useState("");
   const [currentPrompt, setCurrentPrompt] = useState("");
   const [currentTitle, setCurrentTitle] = useState("");
+  // The shared FinalRead review: the single review both the Developer
+  // Workspace (CodeAuditor) and the FinalRead entry read, so toggling
+  // between them never re-uploads, re-scans, or re-charges. In-memory only
+  // — a reload loses it, by design for v1.
+  const [sharedReview, setSharedReview] = useState<SharedReview | null>(null);
   const [refinementInput, setRefinementInput] = useState("");
   const [refinementMode, setRefinementMode] = useState<"evolve" | "fresh">("evolve");
   
@@ -233,6 +244,10 @@ export default function App() {
       // (or be inherited by the next account in this tab).
       setProjects([]);
       handleNewVibe();
+      // Logout clears the shared review outright (handleNewVibe only clears
+      // workspace-originated ones) — the next account in this tab must not
+      // inherit a buyer-flow review either.
+      setSharedReview(null);
       setSidebarOpen(false);
       setActiveRightTab("blueprint");
       setRefinementInput("");
@@ -635,6 +650,12 @@ export default function App() {
     setCurrentTitle("");
     setErrorMessage("");
     setSaveStatus("idle");
+    // The reset unmounts the auditor, destroying its local scan state, so
+    // the shared review it mirrors must go too — otherwise the entry would
+    // show a report for code that is no longer loaded. Only a
+    // workspace-originated review is cleared: an entry-originated review is
+    // a buyer-flow review, not workspace state, and survives the reset.
+    setSharedReview((prev) => (prev?.source === "workspace" ? null : prev));
   };
 
   // Clipboard copies
@@ -694,7 +715,7 @@ export default function App() {
             </div>
             <div>
               <h2 className="font-bold text-xs text-slate-100 uppercase tracking-wider font-sans select-none">
-                {finalreadEntryOpen ? "FinalRead" : "GradeVibes"}
+                {workspaceHeaderTitle(finalreadEntryOpen)}
               </h2>
               {hasActiveWorkspace && (
                 <div className="flex items-center gap-2">
@@ -714,6 +735,18 @@ export default function App() {
 
         {/* Global Controls */}
         <div className="flex items-center gap-2">
+          {/* FinalRead — opens the entry on the current workspace review.
+              Ungated: with no review yet the entry shows its ingest hero,
+              which is also the $199 purchase flow's entry point. */}
+          {!finalreadEntryOpen && (
+            <button
+              onClick={() => { window.location.hash = "finalread"; }}
+              className="px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/20 hover:border-indigo-500/40 text-indigo-300 text-xs font-medium flex items-center gap-1.5 transition duration-150"
+              title="Open the FinalRead review of this workspace"
+            >
+              FinalRead
+            </button>
+          )}
           {/* Credits + auth */}
           {user ? (
             <>
@@ -788,7 +821,11 @@ export default function App() {
       <main id="main-content" className="flex-1 flex flex-col min-h-0 bg-slate-950 relative overflow-hidden">
         {finalreadEntryOpen ? (
           <React.Fragment key={user?.id ?? "logged-out"}>
-            <FinalReadEntry onExit={closeFinalReadEntry} />
+            <FinalReadEntry
+              onExit={closeFinalReadEntry}
+              sharedReview={sharedReview}
+              onSharedReviewChange={setSharedReview}
+            />
           </React.Fragment>
         ) : (
           <>
@@ -837,11 +874,16 @@ export default function App() {
                 setErrorMessage("");
                 setWarningMessage("");
               }}
-              onUploadZipCodebase={(files) => {
+              onUploadZipCodebase={(files, title) => {
+                const reviewTitle = title ?? "Custom ZIP Codebase";
                 setActiveCode(`// Custom ZIP Codebase Loaded Successfully!\n//\n// Extracted ${files.length} file(s) from your archive.\n// Click the "Scan Uploaded Codebase" button on the right to map and evaluate completeness.`);
                 setActivePurpose(`### CUSTOM CODEBASE LOADED\nExtracted ${files.length} file(s) from your custom ZIP codebase. Standard workspace tracking has been adapted to parse your files under Step 2 (Project Completion Evaluator).`);
                 setCurrentPrompt("Auditing of extracted custom React/Express project codebase.");
-                setCurrentTitle("Custom ZIP Codebase");
+                setCurrentTitle(reviewTitle);
+                // A workspace upload starts a shared review (source
+                // "workspace"), so the FinalRead entry can adopt it without
+                // re-uploading — and toggling back keeps this workspace.
+                setSharedReview(createWorkspaceReview(reviewTitle));
                 setActiveRightTab("auditor");
                 setErrorMessage("");
                 setWarningMessage("");
@@ -1112,6 +1154,9 @@ export default function App() {
                       highlightedLine={highlightedLine}
                       onHighlightLine={(lineNum) => setHighlightedLine(lineNum)}
                       isActive={activeRightTab === "auditor"}
+                      sharedReview={sharedReview}
+                      onSharedReviewChange={setSharedReview}
+                      projectTitle={currentTitle}
                     />
                   </div>
                 </div>
@@ -1152,7 +1197,7 @@ export default function App() {
       {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
 
       {/* Site footer with legal links */}
-      <Footer brand={finalreadEntryOpen ? "FinalRead" : undefined} />
+      <Footer brand={footerBrandFor(finalreadEntryOpen)} />
     </div>
   );
 }
