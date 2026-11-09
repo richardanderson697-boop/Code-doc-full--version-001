@@ -11,6 +11,29 @@ import { runOpengrepScan } from "./preflight/opengrep/runner";
 import { log } from "./logger";
 import { PreFlightFinding, PreFlightReport, SEVERITY_ORDER } from "../shared/preflight-types";
 
+// Cross-file probe pass (finalread-cross-file-probe-batching-spec.md §4):
+// probe functions run directly over the full selected set. Imported from the
+// vendored engine, never edited (VENDORED.md: fixes belong upstream).
+import {
+  probePackageJson,
+  probeNpmrcHygiene,
+} from "./preflight/vendor/lib/probes/supply-chain.js";
+import { probeArchitecture } from "./preflight/vendor/lib/probes/quality.js";
+import { probeMissingHeaders } from "./preflight/vendor/lib/probes/transport.js";
+import { probeHostDetection } from "./preflight/vendor/lib/probes/v2/context.js";
+import { probeSupabaseRLS } from "./preflight/vendor/lib/probes/database.js";
+import {
+  probeExternalURLs,
+  probeGEOHygiene,
+  isPrivatePWAContext,
+} from "./preflight/vendor/lib/probes/web.js";
+import { isTestFile } from "./preflight/vendor/lib/file-filter.js";
+import {
+  detectAppShape,
+  applyAppShape,
+} from "./preflight/vendor/lib/probes/v2/app-shape.js";
+import { computeScore } from "./preflight/vendor/lib/scoring.js";
+
 export type { PreFlightFinding, PreFlightReport };
 
 export interface ScanInputFile {
@@ -146,9 +169,261 @@ export interface ScanEngine {
   (files: ScanInputFile[]): any;
 }
 
+// ---------------------------------------------------------------------------
+// Cross-file probe pass (finalread-cross-file-probe-batching-spec.md §4-§6).
+// Batched scans hand the engine 2 files at a time, so any probe whose truth
+// depends on the file set as a whole can misfire on a partial set. The pass
+// runs the cross-file probes once over the full selected set, and the batch
+// filter drops the findings those probes can never authoritatively emit.
+// ---------------------------------------------------------------------------
+
+// Budget for the cross-file pass (spec §4). The pass shares the scan's wall
+// clock and abandons if it cannot finish inside this cap; the tier-1 filter
+// still applies when it does. Confirmed by measurement on the self-scan repo
+// in the acceptance notes.
+export const CROSS_FILE_PASS_BUDGET_MS = 2000;
+
+// Tier 1 — cross-file finding id prefixes (spec §5, audit table). A finding
+// with one of these ids asserts something about the file set as a whole, so a
+// batched (partial-set) run can never authoritatively emit it. Dropped from
+// batch findings always. Entries ending in "-" match by prefix; other entries
+// match exactly.
+export const CROSS_FILE_FINDING_ID_PREFIXES = [
+  // probeArchitecture
+  "arch-classify-",
+  "arch-monolith-split",
+  "arch-static-html-teach",
+  "arch-monorepo-teach",
+  // probeNpmrcHygiene
+  "npmrc-missing",
+  "npmrc-cooldown-",
+  // probeMissingHeaders
+  "headers-next-static-export-",
+  "headers-missing-",
+  "headers-missing-frame-ancestors-",
+  "headers-",
+  // probeHostDetection
+  "host-detection",
+  // probePackageJson (cross-file part)
+  "pkg-entry-not-scanned-",
+  "pkg-nonregistry-",
+  // probeSupabaseRLS (client-reads part)
+  "rls-client-unprotected-",
+  // probeExternalURLs
+  "url-",
+  // probeGEOHygiene (cross-file part)
+  "geo-no-llmstxt",
+  "geo-schema-drift-faq",
+] as const;
+
+// Tier 2 — per-file finding id prefixes of probes the pass runs (spec §5).
+// The pass already emitted these authoritatively over the full set, so batch
+// copies are duplicates. Dropped from batch findings only when the pass ran.
+export const PASS_PROBE_PER_FILE_ID_PREFIXES = [
+  // probePackageJson (per-file part)
+  "pkg-postinstall-",
+  "pkg-floating-",
+  // probeSupabaseRLS (per-table part)
+  "rls-",
+  "rls-permissive-",
+  "rls-permissive-check-",
+  "rls-disabled-",
+  "rls-securitydefiner-",
+  // probeGEOHygiene (per-file part)
+  "geo-block-",
+  "geo-no-freshness",
+] as const;
+
+function matchesIdPrefix(id: unknown, prefixes: readonly string[]): boolean {
+  if (typeof id !== "string") return false;
+  return prefixes.some((p) => (p.endsWith("-") ? id.startsWith(p) : id === p));
+}
+
+// Corpus-middleware gate, same shapes as probeAPIRouteAuth
+// (server/preflight/vendor/lib/probes/auth.js:1546-1575). First-party copy;
+// the gate-agreement test guards drift.
+function hasRouteAuthCorpusMiddleware(files: ScanInputFile[]): boolean {
+  return files.some((mf) => {
+    if (!/(^|\/)(src\/)?middleware\.[jt]sx?$/.test(mf.path)) return false;
+    if (typeof mf.content !== "string") return false;
+    return /(clerkMiddleware|withAuth|getServerSession|getUser|currentUser|requireAuth|\bauth\s*\(|verifyToken|jwt\.verify\s*\([^,)]+,)/i.test(
+      mf.content
+    );
+  });
+}
+
+function hasAppWideAuthMiddleware(files: ScanInputFile[]): boolean {
+  return files.some((mf) => {
+    if (typeof mf.content !== "string") return false;
+    if (isTestFile(mf.path)) return false;
+    return (
+      /\b(?:app|router)\.use\s*\(\s*(?:['"`][^'"`]*['"`]\s*,\s*)?(?:authenticate|authMiddleware|requireAuth|isAuthenticated|verifyJWT|verifyToken|protect|guard|passport\.authenticate|clerkMiddleware|withAuth)/i.test(
+        mf.content
+      ) ||
+      /\bapp\.use\s*\(\s*['"`]\*['"`]\s*,\s*(?:jwt|bearerAuth|basicAuth|auth)\s*\(/i.test(
+        mf.content
+      )
+    );
+  });
+}
+
+// Corpus-middleware gate, same shape as probeAdminRoutes
+// (server/preflight/vendor/lib/probes/auth.js:858-866). Note the token list
+// differs from probeAPIRouteAuth's (no getUser, no jwt.verify) — the gates
+// are evaluated separately, exactly.
+function hasAdminCorpusMiddleware(files: ScanInputFile[]): boolean {
+  return files.some(
+    (mf) =>
+      /(^|\/)(src\/)?middleware\.[jt]sx?$/.test(mf.path) &&
+      typeof mf.content === "string" &&
+      /(clerkMiddleware|withAuth|getServerSession|currentUser|requireAuth|\bauth\s*\(|verifyToken)/i.test(
+        mf.content
+      )
+  );
+}
+
+// Hybrid gates (spec §6). Each entry pairs the finding id prefixes belonging
+// to one probe with its corpus gate over the full selected set. When the gate
+// is true, the full-set probe would emit nothing, so batch findings from that
+// probe are dropped; when false, they are kept.
+interface HybridGate {
+  prefixes: readonly string[];
+}
+
+function evaluateHybridGates(files: ScanInputFile[]): HybridGate[] {
+  const active: HybridGate[] = [];
+  if (hasRouteAuthCorpusMiddleware(files) || hasAppWideAuthMiddleware(files)) {
+    active.push({ prefixes: ["api-noauth-", "api-destructive-"] });
+  }
+  if (hasAdminCorpusMiddleware(files)) {
+    active.push({ prefixes: ["admin-clientonly-"] });
+  }
+  if (isPrivatePWAContext(files)) {
+    active.push({
+      prefixes: ["seo-", "seo-robots-no-sitemap-", "seo-robots-disallow-all-"],
+    });
+  }
+  return active;
+}
+
+type CrossFileProbeFn = (files: ScanInputFile[]) => any[];
+
+const CROSS_FILE_PASS_PROBES: CrossFileProbeFn[] = [
+  probePackageJson,
+  probeArchitecture,
+  probeNpmrcHygiene,
+  probeMissingHeaders,
+  probeHostDetection,
+  probeSupabaseRLS,
+  probeExternalURLs,
+  probeGEOHygiene,
+];
+
+interface CrossFilePassOutcome {
+  findings: any[];
+  score: number;
+  ran: boolean;
+  durationMs: number;
+  failures: { probe: string; error: string }[];
+}
+
+// Full-set cross-file pass (spec §4). Runs the pure and hybrid cross-file
+// probes once over the full selected set and applies the engine's
+// post-processing (detectAppShape / applyAppShape / computeScore) via the
+// vendored helpers. A probe that throws is recorded and skipped, mirroring
+// scan()'s per-probe handling; a budget overrun abandons the pass entirely
+// (no pass findings, ran false) and records a probeFailures entry.
+function runCrossFilePass(
+  selected: ScanInputFile[],
+  started: number,
+  budgetMs: number
+): CrossFilePassOutcome {
+  const passStarted = Date.now();
+  const raw: any[] = [];
+  const failures: { probe: string; error: string }[] = [];
+  for (const probe of CROSS_FILE_PASS_PROBES) {
+    // Own cap on the scan's shared wall clock, checked between probes. A
+    // single probe cannot be interrupted mid-call — same limitation as the
+    // batch loop's deadline check.
+    if (Date.now() - started >= budgetMs) {
+      return {
+        findings: [],
+        score: 100,
+        ran: false,
+        durationMs: Date.now() - passStarted,
+        failures: [
+          ...failures,
+          {
+            probe: "cross-file-pass",
+            error: `cross-file probe pass exceeded its ${budgetMs}ms budget and did not run`,
+          },
+        ],
+      };
+    }
+    try {
+      const found = probe(selected);
+      if (Array.isArray(found)) raw.push(...found);
+    } catch (err: any) {
+      failures.push({
+        probe: probe.name || "cross-file-probe",
+        error: err?.message || String(err),
+      });
+    }
+  }
+  // Post-processing mirroring scan() steps 5b-6. Snippets / stable ids /
+  // probe meta are not replicated: the adapter's finding mapping drops them,
+  // exactly as it does for batch findings.
+  const shape = detectAppShape(selected);
+  const shaped = applyAppShape(raw, shape);
+  return {
+    findings: shaped,
+    score: computeScore(shaped),
+    ran: true,
+    durationMs: Date.now() - passStarted,
+    failures,
+  };
+}
+
+// Batch filter (spec §5). Applied to raw batch findings BEFORE the adapter's
+// mapping (the mapping drops the finding id). Tier 1 always; tier 2 and the
+// hybrid gates only when the pass / gate applies.
+function filterBatchFindings(
+  findings: any[],
+  passRan: boolean,
+  gatesActive: HybridGate[]
+): any[] {
+  return findings.filter((f) => {
+    const id = typeof f?.id === "string" ? f.id : "";
+    if (matchesIdPrefix(id, CROSS_FILE_FINDING_ID_PREFIXES)) return false;
+    if (passRan && matchesIdPrefix(id, PASS_PROBE_PER_FILE_ID_PREFIXES)) return false;
+    for (const g of gatesActive) {
+      if (matchesIdPrefix(id, g.prefixes)) return false;
+    }
+    return true;
+  });
+}
+
+export interface RunPreFlightScanOptions {
+  // Test seam: byte threshold for the single-pass path (default
+  // SINGLE_PASS_BYTES). Tests force the batched path with a tiny value.
+  singlePassBytes?: number;
+  // Test seam: budget for the cross-file pass in ms (default
+  // CROSS_FILE_PASS_BUDGET_MS).
+  crossFilePassBudgetMs?: number;
+}
+
+/**
+ * Main entry point for preflight scanning. Runs a 384KB+ repo in batches of
+ * 2 files through the vendored engine (per-file findings, coverage-only risk),
+ * with the cross-file pass (§4) and batch filter (§5, §6) so cross-file
+ * findings match a single-pass run, then runs the Opengrep AST probe
+ * (repo-wide, server-side). Returns a normalized, severity-sorted report
+ * with deduplicated findings.
+ */
 export function runPreFlightScan(
   files: ScanInputFile[],
-  engine: ScanEngine = scan
+  engine: ScanEngine = scan,
+  options: RunPreFlightScanOptions = {}
 ): PreFlightReport {
   if (!Array.isArray(files)) {
     return emptyReport({ failed: "scan input was not an array of files" });
@@ -166,17 +441,40 @@ export function runPreFlightScan(
   let result: any;
   try {
     const totalBytes = selected.reduce((n, f) => n + Buffer.byteLength(f.content, "utf8"), 0);
-    if (totalBytes <= SINGLE_PASS_BYTES) {
+    const singlePassBytes = options.singlePassBytes ?? SINGLE_PASS_BYTES;
+    if (totalBytes <= singlePassBytes) {
       result = engine(selected);
     } else {
       result = { findings: [], probeFailures: [], score: 0 };
+      // Cross-file pass (spec §4): pure/hybrid cross-file probes run once
+      // over the full selected set, before batching. Batched path only.
+      const pass = runCrossFilePass(
+        selected,
+        started,
+        options.crossFilePassBudgetMs ?? CROSS_FILE_PASS_BUDGET_MS
+      );
+      if (pass.failures.length > 0) {
+        result.probeFailures.push(...pass.failures);
+      }
+      // Hybrid gates (spec §6), evaluated once over the full selected set.
+      const gatesActive = evaluateHybridGates(selected);
       let i = 0;
       for (; i < selected.length; i += BATCH_SIZE) {
         if (Date.now() - started > MAX_SCAN_MS) break;
         const part = engine(selected.slice(i, i + BATCH_SIZE));
-        result.findings.push(...(part.findings || []));
+        const batchFindings = filterBatchFindings(
+          part.findings || [],
+          pass.ran,
+          gatesActive
+        );
+        result.findings.push(...batchFindings);
         result.probeFailures.push(...(part.probeFailures || []));
         result.score = typeof part.score === "number" ? Math.min(result.score || 100, part.score) : result.score;
+      }
+      // Merge the authoritative cross-file findings and their score.
+      if (pass.ran) {
+        result.findings.push(...pass.findings);
+        result.score = Math.min(result.score || 100, pass.score);
       }
       for (let j = i; j < selected.length; j++) {
         skipped.push({
