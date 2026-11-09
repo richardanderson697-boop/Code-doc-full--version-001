@@ -228,6 +228,16 @@ export function splitCodeAndComments(content: string): {
 // capability is IMPLEMENTED, not merely mentioned.
 const AUTH_IMPL = /(better-auth|next-auth|@clerk\/|passport|jsonwebtoken|createSession|verifyPassword|signIn\(|signOut\(|getServerSession|oauth)/i;
 const AUTH_REF = /(sign\s?-?in|log\s?-?in|sign\s?-?up|create\s?account|forgot\s?password|reset\s?password)/i;
+// Documentation-level auth intent (Tier A explicit phrases, Tier B role
+// plurality): a README that describes authentication, role-based access,
+// or several distinct user roles declares auth as intended — so missing
+// auth is a gap, not "not applicable". A single role word never fires
+// alone. Same treatment DB and External integrations already get from
+// README references.
+const AUTH_INTENT_A =
+  /(authentication|role-based access|user roles?|user accounts?|multi-user)/i;
+const AUTH_ROLE_WORDS =
+  /\b(landlord|tenant|administrator|admin|maintenance|worker|customer|member|seller|buyer|user|client)s?\b/gi;
 const DB_IMPL = /(drizzle|prisma|mongoose|typeorm|sequelize|better-sqlite3|node:sqlite|kysely|supabase|mongodb|indexedDB|IDBDatabase|createPool|DataSource)/i;
 // Backend-as-a-service persistence: Firebase/Firestore/Realtime DB, Supabase client,
 // Appwrite, Convex, PlanetScale, Neon, Turso/libSQL, Upstash, PocketBase. These are
@@ -579,6 +589,35 @@ function scoreAuthentication(sig: WorkspaceSignals): CategoryResult {
   if (referenced) {
     evidence.push(ev(referenced.path, findLine(referenced.strippedContent, AUTH_REF), "references sign-in/up with no auth backend (dangling)"));
     return { score: 2, max: 10, evidence, note: "dangling-auth" };
+  }
+
+  // Doc-level intent: a README that describes authentication, role-based
+  // access, or several distinct user roles declares auth as intended, so
+  // missing auth is a gap — not "not applicable". Same treatment DB and
+  // External integrations already get from README references.
+  const docFiles = sig.files.filter((f) => /\.md$/i.test(f.path));
+  const intentDoc = docFiles.find(
+    (f) => hasWord(f.strippedContent, AUTH_INTENT_A) || hasWord(f.strippedContent, AUTH_REF)
+  );
+  if (intentDoc) {
+    const line =
+      findLine(intentDoc.strippedContent, AUTH_INTENT_A) ??
+      findLine(intentDoc.strippedContent, AUTH_REF);
+    evidence.push(ev(intentDoc.path, line, "references authentication with no auth backend (dangling)"));
+    return { score: 2, max: 10, evidence, note: "dangling-auth" };
+  }
+  const roleWords = new Set<string>();
+  for (const f of docFiles) {
+    for (const m of f.strippedContent.matchAll(AUTH_ROLE_WORDS)) roleWords.add(m[1].toLowerCase());
+  }
+  if (roleWords.size >= 2) {
+    const firstRole = [...roleWords][0]!;
+    const wordRe = new RegExp(`\\b${firstRole}\\b`, "i");
+    const roleDoc = docFiles.find((f) => wordRe.test(f.strippedContent));
+    if (roleDoc) {
+      evidence.push(ev(roleDoc.path, findLine(roleDoc.strippedContent, wordRe), "references multiple user roles with no auth backend (dangling)"));
+      return { score: 2, max: 10, evidence, note: "dangling-auth" };
+    }
   }
   evidence.push("no auth code and no auth references — no evidence found");
   return { score: 0, max: 10, evidence, note: "not-applicable", applicable: false };
