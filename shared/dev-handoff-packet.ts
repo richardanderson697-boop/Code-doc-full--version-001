@@ -56,10 +56,17 @@ function lineAnchor(file: string, line: number | null): string {
 /** One item in a multi-finding packet. `fix` is the AI-generated suggestion
  *  when one exists; when absent, the section falls back to the scanner's own
  *  wording (title/message/remediation) with an explicit notice — nothing is
- *  invented to fill the gap. */
+ *  invented to fill the gap. Category-level items (no single file or line)
+ *  carry their evidence lines, checklist, and how-to-check instead. */
 export interface MultiFindingItem {
   finding: DevHandoffFinding;
   fix?: SuggestedFix;
+  /** Deterministic evidence lines (category items only). */
+  evidenceLines?: string[];
+  /** Missing pieces to check off (background automation only). */
+  checklist?: string[];
+  /** How a developer checks the item (category items only). */
+  howToCheck?: string;
 }
 
 export interface MultiFindingPacketInput {
@@ -72,11 +79,24 @@ export interface MultiFindingPacketInput {
   totalCount: number;
   /** ISO 8601 timestamp. */
   generatedAt: string;
+  /** Scanner version and Core-logic metric version that produced the
+   *  report (from the deterministic scorer). Rendered in the header
+   *  when present; omitted for older reports that carry none. */
+  scannerVersion?: string;
+  metricVersion?: string;
+}
+
+function versionLabel(v: string): string {
+  return v.startsWith("v") ? v : `v${v}`;
 }
 
 function renderMultiFindingSection(item: MultiFindingItem, index: number): string[] {
   const { finding, fix } = item;
+  // Category-level findings carry no file — never render empty backticks
+  // for the anchor (§B1). A finding with a file keeps the anchor.
+  const hasFile = finding.file.trim().length > 0;
   const anchor = lineAnchor(finding.file, finding.line);
+  const evidenceLines = (item.evidenceLines || []).filter((l) => l.trim().length > 0);
   const lines: string[] = [
     `## Finding ${index}: ${finding.title}`,
     ``,
@@ -116,15 +136,39 @@ function renderMultiFindingSection(item: MultiFindingItem, index: number): strin
       ``
     );
   } else {
+    // No AI suggestion: the notice is conditional (§B2). A checklist
+    // points at itself; a category item without one points at the
+    // evidence and checks; a file-level finding keeps the existing
+    // wording — the scanner's own wording is shown as-is.
+    const notice = item.checklist
+      ? `Category-level finding. See the checklist below.`
+      : !hasFile
+        ? `Category-level finding — no single fix applies; see the evidence and checks below.`
+        : `No AI suggestion was generated for this finding — the scanner's own wording is shown as-is.`;
     lines.push(
       `### Plain-English issue`,
       ``,
-      `No AI suggestion was generated for this finding — the scanner's own wording is shown as-is.`,
+      notice,
       ``,
       `### Evidence`,
       ``,
-      `\`${anchor}\``,
-      ``,
+      ...(hasFile
+        ? [`\`${anchor}\``, ``]
+        : [`Category-level finding: no single file or line`, ``]),
+      ...(evidenceLines.length > 0
+        ? [...evidenceLines.map((l) => `- ${l}`), ``]
+        : []),
+      ...(item.checklist
+        ? [
+            `### Checklist`,
+            ``,
+            ...item.checklist.map((c) => `- [ ] ${c}`),
+            ``,
+          ]
+        : []),
+      ...(item.howToCheck
+        ? [`### How a developer checks it`, ``, item.howToCheck, ``]
+        : []),
       `### Suggested remediation`,
       ``,
       finding.suggestion
@@ -146,6 +190,8 @@ export function renderMultiFindingPacket(input: MultiFindingPacketInput): string
     ``,
     `**Product:** ${product}`,
     `**Generated:** ${generatedAt}`,
+    ...(input.scannerVersion ? [`**Scanner version:** ${versionLabel(input.scannerVersion)}`] : []),
+    ...(input.metricVersion ? [`**Core-logic metric version:** ${versionLabel(input.metricVersion)}`] : []),
     `**Findings included:** ${includedCount} of ${totalCount}`,
     `**Status:** Suggested fixes — NOT applied. Human review required.`,
     ``,

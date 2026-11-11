@@ -76,6 +76,18 @@ export interface FinalReadAuditInput {
    *  Plumbs the scan's raw signals through to Q&A context so "which?"
    *  questions have something to stand on. */
   categoryEvidence?: Record<string, string[]>;
+  /**
+   * Per-category checklists from the deterministic scorer, keyed by
+   * category. Only backgroundAutomation carries one (the missing
+   * automation pieces); a key present here means the category is
+   * half-built or a liability and the developer gets a checklist.
+   */
+  categoryChecklists?: Record<string, string[]>;
+  /** Scanner version (e.g. "1") and Core-logic metric version (e.g. "2")
+   *  from the deterministic scorer — carried so the report and the
+   *  developer handoff packet can state what produced them. */
+  scannerVersion?: string;
+  metricVersion?: string;
   findings?: FinalReadFindingInput[];
   missingFeatures?: Array<{ category?: string; feature: string; reason?: string }>;
   scanGaps?: FinalReadScanGaps;
@@ -97,6 +109,20 @@ export interface FinalReadBucketItem {
   line: number | null;
   /** Condensed deterministic evidence lines (category items only). */
   evidence?: string[];
+  /**
+   * Present only on half-built/liability category items that carry one:
+   * the missing pieces the developer checks off (background automation
+   * only — no Core logic checklist in this build). The packet renders a
+   * Checklist section when present.
+   */
+  checklist?: string[];
+  /**
+   * Present only on half-built/liability category items: how a developer
+   * checks the score, derived from the item's own evidence plus a small
+   * per-category template — never invented. Working items have nothing
+   * to check, so they carry none.
+   */
+  howToCheck?: string;
   /** The scanner's own remediation text, when the item came from a finding. */
   remediation?: string;
   /**
@@ -156,6 +182,11 @@ export interface FinalReadReport {
    *  Derived from categoryScores — the single source of truth — rather
    *  than a second input field that could disagree with the scores. */
   categoryReasons?: Record<string, string>;
+  /** Scanner version and Core-logic metric version that produced this
+   *  report (from the deterministic scorer). The overlay shows them
+   *  under the completeness line; the packet header carries both. */
+  scannerVersion?: string;
+  metricVersion?: string;
 }
 
 // Plain-English business framing per rubric category: what the category
@@ -384,6 +415,56 @@ function sanitizeFileLedger(raw: unknown): FinalReadFileLedgerEntry[] | undefine
   return out.length > 0 ? out : undefined;
 }
 
+function sanitizeCategoryChecklists(raw: unknown): Record<string, string[]> | undefined {
+  if (!isPlainObject(raw)) return undefined;
+  const out: Record<string, string[]> = {};
+  for (const key of Object.keys(raw)) {
+    const arr = raw[key];
+    if (!Array.isArray(arr)) continue;
+    const items: string[] = [];
+    for (const v of arr) {
+      const s = typeof v === "string" ? v.trim() : "";
+      if (s) items.push(s);
+      if (items.length >= 8) break;
+    }
+    if (items.length > 0) out[key] = items;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * How a developer checks a half-built/liability category item (§B7).
+ * Built from the item's own evidence plus a small per-category template —
+ * never invented. Background automation points at its checklist and the
+ * scan's own signal; Core logic points at reproducing the computation
+ * the evidence states; every other category falls back to asking the
+ * developer to point at the code that settles it.
+ */
+function howToCheckForCategory(
+  key: string,
+  evidence: string[] | undefined,
+  hasChecklist: boolean
+): string {
+  const signal = evidence && evidence.length > 0 ? evidence[0] : "no implementation found";
+  if (key === "backgroundAutomation" && hasChecklist) {
+    return (
+      `Work through the checklist below, item by item: for each one, confirm it exists in the code ` +
+      `and quote the file:line where it lives. The scan's own signal: ${signal}`
+    );
+  }
+  if (key === "coreLogic") {
+    return (
+      `Reproduce the computation from the evidence above: count the files that contain real logic ` +
+      `and are free of stub markers against the denominator, and check whether the fake-success cap ` +
+      `applies. A developer confirms the count against the files the evidence names.`
+    );
+  }
+  return (
+    `Ask the developer to confirm this against the code — the evidence above names the files and ` +
+    `signals the scan stood on; a developer points at the code that settles it.`
+  );
+}
+
 function deriveCategoryReasons(
   categories: Record<string, FinalReadCategoryInput>
 ): Record<string, string> | undefined {
@@ -403,6 +484,7 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
   const notApplicable: FinalReadBucketItem[] = [];
 
   const categories = input.categoryScores || {};
+  const checklists = sanitizeCategoryChecklists(input.categoryChecklists);
   for (const key of Object.keys(categories)) {
     const cat = categories[key];
     // N/A is excluded from every decision bucket. Without this, a null/0
@@ -425,15 +507,23 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
       continue;
     }
     const score = Math.max(0, Math.min(10, Math.round(Number(cat.score) || 0)));
+    const bucket = bucketForScore(score);
+    const evidence = condenseEvidence(input.categoryEvidence?.[key]);
     const item: FinalReadBucketItem = {
       title: categoryLabel(key),
       businessImplication: implicationForCategory(key, score, cat.reason),
       severity: score >= 7 ? "info" : score >= 4 ? "medium" : "high",
       file: "",
       line: null,
-      evidence: condenseEvidence(input.categoryEvidence?.[key]),
+      evidence,
     };
-    const bucket = bucketForScore(score);
+    // Checklist + how-to-check ride only on half-built/liability items:
+    // a working category has nothing to check. (§B3, §B7)
+    if (bucket !== "working") {
+      const checklist = checklists?.[key];
+      if (checklist) item.checklist = checklist;
+      item.howToCheck = howToCheckForCategory(key, evidence, !!checklist);
+    }
     if (bucket === "working") working.push(item);
     else if (bucket === "halfBuilt") halfBuilt.push(item);
     else liabilities.push(item);
@@ -523,5 +613,7 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     applicationMap: sanitizeApplicationMap(input.applicationMap),
     fileLedger: sanitizeFileLedger(input.fileLedger),
     categoryReasons: deriveCategoryReasons(categories),
+    scannerVersion: cleanString(input.scannerVersion),
+    metricVersion: cleanString(input.metricVersion),
   };
 }

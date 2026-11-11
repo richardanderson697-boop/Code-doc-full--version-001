@@ -94,6 +94,19 @@ export function intelResultToFinalReadInput(
     rawEvidence && typeof rawEvidence === "object" && !Array.isArray(rawEvidence)
       ? rawEvidence
       : undefined;
+  // Per-category checklists + scanner/metric versions, persisted by the
+  // intelligence route alongside the evidence (§B3, §B6). Guarded the
+  // same way: only the expected container shapes pass through; the
+  // report builder sanitizes the checklist entries.
+  const rawChecklists = intelResult?.deterministicAssessment?.checklists;
+  const categoryChecklists: Record<string, string[]> | undefined =
+    rawChecklists && typeof rawChecklists === "object" && !Array.isArray(rawChecklists)
+      ? rawChecklists
+      : undefined;
+  const cleanVersion = (v: unknown): string | undefined =>
+    typeof v === "string" && v.trim() ? v.trim() : undefined;
+  const scannerVersion = cleanVersion(intelResult?.deterministicAssessment?.scannerVersion);
+  const metricVersion = cleanVersion(intelResult?.deterministicAssessment?.metricVersion);
   // Warehouse detail for the Q&A: the intelligence run's application map
   // and per-file ledger. The overlay never renders these — they ride along
   // so the server-side Q&A context can retrieve what the analysis
@@ -139,6 +152,9 @@ export function intelResultToFinalReadInput(
       intelResult?.overallSummary || intelResult?.readmeTagline || undefined,
     categoryScores: intelResult?.categoryScores || {},
     categoryEvidence,
+    categoryChecklists,
+    scannerVersion,
+    metricVersion,
     applicationMap,
     fileLedger,
     findings: [
@@ -457,11 +473,20 @@ export default function FinalReadOverlay({
           line: item.line,
           suggestion: item.remediation,
         };
-        return { finding };
+        // Category items carry no file — the packet renders their
+        // evidence lines, checklist, and how-to-check instead (§B1–B7).
+        return {
+          finding,
+          evidenceLines: item.evidence,
+          checklist: item.checklist,
+          howToCheck: item.howToCheck,
+        };
       }),
       includedCount: selected.length,
       totalCount: handoffItems.length,
       generatedAt: new Date().toISOString(),
+      scannerVersion: report.scannerVersion,
+      metricVersion: report.metricVersion,
     });
     downloadMarkdown(`finalread-handoff-${selected.length}-findings.md`, markdown);
   };
@@ -536,6 +561,11 @@ export default function FinalReadOverlay({
                 {report.completenessScore}/100
               </span>
             </p>
+            {(report.scannerVersion || report.metricVersion) && (
+              <p className="text-xs text-slate-400 mt-0.5">
+                Scanner v{report.scannerVersion ?? "?"} · Metric v{report.metricVersion ?? "?"}
+              </p>
+            )}
             <p className="hidden print:block text-sm text-slate-500 mt-0.5">
               Report generated{" "}
               {new Date(report.generatedAt).toLocaleDateString()}

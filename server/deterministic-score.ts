@@ -61,7 +61,37 @@ export interface CategoryResult {
   // means applicable.
   designDeclaration?: string; // set only on row-3 (excluded-by-design)
   // returns: the declared-design quote that excluded the category.
+  /**
+   * Plain-English rendering of the evidence (same counts, no scanner
+   * jargon). Set only by scoreCoreLogic (§B9): the stakeholder report and
+   * the model prompt read this, while the Q&A and the handoff packet keep
+   * the precise `evidence` lines. Never a different number — a translation
+   * of the same counts.
+   */
+  plainEvidence?: string[];
+  /**
+   * The missing pieces for this category, as a checklist (§B3). Set only
+   * by scoreBackgroundAutomation for the webhook-only (score 6) and
+   * dangling (score 3) cases — the packet renders these as a checklist.
+   * Never set for a working (10/10) category.
+   */
+  checklist?: string[];
 }
+
+/** Scanner version: bump when a detector's behavior changes. Shown in the
+ *  stakeholder report and the developer handoff packet so a later re-score
+ *  is explainable. First versioned release. */
+export const SCANNER_VERSION = "1";
+/** Core-logic metric version: v2 = the strengthened "contains real logic"
+ *  test + fake-success cap + denominator floor (spec §§A1–A5). v1 was the
+ *  40-line rule. */
+export const CORE_LOGIC_METRIC_VERSION = "2";
+/** Denominator floor for Core logic (§A1): a tiny repo must not claim
+ *  10/10 on three files. Proposed value; Richard may adjust it. */
+export const CORE_LOGIC_DENOMINATOR_FLOOR = 10;
+/** Fake-success cap for Core logic (§A4): any fake-success finding on a
+ *  non-test product file caps the score here. */
+export const CORE_LOGIC_FAKE_SUCCESS_CAP = 7;
 
 export interface MissingFeatureFact {
   feature: string;
@@ -108,6 +138,12 @@ export interface DeterministicAssessment {
   applicableCount: number; // how many of the 10 categories apply (for "N of 10" display)
   capsApplied: string[];
   importMap: { path: string; imports: string[] }[]; // deterministic per-file import lists
+  /** Scanner version and Core-logic metric version that produced this
+   *  assessment (spec §B6). The intelligence route persists both so the
+   *  report and the developer handoff packet can state what produced
+   *  them. */
+  scannerVersion: string;
+  metricVersion: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +381,16 @@ export function extractDesignDeclarations(
 const PAYMENT_REF = /(stripe|checkout|payment|billing|subscription)/i;
 const AUTOMATION_IMPL = /(node-cron|cron\.schedule|setInterval\s*\(|bullmq|inngest|trigger\.dev|new\s+Worker|webhook)/i;
 const AUTOMATION_REF = /(webhook|cron|schedule|worker|queue|background\sjob)/i;
+/** The four missing pieces of background automation (§B3): a webhook
+ *  handler alone is event-driven automation, not a scheduler, queue,
+ *  worker, or retry/reconciliation loop. The packet renders these as a
+ *  checklist for the webhook-only (score 6) and dangling (score 3) cases. */
+const AUTOMATION_CHECKLIST = [
+  "Scheduled jobs",
+  "Job queues",
+  "Background workers",
+  "Webhook retry/reconciliation logic",
+];
 // (EXT_SDK retired: bare word mentions like "Stripe" in Legal.tsx are not
 // integrations. EXT_SDK_USE requires an import or API call.)
 const EXT_SDK_USE =
@@ -744,21 +790,570 @@ function scoreErrorHandling(sig: WorkspaceSignals): CategoryResult {
   return { score, max: 10, evidence };
 }
 
-function scoreCoreLogic(sig: WorkspaceSignals): CategoryResult {
-  const evidence: string[] = [];
-  const codeFiles = sig.files.filter((f) => isCodeFile(f.path));
-  const substantive = codeFiles.filter(
-    (f) => f.lineCount >= 40 && f.analysis.stubCount === 0 && !/(\.test\.|\.spec\.|__tests__)/i.test(f.path)
-  );
-  const ratio = codeFiles.length > 0 ? substantive.length / codeFiles.length : 0;
-  evidence.push(`${substantive.length}/${codeFiles.length} code files are substantive (40+ lines, no stubs)`);
-  if (sig.totalStubs > 0) evidence.push(`${sig.totalStubs} stub markers detected`);
-  if (sig.totalTodos > 0) evidence.push(`${sig.totalTodos} TODO/FIXME markers detected`);
+// ---------------------------------------------------------------------------
+// "Contains real logic" (spec §A2): the strengthened substantive test for
+// Core logic. A file contains real logic when its comment-blanked text
+// shows at least one statement that uses its inputs, touches state / I/O /
+// a call, or branches on a runtime value. A body that only returns a
+// literal, only throws "not implemented", or is empty does NOT count —
+// even `res.json({ ok: true })` does not count (`res.json(user)` does).
+//
+// Mechanism: a line/regex-based extension of the deterministic scan (spec
+// §5.2). The fixtures in test/deterministic-score.test.ts are the gate:
+// if a fixture fails, this function is wrong, not the fixture. Known
+// limitations (documented, not hidden): regex literals can mislead the
+// string blanker the same way they mislead splitCodeAndComments, and a
+// generic instantiation (`foo<string>(...)`) can read as a comparison —
+// both cost a possible misread on those lines, and neither changes the
+// ratio by more than the one file involved. One deliberate miss: a
+// non-shorthand object literal assigned to a const and returned only by
+// identifier (`const c = { owner: user }; return c;`) does not count —
+// `key: value` inside braces is indistinguishable by regex from a type
+// annotation (`const x: User[]`, `(req: Request)`), and the annotation
+// surface is far larger than the case it would catch. `return
+// { owner: user }` and shorthand `{ owner }` do count.
+// ---------------------------------------------------------------------------
 
-  let score = Math.round(ratio * 10);
-  if (codeFiles.length === 0) score = 1;
-  else if (score < 2) score = 2;
-  return { score, max: 10, evidence };
+/** Blank string/template literal contents to spaces (newlines kept), but
+ *  keep `${...}` interpolation expressions — a string that says "await"
+ *  is not an await, while an interpolated `${token}` is a real value. */
+export function blankStringLiterals(code: string): string {
+  const out: string[] = [];
+  const n = code.length;
+  let i = 0;
+  // Stack frames: "single"/"double" string, "template" literal, or "expr"
+  // (a ${...} interpolation, whose braceDepth counts nested `{ }`).
+  const stack: { kind: "single" | "double" | "template" | "expr"; braceDepth: number }[] = [];
+  while (i < n) {
+    const ch = code[i]!;
+    const frame = stack[stack.length - 1];
+    if (!frame) {
+      if (ch === "'" || ch === '"') {
+        stack.push({ kind: ch === "'" ? "single" : "double", braceDepth: 0 });
+        out.push(ch);
+        i++;
+      } else if (ch === "`") {
+        stack.push({ kind: "template", braceDepth: 0 });
+        out.push(ch);
+        i++;
+      } else {
+        out.push(ch);
+        i++;
+      }
+      continue;
+    }
+    if (frame.kind === "single" || frame.kind === "double") {
+      const quote = frame.kind === "single" ? "'" : '"';
+      if (ch === "\\" && i + 1 < n) {
+        out.push(" ", " ");
+        i += 2;
+        continue;
+      }
+      if (ch === "\n") {
+        out.push("\n");
+        i++;
+        continue;
+      }
+      if (ch === quote) {
+        stack.pop();
+        out.push(ch);
+        i++;
+        continue;
+      }
+      out.push(" ");
+      i++;
+      continue;
+    }
+    if (frame.kind === "template") {
+      if (ch === "\\" && i + 1 < n) {
+        out.push(" ", " ");
+        i += 2;
+        continue;
+      }
+      if (ch === "`") {
+        stack.pop();
+        out.push(ch);
+        i++;
+        continue;
+      }
+      if (ch === "$" && code[i + 1] === "{") {
+        stack.push({ kind: "expr", braceDepth: 0 });
+        out.push("$", "{");
+        i += 2;
+        continue;
+      }
+      out.push(ch === "\n" ? "\n" : " ");
+      i++;
+      continue;
+    }
+    // Inside a ${...} interpolation: strings/templates nest; braces nest.
+    if (ch === "'" || ch === '"') {
+      stack.push({ kind: ch === "'" ? "single" : "double", braceDepth: 0 });
+      out.push(ch);
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      stack.push({ kind: "template", braceDepth: 0 });
+      out.push(ch);
+      i++;
+      continue;
+    }
+    if (ch === "{") {
+      frame.braceDepth++;
+      out.push(ch);
+      i++;
+      continue;
+    }
+    if (ch === "}") {
+      if (frame.braceDepth === 0) stack.pop();
+      else frame.braceDepth--;
+      out.push(ch);
+      i++;
+      continue;
+    }
+    out.push(ch);
+    i++;
+  }
+  return out.join("");
+}
+
+/** Blank the range [start, end) to spaces, preserving newlines. */
+function blankRange(chars: string[], start: number, end: number): void {
+  for (let i = start; i < end && i < chars.length; i++) {
+    if (chars[i] !== "\n") chars[i] = " ";
+  }
+}
+
+/** Strip `interface` and `type` declarations: a file of only type
+ *  declarations contains no logic, and a method signature
+ *  (`onSuccess(token: string): void;`) must never read as a call. */
+function stripTypeDeclarations(code: string): string {
+  const chars = code.split("");
+  const n = code.length;
+  const re = /\b(?:export\s+)?(?:declare\s+)?(interface|type)\s+[A-Za-z_$][\w$]*/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const kind = m[1]!;
+    let i = m.index + m[0].length;
+    if (kind === "interface") {
+      const open = code.indexOf("{", i);
+      if (open === -1) continue;
+      let depth = 0;
+      let j = open;
+      for (; j < n; j++) {
+        if (code[j] === "{") depth++;
+        else if (code[j] === "}") {
+          depth--;
+          if (depth === 0) {
+            j++;
+            break;
+          }
+        }
+      }
+      blankRange(chars, m.index, j);
+    } else {
+      // type: find the declaration `=` at depth 0, then the `;` at depth 0.
+      let j = i;
+      let depth = 0;
+      let eq = -1;
+      for (; j < n; j++) {
+        const c = code[j]!;
+        if (c === "<" || c === "{" || c === "(" || c === "[") depth++;
+        else if (c === ">" || c === "}" || c === ")" || c === "]") depth--;
+        else if (c === "=" && depth === 0) {
+          eq = j;
+          break;
+        } else if (c === ";" && depth === 0) break; // `export type { A }`: no `=`, leave it
+      }
+      if (eq === -1) continue;
+      depth = 0;
+      let end = n;
+      for (j = eq; j < n; j++) {
+        const c = code[j]!;
+        if (c === "{" || c === "(" || c === "[") depth++;
+        else if (c === "}" || c === ")" || c === "]") depth--;
+        else if (c === ";" && depth === 0) {
+          end = j + 1;
+          break;
+        }
+      }
+      blankRange(chars, m.index, end);
+    }
+  }
+  return chars.join("");
+}
+
+/** Words that are never a value on their own: literals, the `function`
+ *  keyword (a generator `function*` is not an operator), and the
+ *  declaration keywords. `this` is deliberately absent — it is a value. */
+const NON_VALUE_WORDS =
+  /^(true|false|null|undefined|function|if|else|for|while|do|switch|case|default|return|typeof|instanceof|new|delete|void|in|of|class|extends|super|import|export|from|as|const|let|var|await|yield|try|catch|finally|throw)$/;
+
+/** True when `text` contains an identifier used as a value — not an
+ *  object key, a member name, a JSX tag name, or a keyword. */
+function hasValueIdentifier(text: string): boolean {
+  let t = text;
+  // `import.meta` is the module metadata object — a runtime value, not a
+  // keyword. (Without this, `if (import.meta.env.DEV)` reads as a branch
+  // on nothing, and a conditional logger scores as a declaration.)
+  if (/\bimport\s*\.\s*meta\b/.test(t)) return true;
+  // JSX tag names are not values (`<div>` / `</div>` / `<App />`).
+  t = t.replace(/<\/?[A-Za-z][\w.]*/g, " ");
+  // Object keys (identifier followed by `:` after `{` or `,`) are not values.
+  t = t.replace(/(^|[{,])\s*[A-Za-z_$][\w$]*\s*:/g, "$1");
+  // Member names (identifier preceded by `.`) are not values — but a
+  // spread (`...args`) is a value, not a member access: the `..` before
+  // the final dot gives it away.
+  t = t.replace(/(?<!\.\.)(?<=\.)[A-Za-z_$][\w$]*/g, " ");
+  const re = /[A-Za-z_$][\w$]*/g;
+  let id: RegExpExecArray | null;
+  while ((id = re.exec(t)) !== null) {
+    if (!NON_VALUE_WORDS.test(id[0])) return true;
+  }
+  return false;
+}
+
+/** The inner text of the balanced paren group starting at `openIdx`
+ *  (the `(`), plus the index of its closing paren — or null when
+ *  unbalanced. Strings and comments are already blanked, so no paren
+ *  inside them can mislead the depth count. */
+function balancedParenText(
+  text: string,
+  openIdx: number
+): { inner: string; closeIdx: number } | null {
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0) return { inner: text.slice(openIdx + 1, i), closeIdx: i };
+    }
+  }
+  return null;
+}
+
+/** Callee names that are never a call: control flow, declarations, and
+ *  operators. `new Foo(` still matches — on `Foo`, not on `new`. */
+const CALL_KEYWORDS = new Set([
+  "if", "else", "for", "while", "do", "switch", "catch", "return", "typeof",
+  "instanceof", "new", "delete", "void", "in", "of", "function", "class",
+  "extends", "super", "import", "export", "from", "as", "const", "let",
+  "var", "await", "yield", "try", "finally", "throw", "case", "default",
+  "break", "continue", "debugger", "true", "false", "null", "undefined",
+]);
+
+/** True when the call whose `(` sits at `openIdx` is a declaration, not
+ *  a call: `foo() {`, `foo(): T {`. A call in a ternary consequent
+ *  (`c ? foo(x) : {...}`) can look like the second case — harmless, the
+ *  ternary's own `?` is a signal too. */
+function isDeclarationCall(code: string, closeIdx: number): boolean {
+  const after = code.slice(closeIdx + 1).trimStart();
+  if (after.startsWith("{")) return true;
+  if (!after.startsWith(":")) return false;
+  // Return-type annotation: `:` then only type-like tokens, then `{`
+  // before any `;`, `,` or `)` ends the statement.
+  let j = 1;
+  while (j < after.length && after[j] !== "{" && after[j] !== ";" && after[j] !== "," && after[j] !== ")") {
+    if (after[j] === "(") return false;
+    j++;
+  }
+  if (j >= after.length || after[j] !== "{") return false;
+  return /^[\w$.\[\]<>|&\s,?]*$/.test(after.slice(1, j));
+}
+
+/** True when some call in `code` passes at least one non-literal argument. */
+function hasCallWithValueArgument(code: string): boolean {
+  const re = /([A-Za-z_$][\w$]*)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const name = m[1]!;
+    if (CALL_KEYWORDS.has(name)) continue;
+    const openIdx = m.index + m[0].length - 1;
+    const group = balancedParenText(code, openIdx);
+    if (group === null) continue;
+    if (isDeclarationCall(code, group.closeIdx)) continue;
+    // A method call with no arguments (`foo.bar()`) is a call on a value
+    // (§A2b) — it invokes behavior on an object. A bare call with no
+    // arguments (`foo()`) is not, and a call with only literal arguments
+    // (`res.json({ ok: true })`) is a literal-only return, not logic.
+    if (group.inner.trim() === "" && code[m.index - 1] === ".") return true;
+    if (hasValueIdentifier(group.inner)) return true;
+  }
+  return false;
+}
+
+/** True when an `if` / `switch` / `while` / `for` condition reads a value.
+ *  `catch (e)` is excluded: a bare catch binding is not a use — the catch
+ *  body is judged on its own statements. */
+function hasBranchOnValue(code: string): boolean {
+  const re = /\b(if|switch|while|for)\s*\(/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const openIdx = m.index + m[0].length - 1;
+    const group = balancedParenText(code, openIdx);
+    if (group !== null && hasValueIdentifier(group.inner)) return true;
+  }
+  return false;
+}
+
+/** True when a `return` hands back a computed value: a property read, a
+ *  comparison/arithmetic/logical expression, a unary operator on a value,
+ *  or an object/array literal holding a value. `return x;` (bare
+ *  parameter/local) and `return { ok: true };` do not count. */
+function hasComputedReturn(code: string): boolean {
+  // A property read (`return foo.bar`) — but not a call: `return
+  // Response.json({ ok: true })` is a literal-only return through a
+  // helper, and the call's own arguments decide (see
+  // hasCallWithValueArgument). The pattern consumes the whole property
+  // chain, so `return foo.bar.baz()` (a call) does not match either.
+  // The `(?![\w$])` pins the last identifier complete — without it the
+  // `[\w$]*` backtracks to a prefix (`jso` of `json`) and the `(` test
+  // sees a letter instead of the paren.
+  if (/\breturn\s+[A-Za-z_$][\w$]*(?:\s*\??\.[A-Za-z_$][\w$]*)+(?![\w$])(?!\s*\()/.test(code)) return true;
+  if (/\breturn\s+[A-Za-z_$][\w$]*\s*(===|!==|==|!=|>=|<=|>|<|\+|-|\*|\/|%|&&|\|\||\?\?)/.test(code)) return true;
+  if (/\breturn\s*[-+!~]\s*[A-Za-z_$]/.test(code)) return true;
+  const re = /\breturn\s*([{\[])/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    const openIdx = m.index + m[0].length - 1;
+    let depth = 0;
+    let inner: string | null = null;
+    for (let j = openIdx; j < code.length; j++) {
+      const c = code[j]!;
+      if (c === "{" || c === "[" || c === "(") depth++;
+      else if (c === "}" || c === "]" || c === ")") {
+        depth--;
+        if (depth === 0) {
+          inner = code.slice(openIdx + 1, j);
+          break;
+        }
+      }
+    }
+    if (inner !== null && hasValueIdentifier(inner)) return true;
+  }
+  return false;
+}
+
+/**
+ * Exported for tests: does this comment-blanked file text contain real
+ * logic (§A2)? A file contains real logic when at least one statement
+ * uses its inputs, touches state / I/O / a call, or branches on a runtime
+ * value. Literal-only returns, placeholder components, not-implemented
+ * throws, and input-ignoring handlers do not count.
+ */
+export function containsRealLogic(strippedContent: string): boolean {
+  // Re-exports are declarations, not logic: `export { App } from './App'`
+  // and `export * from './x'` must never count (the `*` would otherwise
+  // read as a binary operator). Import specifier lists are the same:
+  // `import { defineConfig }` is not an object literal holding a value.
+  // Strip both before any signal check.
+  const code = stripTypeDeclarations(blankStringLiterals(strippedContent))
+    .replace(
+      /export\s*(?:\*|\{[^}]*\})(?:\s*(?:as\s+\w+\s*)?from\s*['"][^'"]*['"])?/g,
+      ""
+    )
+    .replace(/import\s+(?:type\s+)?\{[^}]*\}/g, "");
+  // Await / yield of a value.
+  if (/\bawait\s+[^\s;)]/.test(code) || /\byield\s+[^\s;)]/.test(code)) return true;
+  // Template interpolation of a value.
+  if (/\$\{[^}]*[A-Za-z_$]/.test(code)) return true;
+  // State mutation: property/element assignment, compound assignment,
+  // inc/dec, mutating method calls, `delete`.
+  if (/[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*|\[[^\]\n]+\])\s*=(?!=)/.test(code)) return true;
+  if (/[A-Za-z_$][\w$]*\s*(\+\+|--|\+=|-=|\*=|\/=|%=|\*\*=|\|\|=|&&=|\?\?=)/.test(code)) return true;
+  if (/\.(push|splice|set|add|delete|sort|reverse|fill)\s*\(/.test(code)) return true;
+  if (/\bdelete\s+[A-Za-z_$]/.test(code)) return true;
+  // A call passing at least one non-literal argument.
+  if (hasCallWithValueArgument(code)) return true;
+  // A branch on a runtime value.
+  if (hasBranchOnValue(code)) return true;
+  // Ternary / nullish / logical on a value (not a literal keyword).
+  if (/(?<![\w$.])(?!(?:true|false|null|undefined|function)\b)[A-Za-z_$][\w$]*\s*\?(?![?.:])/.test(code)) return true;
+  if (/(?<![\w$.])(?!(?:true|false|null|undefined|function)\b)[A-Za-z_$][\w$.]*\s*\?\?/.test(code)) return true;
+  if (/(?<![\w$.])(?!(?:true|false|null|undefined|function)\b)[A-Za-z_$][\w$.]*\s*(&&|\|\|)/.test(code)) return true;
+  // A binary expression on values: `(x) => x * 2`, `const ok = x > 0`.
+  // JSX tags are blanked first: `return <div>` and `</div>` would
+  // otherwise read as comparisons (`return <`, `div >`). Generic
+  // instantiations like `foo<string>` blank the same way — the misread
+  // the header note warned about no longer fires here.
+  const noJsx = code.replace(/<\/?[A-Za-z][\w.]*(?:\s[^>]*?)?>/g, " ");
+  if (/(?<![\w$.])(?!(?:true|false|null|undefined|function)\b)[A-Za-z_$][\w$]*\s*(===|!==|>=|<=|==|!=|\*\*|>|<|\+|-|\*|\/|%)(?![=>])/.test(noJsx)) return true;
+  // A return of a computed value.
+  if (hasComputedReturn(code)) return true;
+  // An object/array literal holding a value (§A2a: a parameter read in an
+  // expression, e.g. `const n = { id, channel: 'EMAIL', status: 'Delivered' }`
+  // — not a literal-only return). Shorthand properties and array elements
+  // count; literal-only values do not. Deliberately NO colon check:
+  // `key: value` inside braces is indistinguishable by regex from a type
+  // annotation (`const x: User[]`, `(req: Request)`), and the annotation
+  // surface is far larger than the `{ key: value }` case it would catch —
+  // `return { key: value }` is already caught by hasComputedReturn, and a
+  // value passed to a call by hasCallWithValueArgument. (A non-shorthand
+  // object literal assigned to a const and returned only by identifier is
+  // the known miss; see the header note.)
+  if (/\{\s*[A-Za-z_$][\w$]*\s*[,}]/.test(code)) return true;
+  if (/\[\s*(?!(?:true|false|null|undefined|string|number|boolean|any|unknown|void|never)\b)[A-Za-z_$][\w$]*\s*[,\\\]]/.test(code)) return true;
+  // Throwing a value (not `new Error('literal')`).
+  if (/\bthrow\s+(?!new\b)[A-Za-z_$]/.test(code)) return true;
+  return false;
+}
+
+/**
+ * The fake-success finding probes (§A4): a dead action, a mocked payment /
+ * notification, or a fabricated status. These are the score layer's own
+ * filtered view — the per-file candidate counts ALSO include hits the
+ * score layer drops (e.g. a mocked-notification candidate the repo's
+ * delivery provider absorbs, or a detector firing on its own source
+ * comment), and those must never cap the score. Delivery claims are not
+ * findings — they become missing features — so they are counted
+ * separately below, with the same provider filter the missing-features
+ * builder applies.
+ */
+const FAKE_SUCCESS_PROBES = new Set([
+  "Dead Action",
+  "Mocked Payment",
+  "Mocked Notification",
+  "Fabricated Status",
+]);
+
+function scoreCoreLogic(
+  sig: WorkspaceSignals,
+  deterministicFindings: DeterministicFinding[]
+): CategoryResult {
+  const isTestFile = (p: string) => /(\.test\.|\.spec\.|__tests__)/i.test(p);
+  // Fake-success details per file, from the findings the score layer
+  // actually stands behind — never the raw candidate counts (§A4, §5.3).
+  const fakeSuccessByFile = new Map<string, { kind: string; lines: string; label: string }[]>();
+  const addFake = (path: string, kind: string, lines: string, label: string) => {
+    if (isTestFile(path) || !isCodeFile(path)) return;
+    const list = fakeSuccessByFile.get(path) ?? [];
+    list.push({ kind, lines, label });
+    fakeSuccessByFile.set(path, list);
+  };
+  for (const f of deterministicFindings) {
+    if (f.probe && FAKE_SUCCESS_PROBES.has(f.probe)) {
+      addFake(f.file, f.probe.toLowerCase(), f.line != null ? String(f.line) : "", f.title);
+    }
+  }
+  // Delivery claims: missing features, not findings — counted here with
+  // the same repo-wide provider filter the missing-features builder uses,
+  // so a claim a real provider fulfills never caps the score.
+  const repoHasDeliveryProvider = sig.files.some(
+    (f) => isCodeFile(f.path) && DELIVERY_PROVIDER_USE.test(f.strippedContent)
+  );
+  if (!repoHasDeliveryProvider) {
+    for (const f of sig.files) {
+      for (const c of f.analysis.deliveryClaims) {
+        addFake(f.path, "mocked delivery claim", c.lines, c.code.slice(0, 60));
+      }
+    }
+  }
+  const codeFiles = sig.files.filter((f) => isCodeFile(f.path) && !isTestFile(f.path));
+  const perFile = codeFiles.map((f) => ({
+    path: f.path,
+    hasLogic: containsRealLogic(f.strippedContent),
+    hasStub: f.analysis.stubCount > 0,
+    stubCount: f.analysis.stubCount,
+    firstStubLine: f.analysis.stubs[0]?.lines.split("-")[0] ?? null,
+    fakeSuccess: fakeSuccessByFile.get(f.path) ?? [],
+  }));
+  // Denominator (§A1): non-test files that contain logic OR carry stub
+  // markers OR carry a fake-success finding — floored at 10.
+  const logicPurporting = perFile.filter((p) => p.hasLogic || p.hasStub || p.fakeSuccess.length > 0);
+  const substantive = perFile.filter((p) => p.hasLogic && !p.hasStub);
+  const excluded = codeFiles.length - logicPurporting.length;
+  const floorBound = logicPurporting.length < CORE_LOGIC_DENOMINATOR_FLOOR;
+  const denominator = Math.max(logicPurporting.length, CORE_LOGIC_DENOMINATOR_FLOOR);
+  const numerator = substantive.length;
+  const ratio = denominator > 0 ? numerator / denominator : 0;
+
+  const totalStubs = perFile.reduce((n, p) => n + p.stubCount, 0);
+  const stubFiles = perFile.filter((p) => p.hasStub);
+  const cappedFiles = perFile.filter((p) => p.fakeSuccess.length > 0);
+  const totalFake = cappedFiles.reduce((n, p) => n + p.fakeSuccess.length, 0);
+
+  // Score (§A5): ratio, min 2 when files exist (1 when none), capped at 7
+  // per §A4. The cap only "applies" when it actually binds — a repo
+  // already below 7 is not described as capped.
+  let rawScore = Math.round(ratio * 10);
+  if (codeFiles.length === 0) rawScore = 1;
+  else if (rawScore < 2) rawScore = 2;
+  const capBinds = cappedFiles.length > 0 && rawScore > CORE_LOGIC_FAKE_SUCCESS_CAP;
+  const score = capBinds ? CORE_LOGIC_FAKE_SUCCESS_CAP : rawScore;
+
+  // Evidence, precise (§A6): every count a developer needs to reproduce
+  // the score. Lines stay short — the report builder condenses them.
+  const evidence: string[] = [];
+  evidence.push(
+    `${numerator}/${denominator} logic-purporting non-test files contain real logic ` +
+      `(uses inputs, state, I/O, or calls — not literal-only returns) and are free of stub markers`
+  );
+  evidence.push(
+    `${excluded} declaration/config files excluded from the denominator` +
+      (floorBound
+        ? `; denominator floored at ${CORE_LOGIC_DENOMINATOR_FLOOR} (${logicPurporting.length} logic files counted)`
+        : `; denominator floor did not bind`)
+  );
+  if (totalStubs === 0) {
+    evidence.push("No stubs found.");
+  } else {
+    const named = stubFiles
+      .slice(0, 3)
+      .map((p) => `${p.path}${p.firstStubLine ? `:${p.firstStubLine}` : ""} (×${p.stubCount})`)
+      .join(", ");
+    evidence.push(
+      `${totalStubs} stub markers detected: ${named}` +
+        (stubFiles.length > 3 ? `, and ${stubFiles.length - 3} more files` : "")
+    );
+  }
+  if (totalFake === 0) {
+    evidence.push("0 fake-success findings. No cap.");
+  } else {
+    const named = cappedFiles
+      .flatMap((p) =>
+        p.fakeSuccess.map((d) => `${p.path}:${d.lines.split("-")[0]} (${d.kind})`)
+      )
+      .slice(0, 3)
+      .join(", ");
+    evidence.push(
+      capBinds
+        ? `${totalFake} fake-success findings — Core logic capped at ${CORE_LOGIC_FAKE_SUCCESS_CAP}: ${named}` +
+            (totalFake > 3 ? `, and ${totalFake - 3} more` : "")
+        : `${totalFake} fake-success findings (score already below ${CORE_LOGIC_FAKE_SUCCESS_CAP}, so the cap does not change it): ${named}` +
+            (totalFake > 3 ? `, and ${totalFake - 3} more` : "")
+    );
+  }
+
+  // Plain-English rendering of the same counts (§B9): the stakeholder
+  // report and the model prompt read this; the Q&A and the handoff packet
+  // keep the precise lines above. Same numbers, different words.
+  const plainEvidence: string[] = [];
+  plainEvidence.push(
+    `${numerator} of ${denominator} files that should contain the app's main features do real work — ` +
+      `they use their inputs, change state, or call other code, instead of just returning a fixed value.`
+  );
+  if (excluded > 0) {
+    plainEvidence.push(
+      `${excluded} files hold only declarations or settings, not features, so they are not counted.`
+    );
+  }
+  if (floorBound) {
+    plainEvidence.push(
+      `Only ${logicPurporting.length} files were counted, so a minimum of ${CORE_LOGIC_DENOMINATOR_FLOOR} was used — a tiny codebase cannot claim a perfect score on a handful of files.`
+    );
+  }
+  plainEvidence.push(totalStubs === 0 ? "No unfinished placeholders were found." : `${totalStubs} unfinished placeholders were found.`);
+  plainEvidence.push(
+    totalFake === 0
+      ? "No features that only pretend to work were found."
+      : capBinds
+        ? `${totalFake} features that only pretend to work were found, so the score is capped at ${CORE_LOGIC_FAKE_SUCCESS_CAP}.`
+        : `${totalFake} features that only pretend to work were found.`
+  );
+
+  return { score, max: 10, evidence, plainEvidence };
 }
 
 function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
@@ -792,7 +1387,7 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
     const whLine = findLine(c, /webhook/i);
     evidence.push(`${impl.path}${whLine != null ? `:${whLine}` : ""}: webhook handler found (event-driven automation)`);
     evidence.push("no scheduled jobs, queues, workers, or webhook retry/reconciliation logic");
-    return { score: 6, max: 10, evidence };
+    return { score: 6, max: 10, evidence, checklist: [...AUTOMATION_CHECKLIST] };
   }
   const referenced = anyFile(sig, (f) => hasWord(f.strippedContent, AUTOMATION_REF) || hasWord(f.strippedContent, PAYMENT_REF));
   // A scheduler/queue/worker dependency with no code usage yet still counts
@@ -805,7 +1400,7 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
         findLine(referenced!.content, AUTOMATION_REF) ?? findLine(referenced!.content, PAYMENT_REF);
       evidence.push(ev(referenced!.path, rLine, "references automation/webhooks with no implementation"));
     }
-    return { score: 3, max: 10, evidence, note: "dangling-automation" };
+    return { score: 3, max: 10, evidence, note: "dangling-automation", checklist: [...AUTOMATION_CHECKLIST] };
   }
   // Rule-based N/A (never model judgment): no scheduler/queue/worker/cron
   // implementation in code AND no such reference or dependency anywhere.
@@ -1611,7 +2206,7 @@ export function computeDeterministicAssessment(
     authentication: scoreAuthentication(sig, middlewareResolution.gates),
     databaseLayer: scoreDatabaseLayer(sig),
     errorHandling: scoreErrorHandling(sig),
-    coreLogic: scoreCoreLogic(sig),
+    coreLogic: scoreCoreLogic(sig, deterministicFindings),
     backgroundAutomation: scoreBackgroundAutomation(sig),
     externalIntegrations: scoreExternalIntegrations(sig),
     security: scoreSecurity(sig, calibratedPreflight),
@@ -1741,7 +2336,7 @@ export function computeDeterministicAssessment(
   if (totalCap !== null) completenessScore = Math.min(completenessScore, totalCap);
   const importMap = sig.files.map((f) => ({ path: f.path, imports: f.imports.slice(0, 40) }));
 
-  return { categories, missingFeatures, deterministicFindings, calibratedPreflightFindings: calibratedPreflight.findings, completenessScore, applicableCount, capsApplied, importMap };
+  return { categories, missingFeatures, deterministicFindings, calibratedPreflightFindings: calibratedPreflight.findings, completenessScore, applicableCount, capsApplied, importMap, scannerVersion: SCANNER_VERSION, metricVersion: CORE_LOGIC_METRIC_VERSION };
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,10 +2352,14 @@ export function formatAssessmentForPrompt(a: DeterministicAssessment): string {
   lines.push("Category scores (copy each score EXACTLY; write the reason from the evidence):");
   for (const k of CATEGORY_KEYS) {
     const c = a.categories[k];
+    // The model writes the buyer-facing reason from the plain rendering
+    // when one exists (§B9) — the precise lines stay with the Q&A and the
+    // packet. Same counts, different words.
+    const shown = c.plainEvidence ?? c.evidence;
     if (c.applicable === false) {
-      lines.push(`- ${k}: N/A (not applicable — ${c.evidence.join(" | ")}; write score 0 and state "not applicable" in the reason; the server replaces it with the N/A marker)`);
+      lines.push(`- ${k}: N/A (not applicable — ${shown.join(" | ")}; write score 0 and state "not applicable" in the reason; the server replaces it with the N/A marker)`);
     } else {
-      lines.push(`- ${k}: ${c.score}/10 — evidence: ${c.evidence.join(" | ")}`);
+      lines.push(`- ${k}: ${c.score}/10 — evidence: ${shown.join(" | ")}`);
     }
   }
   lines.push("");
@@ -1778,12 +2377,15 @@ export function formatAssessmentForPrompt(a: DeterministicAssessment): string {
 }
 
 // Fallback reason when the model drops a category reason: built from evidence.
+// Uses the plain rendering when one exists (§B9) — the fallback reason is
+// buyer-facing, so it reads plain English, never scanner jargon.
 export function fallbackReason(key: CategoryKey, a: DeterministicAssessment): string {
   const c = a.categories[key];
+  const shown = c.plainEvidence ?? c.evidence;
   if (c.applicable === false) {
-    return `Not applicable to this project (excluded from the total). Evidence: ${c.evidence.join("; ")}.`;
+    return `Not applicable to this project (excluded from the total). Evidence: ${shown.join("; ")}.`;
   }
-  return `Deterministic score ${c.score}/10. Evidence: ${c.evidence.join("; ")}.`;
+  return `Deterministic score ${c.score}/10. Evidence: ${shown.join("; ")}.`;
 }
 
 export function fallbackMissingReason(m: MissingFeatureFact): string {

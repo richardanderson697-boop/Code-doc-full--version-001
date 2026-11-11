@@ -525,6 +525,18 @@ The total completenessScore is computed server-side (rescaled over the applicabl
       evidence: Object.fromEntries(
         CATEGORY_KEYS.map((k) => [k, assessment.categories[k].evidence])
       ),
+      // Per-category checklists (background automation only — the scorer
+      // attaches one only where a category is half-built or a liability)
+      // plus the scanner / metric versions, so the report and the
+      // developer handoff packet can state what produced them (§B3, §B6).
+      checklists: Object.fromEntries(
+        CATEGORY_KEYS.filter((k) => assessment.categories[k].checklist).map((k) => [
+          k,
+          assessment.categories[k].checklist,
+        ])
+      ),
+      scannerVersion: assessment.scannerVersion,
+      metricVersion: assessment.metricVersion,
       // Deterministic findings (dead payment buttons, mocked-payment
       // routes): the overlay appends these to the audit input's findings
       // so the report builder buckets them — liabilities for dead payment

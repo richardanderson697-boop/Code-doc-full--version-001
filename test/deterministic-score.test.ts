@@ -5,11 +5,16 @@
 import { describe, it, expect } from "vitest";
 import {
   computeDeterministicAssessment,
+  containsRealLogic,
+  splitCodeAndComments,
   formatAssessmentForPrompt,
+  fallbackReason,
   CATEGORY_KEYS,
 } from "../server/deterministic-score";
 import type { PreFlightReport } from "../shared/preflight-types";
 import type { WorkspaceFile } from "../server/workspace";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative, resolve } from "node:path";
 
 function wf(path: string, content: string): WorkspaceFile {
   return { path, content, lineCount: content.split("\n").length } as WorkspaceFile;
@@ -682,5 +687,284 @@ export async function POST(request: NextRequest) {
     const a = computeDeterministicAssessment(files, emptyPreflight());
     expect(a.deterministicFindings).toHaveLength(0);
     expect(a.missingFeatures.filter((m) => m.feature.includes("dead"))).toHaveLength(0);
+  });
+});
+
+describe("coreLogic metric v2 (spec §A)", () => {
+  // containsRealLogic takes comment-blanked content (the same input the
+  // scorer passes it); the fixtures go through splitCodeAndComments so a
+  // comment mentioning "await" or a notification can never fake a signal.
+  const logicOf = (code: string) =>
+    containsRealLogic(splitCodeAndComments(code).code);
+
+  it("does not count a literal-only return as logic", () => {
+    expect(logicOf(`export function getStatus() { return { ok: true }; }`)).toBe(false);
+    expect(logicOf(`export function getCount() { return 42; }`)).toBe(false);
+  });
+
+  it("does not count an input-ignoring handler as logic", () => {
+    // The spec's own example: `res.json({ ok: true })` does not count.
+    expect(
+      logicOf(`export async function GET() { return Response.json({ ok: true }); }`)
+    ).toBe(false);
+    expect(
+      logicOf(`export async function GET(req: Request) { return Response.json({ ok: true }); }`)
+    ).toBe(false);
+  });
+
+  it("does not count a placeholder component as logic", () => {
+    expect(
+      logicOf(`export function ComingSoon() { return <div>Coming soon</div>; }`)
+    ).toBe(false);
+  });
+
+  it("does not count a not-implemented throw as logic", () => {
+    expect(
+      logicOf(`export function run() { throw new Error('not implemented'); }`)
+    ).toBe(false);
+  });
+
+  it("does not count pure type declarations, constants, configs, or re-exports as logic", () => {
+    expect(
+      logicOf(`interface User { id: string; name: string; }\nexport type Role = 'admin' | 'user';`)
+    ).toBe(false);
+    expect(logicOf(`export const CONFIG = { port: 3000, name: 'app' };`)).toBe(false);
+    expect(logicOf(`export { App } from './App';`)).toBe(false);
+    expect(logicOf(`export * from './utils';`)).toBe(false);
+    expect(
+      logicOf(
+        `import { defineConfig } from "vitest/config";\n\nexport default defineConfig({ test: { environment: "node", testTimeout: 30000 } });`
+      )
+    ).toBe(false);
+  });
+
+  it("counts a 25-line util with a real branch as logic", () => {
+    const util = `// Calculates a tiered discount for an order total.
+// Orders over 100 get 10% off, over 500 get 20% off.
+// Anything else pays full price.
+export function discountFor(total: number): number {
+  let rate = 0;
+  if (total > 500) {
+    rate = 0.2;
+  } else if (total > 100) {
+    rate = 0.1;
+  }
+  const discount = total * rate;
+  const finalTotal = total - discount;
+  return finalTotal;
+}
+
+export function formatPrice(total: number): string {
+  const discounted = discountFor(total);
+  return \`$\${discounted.toFixed(2)}\`;
+}
+`;
+    expect(logicOf(util)).toBe(true);
+  });
+
+  it("counts a handler that reads req.body and calls a service as logic", () => {
+    expect(
+      logicOf(
+        `export async function POST(req: any) {\n  const body = await req.json();\n  const user = await createUser(body);\n  return Response.json({ user });\n}`
+      )
+    ).toBe(true);
+  });
+
+  it("counts a parameter read in an object literal as logic, but not a literal-only one", () => {
+    expect(
+      logicOf(
+        `export function recordNotification(id: string) {\n  const notification = { id, channel: 'EMAIL', status: 'Delivered' };\n  return notification;\n}`
+      )
+    ).toBe(true);
+    expect(
+      logicOf(`export function wrap(item: string) { const list = [item]; return list; }`)
+    ).toBe(true);
+  });
+
+  it("counts a state mutation and an awaited call with a value argument as logic", () => {
+    expect(
+      logicOf(`export function addItem(list: string[], item: string) { list.push(item); return list; }`)
+    ).toBe(true);
+    expect(
+      logicOf(`export async function load(id: string) { const row = await fetchUser(id); return row; }`)
+    ).toBe(true);
+  });
+
+  it("counts a spread argument as a value argument, and a branch on import.meta as a runtime branch", () => {
+    expect(
+      logicOf(
+        `export function logDebug(...args: unknown[]): void {\n  if (import.meta.env.DEV) {\n    console.log(...args);\n  }\n}`
+      )
+    ).toBe(true);
+  });
+
+  // The cap (§A4): ten real logic files plus one file with dead payment
+  // buttons. The ratio alone is 10/10 — only the cap holds it at 7.
+  // Neutral service names (fetchUser, no db/auth/payment words) so CAP A
+  // and CAP B cannot rescale the scores and hide the cap.
+  it("caps Core logic at 7 on a fake-success finding (ratio would be 10)", () => {
+    const service = (i: number) =>
+      wf(
+        `lib/service${i}.ts`,
+        `export async function getRecord${i}(id: string) {\n  const row = await fetchUser(id);\n  return row;\n}`
+      );
+    const files = [
+      ...Array.from({ length: 10 }, (_, i) => service(i + 1)),
+      wf("app/layout.tsx", `export default function RootLayout({ children }: { children: React.ReactNode }) {\n  return <html><body>{children}</body></html>;\n}`),
+      wf(
+        "app/pricing/pricing-client.tsx",
+        `'use client'\nimport { Button } from '@/components/ui/button'\nexport function PricingClient() {\n  return (\n    <div>\n      <Button className="w-full">Get Started</Button>\n      <Button className="w-full">Get Started</Button>\n      <Button className="w-full">Get Started</Button>\n    </div>\n  )\n}`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.coreLogic.score).toBe(7);
+    expect(a.categories.coreLogic.evidence.join(" ")).toMatch(/capped at 7/);
+    expect(a.categories.coreLogic.evidence.join(" ")).toMatch(/pricing-client.*dead action/);
+    expect(a.deterministicFindings.filter((f) => f.probe === "Dead Action")).toHaveLength(3);
+  });
+
+  // The floor (§A1): three logic files cannot claim more than 3/10 — the
+  // denominator floor of 10 binds.
+  it("floors the denominator at 10 on a tiny fixture repo", () => {
+    const files = [
+      wf("app/page.tsx", `export default function Home() {\n  return <div><h1>Hello</h1></div>;\n}`),
+      ...[1, 2, 3].map((i) =>
+        wf(
+          `lib/service${i}.ts`,
+          `export async function getRecord${i}(id: string) {\n  const row = await fetchUser(id);\n  return row;\n}`
+        )
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.coreLogic.score).toBe(3);
+    expect(a.categories.coreLogic.evidence.join(" ")).toMatch(/denominator floored at 10 \(3 logic files counted\)/);
+  });
+
+  // The dropped candidate (§5.3): a mocked-notification candidate in a
+  // repo that uses a delivery provider must never become a finding and
+  // must never cap the score. The candidate is verified to fire at the
+  // detector level (mockedNotificationCount 1) and to be dropped by the
+  // score layer (0 findings).
+  it("does not cap on a mocked-notification candidate the delivery provider absorbs", async () => {
+    const { runDeterministicScan } = await import("../server/deterministic-scan");
+    const notify = `export function recordNotification(id: string) {\n  const notification = { id, channel: 'EMAIL', status: 'Delivered' };\n  return notification;\n}`;
+    expect(runDeterministicScan(notify, "lib/notify.ts").mockedNotificationCount).toBe(1);
+    const files = [
+      wf("lib/notify.ts", notify),
+      wf(
+        "lib/email.ts",
+        `const RESEND_API = "https://api.resend.com/emails";\nexport async function sendEmail(to: string) {\n  await fetch(RESEND_API, { method: 'POST', body: JSON.stringify({ to }) });\n}`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.deterministicFindings).toHaveLength(0);
+    expect(a.categories.coreLogic.evidence.join(" ")).toMatch(/0 fake-success findings\. No cap\./);
+  });
+
+  it("states the computation in the evidence and says 'no stubs found' at 0", () => {
+    const a = computeDeterministicAssessment(HEALTHY_NEXT, emptyPreflight());
+    const ev = a.categories.coreLogic.evidence.join(" ");
+    expect(ev).toMatch(/logic-purporting non-test files contain real logic/);
+    expect(ev).toMatch(/No stubs found\./);
+    expect(ev).toMatch(/fake-success findings/);
+  });
+
+  it("renders plain English in the prompt/fallback reason, precise terms in the evidence (§B9)", () => {
+    const a = computeDeterministicAssessment(HEALTHY_NEXT, emptyPreflight());
+    const plain = formatAssessmentForPrompt(a) + " " + fallbackReason("coreLogic", a);
+    expect(plain).not.toMatch(/fake-success/i);
+    expect(plain).not.toMatch(/stub markers/i);
+    expect(plain).not.toMatch(/denominator/i);
+    const precise = a.categories.coreLogic.evidence.join(" ");
+    expect(precise).toMatch(/fake-success findings/);
+    expect(precise).toMatch(/denominator/);
+  });
+
+  // Reference-repo pins (§A7). The clones live next to this repo; when
+  // absent (CI, a fresh machine) the pins skip instead of failing.
+  // Directions, not exact counts: RentStream must not reach 10 (the cap
+  // holds it down); Whistle-stop and Automate-AI sit at 7 via the cap
+  // (9→7 and 6→7 from the v1 metric); the self-scan is 10 with the
+  // computation stated in its evidence.
+  const REPO_ROOT = resolve(process.cwd(), "..", "..");
+  const SKIP_DIR = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", "__pycache__", ".turbo", "vendor"]);
+  const TEXT_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|json|md|html|css|txt|yml|yaml|toml|lock)$/i;
+  function readRepo(dir: string): WorkspaceFile[] {
+    const out: WorkspaceFile[] = [];
+    const walk = (d: string) => {
+      for (const e of readdirSync(d)) {
+        const p = join(d, e);
+        let st;
+        try {
+          st = statSync(p);
+        } catch {
+          continue;
+        }
+        if (st.isDirectory()) {
+          if (!SKIP_DIR.has(e)) walk(p);
+        } else if (st.isFile() && st.size < 1024 * 1024 && TEXT_EXT.test(e)) {
+          const content = readFileSync(p, "utf8");
+          out.push({
+            path: relative(dir, p).split("/").join("/"),
+            content,
+            lineCount: content.split("\n").length,
+          } as WorkspaceFile);
+        }
+      }
+    };
+    walk(dir);
+    out.sort((x, y) => (x.path < y.path ? -1 : 1));
+    return out;
+  }
+  const pinIt = (dir: string) => (existsSync(dir) ? it : it.skip);
+
+  pinIt(join(REPO_ROOT, "rentstream-check"))(
+    "pins RentStream below 10 via the fake-success cap (not the ratio)",
+    () => {
+      const a = computeDeterministicAssessment(readRepo(join(REPO_ROOT, "rentstream-check")), emptyPreflight());
+      expect(a.categories.coreLogic.score).toBe(7);
+      const ev = a.categories.coreLogic.evidence.join(" ");
+      expect(ev).toMatch(/capped at 7/);
+      expect(ev).toMatch(/fabricated status/);
+      // The ratio alone is 10/10 — the cap, not the ratio, holds it down.
+      expect(ev).toMatch(/10\/10 logic-purporting/);
+    }
+  );
+
+  pinIt(join(REPO_ROOT, "whistle-stop-cleaning-check"))(
+    "pins Whistle-stop at 7 via the fake-success cap (v1: 9)",
+    () => {
+      const a = computeDeterministicAssessment(
+        readRepo(join(REPO_ROOT, "whistle-stop-cleaning-check")),
+        emptyPreflight()
+      );
+      expect(a.categories.coreLogic.score).toBe(7);
+      const ev = a.categories.coreLogic.evidence.join(" ");
+      expect(ev).toMatch(/capped at 7/);
+      expect(ev).toMatch(/mocked notification/);
+    }
+  );
+
+  pinIt(join(REPO_ROOT, "automate-ai-pricing-check", "Automate-AI-v4-main"))(
+    "pins Automate-AI v4 at 7 via the fake-success cap (v1: 6)",
+    () => {
+      const a = computeDeterministicAssessment(
+        readRepo(join(REPO_ROOT, "automate-ai-pricing-check", "Automate-AI-v4-main")),
+        emptyPreflight()
+      );
+      expect(a.categories.coreLogic.score).toBe(7);
+      const ev = a.categories.coreLogic.evidence.join(" ");
+      expect(ev).toMatch(/capped at 7/);
+      expect(ev).toMatch(/mocked payment|dead action/);
+    }
+  );
+
+  it("pins the self-scan at 10 with the computation stated in the evidence", () => {
+    const a = computeDeterministicAssessment(readRepo(process.cwd()), emptyPreflight());
+    expect(a.categories.coreLogic.score).toBe(10);
+    const ev = a.categories.coreLogic.evidence.join(" ");
+    expect(ev).toMatch(/logic-purporting non-test files contain real logic/);
+    expect(ev).toMatch(/No stubs found\./);
+    expect(ev).toMatch(/0 fake-success findings\. No cap\./);
   });
 });

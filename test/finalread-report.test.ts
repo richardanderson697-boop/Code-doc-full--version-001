@@ -421,3 +421,164 @@ describe("buildFinalReadReport deterministic findings", () => {
     expect(item!.verification!.whatEachAnswerMeans).toMatch(/Confirmed → it becomes a liability/);
   });
 });
+
+describe("buildFinalReadReport checklists, how-to-check, and versions (spec §B)", () => {
+  const automationInput = (overrides: Partial<FinalReadAuditInput> = {}): FinalReadAuditInput =>
+    baseInput({
+      categoryScores: {
+        backgroundAutomation: { score: 3, reason: "Only a webhook reference, no implementation." },
+        coreLogic: { score: 7, reason: "All logic files are real, but fake-success findings cap the score." },
+        authentication: { score: 9, reason: "Login and sessions implemented." },
+      },
+      categoryEvidence: {
+        backgroundAutomation: ["index.html:15 references automation/webhooks with no implementation"],
+        coreLogic: [
+          "16/16 logic-purporting non-test files contain real logic and are free of stub markers",
+          "No stubs found.",
+          "13 fake-success findings — Core logic capped at 7: server.ts:279 (mocked notification)",
+        ],
+      },
+      categoryChecklists: {
+        backgroundAutomation: [
+          "Scheduled jobs",
+          "Job queues",
+          "Background workers",
+          "Webhook retry/reconciliation logic",
+        ],
+      },
+      scannerVersion: "1",
+      metricVersion: "2",
+      ...overrides,
+    });
+
+  it("populates the Background automation checklist and how-to-check on a half-built/liability item", () => {
+    const r = buildFinalReadReport(automationInput());
+    const item = r.liabilities.find((i) => i.title === "Background automation");
+    expect(item).toBeDefined();
+    expect(item!.checklist).toEqual([
+      "Scheduled jobs",
+      "Job queues",
+      "Background workers",
+      "Webhook retry/reconciliation logic",
+    ]);
+    expect(item!.howToCheck).toMatch(/Work through the checklist below/);
+    expect(item!.howToCheck).toMatch(/index\.html:15 references automation\/webhooks/);
+  });
+
+  it("populates how-to-check for Core logic but never a checklist (B4)", () => {
+    const r = buildFinalReadReport(automationInput());
+    // Core logic 7/10 is working, so it carries neither — prove the
+    // half-built case separately below.
+    expect(r.working.find((i) => i.title === "Core logic")?.checklist).toBeUndefined();
+    expect(r.working.find((i) => i.title === "Core logic")?.howToCheck).toBeUndefined();
+    const half = buildFinalReadReport(
+      automationInput({
+        categoryScores: {
+          ...automationInput().categoryScores,
+          coreLogic: { score: 5, reason: "Half the logic files are stubs." },
+        },
+      })
+    );
+    const core = half.halfBuilt.find((i) => i.title === "Core logic");
+    expect(core).toBeDefined();
+    expect(core!.checklist).toBeUndefined();
+    expect(core!.howToCheck).toMatch(/Reproduce the computation from the evidence above/);
+  });
+
+  it("gives a working category neither a checklist nor a how-to-check", () => {
+    const r = buildFinalReadReport(automationInput());
+    const auth = r.working.find((i) => i.title === "Authentication");
+    expect(auth).toBeDefined();
+    expect(auth!.checklist).toBeUndefined();
+    expect(auth!.howToCheck).toBeUndefined();
+  });
+
+  it("ignores a checklist key with no matching category score", () => {
+    const r = buildFinalReadReport(
+      automationInput({ categoryChecklists: { security: ["Patched deps"] } })
+    );
+    const all = [...r.working, ...r.halfBuilt, ...r.liabilities];
+    expect(all.some((i) => i.checklist)).toBe(false);
+  });
+
+  it("carries the scanner and metric versions on the report", () => {
+    const r = buildFinalReadReport(automationInput());
+    expect(r.scannerVersion).toBe("1");
+    expect(r.metricVersion).toBe("2");
+    const bare = buildFinalReadReport(baseInput());
+    expect(bare.scannerVersion).toBeUndefined();
+    expect(bare.metricVersion).toBeUndefined();
+  });
+
+  it("falls back to the generic ask-the-developer check for other categories", () => {
+    const r = buildFinalReadReport(
+      baseInput({
+        categoryScores: { documentationVerified: { score: 2, reason: "Docs do not match code." } },
+        categoryEvidence: { documentationVerified: ["no README.md"] },
+      })
+    );
+    const item = r.liabilities.find((i) => i.title === "Documentation verified");
+    expect(item).toBeDefined();
+    expect(item!.howToCheck).toMatch(/Ask the developer to confirm this against the code/);
+    // The generic check points at the evidence on the item, not a quoted line.
+    expect(item!.evidence).toContain("no README.md");
+  });
+});
+
+describe("intelResultToFinalReadInput passes checklists and versions through", () => {
+  it("carries categoryChecklists, scannerVersion, and metricVersion into the audit input", async () => {
+    const { intelResultToFinalReadInput } = await import(
+      "../src/components/auditor/FinalReadOverlay"
+    );
+    const input = intelResultToFinalReadInput({
+      completenessScore: 53,
+      categoryScores: { backgroundAutomation: { score: 3 } },
+      deterministicAssessment: {
+        evidence: { backgroundAutomation: ["index.html:15 references automation/webhooks"] },
+        checklists: {
+          backgroundAutomation: [
+            "Scheduled jobs",
+            "Job queues",
+            "Background workers",
+            "Webhook retry/reconciliation logic",
+          ],
+        },
+        scannerVersion: "1",
+        metricVersion: "2",
+      },
+    });
+    expect(input.categoryChecklists).toEqual({
+      backgroundAutomation: [
+        "Scheduled jobs",
+        "Job queues",
+        "Background workers",
+        "Webhook retry/reconciliation logic",
+      ],
+    });
+    expect(input.scannerVersion).toBe("1");
+    expect(input.metricVersion).toBe("2");
+    const report = buildFinalReadReport(input);
+    expect(report.liabilities.find((i) => i.title === "Background automation")?.checklist).toEqual([
+      "Scheduled jobs",
+      "Job queues",
+      "Background workers",
+      "Webhook retry/reconciliation logic",
+    ]);
+    expect(report.scannerVersion).toBe("1");
+    expect(report.metricVersion).toBe("2");
+  });
+
+  it("degrades gracefully when the assessment carries no checklists or versions", async () => {
+    const { intelResultToFinalReadInput } = await import(
+      "../src/components/auditor/FinalReadOverlay"
+    );
+    const input = intelResultToFinalReadInput({
+      completenessScore: 53,
+      categoryScores: { backgroundAutomation: { score: 3 } },
+      deterministicAssessment: { evidence: {} },
+    });
+    expect(input.categoryChecklists).toBeUndefined();
+    expect(input.scannerVersion).toBeUndefined();
+    expect(input.metricVersion).toBeUndefined();
+  });
+});
