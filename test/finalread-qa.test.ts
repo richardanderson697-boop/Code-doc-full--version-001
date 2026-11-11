@@ -29,6 +29,9 @@ import {
   selectHistoryLines,
   QA_HISTORY_MAX_TURNS,
   QA_HISTORY_MAX_CHARS,
+  resolveQaLabel,
+  formatLabelPin,
+  labelFallbackAnswer,
 } from "../shared/finalread-qa";
 import { buildFinalReadReport } from "../shared/finalread-report";
 import { intelResultToFinalReadInput } from "../src/components/auditor/FinalReadOverlay";
@@ -1233,5 +1236,456 @@ describe("buildQaContext conversation", () => {
     expect(unknownCitations(["Quantum flux capacitor"], sampleReport())).toEqual([
       "Quantum flux capacitor",
     ]);
+  });
+});
+
+describe("resolveQaLabel — live wordings (general label fix)", () => {
+  // Whistle-stop as re-asked 2026-11-10: Authentication 2/10 liability,
+  // summary present, application map names a FinalRead view component.
+  function whistleStopReport() {
+    return buildFinalReadReport({
+      projectTitle: "Whistle Stop Cleaning",
+      completenessScore: 56,
+      applicationSummary: "A cleaning booking platform.",
+      categoryScores: {
+        authentication: {
+          score: 2,
+          reason: "No login flow exists; anyone can access admin pages.",
+        },
+        coreLogic: { score: 5, reason: "Booking flow is partly built." },
+        security: { score: 3, reason: "Gaps." },
+      },
+      applicationMap: {
+        entrypoint: "src/main.tsx",
+        components: [
+          {
+            name: "FinalReadOverlay",
+            filePath: "src/components/auditor/FinalReadOverlay.tsx",
+          },
+          { name: "BookingForm", filePath: "src/components/BookingForm.tsx" },
+        ],
+        endpoints: [
+          { method: "POST", path: "/api/bookings", purpose: "Creates a booking" },
+        ],
+      },
+      findings: [],
+    });
+  }
+
+  // GradeVibes self-scan as in PDF #13: Core logic 5, Background
+  // automation 6, summary present, map names a FinalRead view component.
+  function selfScanReport() {
+    return buildFinalReadReport({
+      projectTitle: "GradeVibes",
+      completenessScore: 88,
+      applicationSummary:
+        "A full-featured AI-driven React and TypeScript development workspace and reactive code auditor.",
+      categoryScores: {
+        coreLogic: {
+          score: 5,
+          reason: "Only 66 of 133 code files contain complete logic.",
+        },
+        backgroundAutomation: { score: 6, reason: "Some jobs are partly built." },
+        authentication: { score: 9, reason: "Login is complete." },
+      },
+      applicationMap: {
+        entrypoint: "src/main.tsx",
+        components: [
+          {
+            name: "FinalReadOverlay",
+            filePath: "src/components/auditor/FinalReadOverlay.tsx",
+          },
+        ],
+        endpoints: [],
+      },
+      findings: [],
+    });
+  }
+
+  it("maps Q4 to the Authentication label", () => {
+    const r = resolveQaLabel("Does user authentication work?", whistleStopReport());
+    expect(r.resolved).toBe(true);
+    if (r.resolved === true) {
+      expect(r.label.kind).toBe("item");
+      expect(r.label.title).toBe("Authentication");
+    }
+  });
+
+  it("maps Q5 and the auth rephrasings to the same Authentication label", () => {
+    const report = whistleStopReport();
+    for (const q of [
+      "How do users login?",
+      "is the login real?",
+      "do users have accounts?",
+    ]) {
+      const r = resolveQaLabel(q, report);
+      expect(r.resolved).toBe(true);
+      if (r.resolved === true) expect(r.label.title).toBe("Authentication");
+    }
+  });
+
+  it("maps Q1 and its rephrasing to the PURPOSE label", () => {
+    const report = selfScanReport();
+    for (const q of [
+      "Is this strictly a developer tool or can investors use it to understand software?",
+      "can an investor use this report?",
+    ]) {
+      const r = resolveQaLabel(q, report);
+      expect(r.resolved).toBe(true);
+      if (r.resolved === true) expect(r.label.kind).toBe("purpose");
+    }
+  });
+
+  it("maps Q2 and Q3 to the STAKEHOLDER VIEW label", () => {
+    const report = selfScanReport();
+    for (const q of [
+      "Is there an investor view?",
+      "Does it have a stakeholder view?",
+    ]) {
+      const r = resolveQaLabel(q, report);
+      expect(r.resolved).toBe(true);
+      if (r.resolved === true) expect(r.label.kind).toBe("stakeholder-view");
+    }
+  });
+
+  it("resolves STAKEHOLDER VIEW from the route-level fact alone, with no map components", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "No Map",
+      completenessScore: 60,
+      applicationSummary: "A cleaning booking platform.",
+      categoryScores: { coreLogic: { score: 5, reason: "Partly built." } },
+      findings: [],
+    });
+    const r = resolveQaLabel("Is there an investor view?", report);
+    expect(r.resolved).toBe(true);
+    if (r.resolved === true) {
+      expect(r.label.kind).toBe("stakeholder-view");
+      expect(r.label.componentNames).toEqual([]);
+    }
+  });
+
+  it("has no PURPOSE label when the report carries no application summary", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "No Summary",
+      completenessScore: 60,
+      categoryScores: { coreLogic: { score: 5, reason: "Partly built." } },
+      findings: [],
+    });
+    const r = resolveQaLabel(
+      "Is this strictly a developer tool or can investors use it to understand software?",
+      report
+    );
+    expect(r.resolved).toBe(false);
+    if (r.resolved === false) expect(r.tied).toEqual([]);
+  });
+
+  it("resolves nothing on a tie between two labels", () => {
+    // "what's the biggest risk?" matches the risk family on both
+    // liabilities equally — a guessed pick would be a new way to be
+    // wrong with confidence, so the rule forbids it.
+    const r = resolveQaLabel("what is the biggest risk?", whistleStopReport());
+    expect(r.resolved).toBe(false);
+    if (r.resolved === false) {
+      expect(r.tied.map((l) => l.title).sort()).toEqual([
+        "Authentication",
+        "Security",
+      ]);
+    }
+  });
+
+  it("resolves nothing for a question with no matching terms", () => {
+    const r = resolveQaLabel("does it use quantum flux?", whistleStopReport());
+    expect(r.resolved).toBe(false);
+    if (r.resolved === false) expect(r.tied).toEqual([]);
+  });
+
+  it("does not let the generic verb 'use' hijack feature questions to PURPOSE", () => {
+    // "does it use X?" is the canonical form for asking about a feature;
+    // a bare "use" term must not resolve it to PURPOSE.
+    const report = selfScanReport();
+    for (const q of [
+      "does it use quantum flux?",
+      "does it use speech synthesis?",
+    ]) {
+      const r = resolveQaLabel(q, report);
+      expect(r.resolved).toBe(false);
+      if (r.resolved === false) expect(r.tied).toEqual([]);
+    }
+  });
+
+  it("resolves a specific payment question to the payment finding", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "Dead Only",
+      completenessScore: 62,
+      categoryScores: { externalIntegrations: { score: 3 } },
+      findings: [
+        {
+          severity: "high",
+          title: 'Dead "Get Started" button — no handler',
+          file: "app/pricing/pricing-client.tsx",
+          line: 18,
+          probe: "Dead Action",
+        },
+      ],
+    });
+    const r = resolveQaLabel("is the get started button broken?", report);
+    expect(r.resolved).toBe(true);
+    if (r.resolved === true) {
+      expect(r.label.title).toBe('Dead "Get Started" button — no handler');
+    }
+  });
+
+  it("ties a generic payment word across the payment labels instead of guessing", () => {
+    // "checkout" matches the dead-button finding AND the External
+    // integrations category (the payments category) equally — the
+    // question goes to the model with both pinned, not to a guessed pick.
+    const report = buildFinalReadReport({
+      projectTitle: "Dead Only",
+      completenessScore: 62,
+      categoryScores: { externalIntegrations: { score: 3 } },
+      findings: [
+        {
+          severity: "high",
+          title: 'Dead "Get Started" button — no handler',
+          file: "app/pricing/pricing-client.tsx",
+          line: 18,
+          probe: "Dead Action",
+        },
+      ],
+    });
+    const r = resolveQaLabel("is checkout broken?", report);
+    expect(r.resolved).toBe(false);
+    if (r.resolved === false) expect(r.tied.length).toBe(2);
+  });
+
+  it("ties payment-flavored questions across several payment labels instead of guessing", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "Automate-AI-v4",
+      completenessScore: 62,
+      categoryScores: { externalIntegrations: { score: 3 } },
+      findings: [
+        {
+          severity: "high",
+          title: 'Dead "Get Started" button — no handler',
+          file: "app/pricing/pricing-client.tsx",
+          line: 18,
+          probe: "Dead Action",
+        },
+        {
+          severity: "medium",
+          title: "Checkout records sales as complete with no payment provider call",
+          file: "app/api/checkout/route.ts",
+          line: 39,
+          probe: "Mocked Payment",
+          unverified: true,
+        },
+      ],
+    });
+    const r = resolveQaLabel("is checkout broken?", report);
+    expect(r.resolved).toBe(false);
+    if (r.resolved === false) expect(r.tied.length).toBeGreaterThan(1);
+  });
+});
+
+describe("labelFallbackAnswer", () => {
+  function whistleStopReport() {
+    return buildFinalReadReport({
+      projectTitle: "Whistle Stop Cleaning",
+      completenessScore: 56,
+      applicationSummary: "A cleaning booking platform.",
+      categoryScores: {
+        authentication: {
+          score: 2,
+          reason: "No login flow exists; anyone can access admin pages.",
+        },
+        coreLogic: { score: 5, reason: "Booking flow is partly built." },
+      },
+      applicationMap: {
+        entrypoint: "src/main.tsx",
+        components: [
+          {
+            name: "FinalReadOverlay",
+            filePath: "src/components/auditor/FinalReadOverlay.tsx",
+          },
+        ],
+        endpoints: [],
+      },
+      findings: [],
+    });
+  }
+
+  it("returns the item's business implication with its exact title as the citation", () => {
+    const report = whistleStopReport();
+    const r = resolveQaLabel("Does user authentication work?", report);
+    expect(r.resolved).toBe(true);
+    if (r.resolved === true) {
+      const fb = labelFallbackAnswer(r.label);
+      expect(fb.answer).toMatch(/^Authentication: /);
+      expect(fb.answer).toMatch(/2\/10/);
+      expect(fb.answer).toMatch(/No login flow exists/);
+      expect(fb.citedFindings).toEqual(["Authentication"]);
+      // Citations pass the validator by construction.
+      expect(unknownCitations(fb.citedFindings, report)).toEqual([]);
+    }
+  });
+
+  it("returns the PURPOSE material with no citations", () => {
+    const report = whistleStopReport();
+    const r = resolveQaLabel("can an investor use this report?", report);
+    expect(r.resolved).toBe(true);
+    if (r.resolved === true) {
+      const fb = labelFallbackAnswer(r.label);
+      expect(fb.answer).toMatch(/A cleaning booking platform\./);
+      expect(fb.answer).toMatch(/56\/100/);
+      expect(fb.citedFindings).toEqual([]);
+    }
+  });
+
+  it("renders a NEEDS VERIFICATION label as flagged-not-established, never as fact", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "Test App",
+      completenessScore: 60,
+      categoryScores: {},
+      findings: [
+        {
+          severity: "critical",
+          title: "POST /api/auth/reset-password without auth check",
+          file: "server/routes/auth.ts",
+          line: 179,
+          probe: "API Route Auth",
+          evidence: "app.post('/api/auth/reset-password', handler)",
+          unverified: true,
+        },
+      ],
+    });
+    const r = resolveQaLabel("is the password reset verified?", report);
+    expect(r.resolved).toBe(true);
+    if (r.resolved === true) {
+      expect(r.label.kind).toBe("item");
+      const fb = labelFallbackAnswer(r.label);
+      expect(fb.answer).toMatch(/flagged, not established/);
+      expect(fb.answer).toMatch(/Flagged at server\/routes\/auth\.ts:179/);
+      expect(fb.answer).toMatch(/How a developer checks it/);
+      expect(fb.answer).not.toMatch(/is a liability/);
+      expect(fb.citedFindings).toEqual([
+        "POST /api/auth/reset-password without auth check",
+      ]);
+      expect(unknownCitations(fb.citedFindings, report)).toEqual([]);
+    }
+  });
+
+  it("cites the matched component names for STAKEHOLDER VIEW, and nothing without them", () => {
+    const withComponents = whistleStopReport();
+    const r1 = resolveQaLabel("Is there an investor view?", withComponents);
+    expect(r1.resolved).toBe(true);
+    if (r1.resolved === true) {
+      const fb = labelFallbackAnswer(r1.label);
+      expect(fb.answer).toMatch(/this report is the stakeholder view/);
+      expect(fb.answer).toMatch(/FinalReadOverlay/);
+      expect(fb.citedFindings).toEqual(["FinalReadOverlay"]);
+      expect(unknownCitations(fb.citedFindings, withComponents)).toEqual([]);
+    }
+
+    const withoutComponents = buildFinalReadReport({
+      projectTitle: "No Map",
+      completenessScore: 60,
+      applicationSummary: "A cleaning booking platform.",
+      categoryScores: { coreLogic: { score: 5, reason: "Partly built." } },
+      findings: [],
+    });
+    const r2 = resolveQaLabel("Is there an investor view?", withoutComponents);
+    expect(r2.resolved).toBe(true);
+    if (r2.resolved === true) {
+      const fb = labelFallbackAnswer(r2.label);
+      expect(fb.answer).toMatch(/this report is the stakeholder view/);
+      expect(fb.citedFindings).toEqual([]);
+    }
+  });
+});
+
+describe("formatLabelPin", () => {
+  function whistleStopReport() {
+    return buildFinalReadReport({
+      projectTitle: "Whistle Stop Cleaning",
+      completenessScore: 56,
+      applicationSummary: "A cleaning booking platform.",
+      categoryScores: {
+        authentication: {
+          score: 2,
+          reason: "No login flow exists; anyone can access admin pages.",
+        },
+        coreLogic: { score: 5, reason: "Booking flow is partly built." },
+        security: { score: 3, reason: "Gaps." },
+      },
+      findings: [],
+    });
+  }
+
+  it("pins the resolved label's exact title and citation instruction", () => {
+    const r = resolveQaLabel("Does user authentication work?", whistleStopReport());
+    const pin = formatLabelPin(r);
+    expect(pin).not.toBeNull();
+    expect(pin).toMatch(/^THIS QUESTION IS ABOUT: Authentication\n/);
+    expect(pin).toMatch(/cite it exactly as "Authentication"/);
+    expect(pin).toMatch(/No login flow exists/);
+  });
+
+  it("pins PURPOSE with a cite-nothing instruction", () => {
+    const r = resolveQaLabel("can an investor use this report?", whistleStopReport());
+    const pin = formatLabelPin(r);
+    expect(pin).not.toBeNull();
+    expect(pin).toMatch(/^THIS QUESTION IS ABOUT: What this app is\n/);
+    expect(pin).toMatch(/cite nothing for it/);
+    expect(pin).toMatch(/A cleaning booking platform\./);
+  });
+
+  it("pins tied labels together with the multi-section instruction", () => {
+    const r = resolveQaLabel("what is the biggest risk?", whistleStopReport());
+    expect(r.resolved).toBe(false);
+    const pin = formatLabelPin(r);
+    expect(pin).not.toBeNull();
+    expect(pin).toMatch(/MORE THAN ONE SECTION OF THE REVIEW/);
+    expect(pin).toMatch(/- Authentication: /);
+    expect(pin).toMatch(/- Security: /);
+    expect(pin).toMatch(/cite exactly the title\(s\) you relied on/);
+  });
+
+  it("returns null when nothing resolved and nothing tied", () => {
+    const r = resolveQaLabel("does it use quantum flux?", whistleStopReport());
+    expect(formatLabelPin(r)).toBeNull();
+  });
+});
+
+describe("buildQaContext label pin", () => {
+  it("prepends the pin ahead of the review", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "Whistle Stop Cleaning",
+      completenessScore: 56,
+      applicationSummary: "A cleaning booking platform.",
+      categoryScores: {
+        authentication: { score: 2, reason: "No login flow exists." },
+      },
+      findings: [],
+    });
+    const pin = formatLabelPin(
+      resolveQaLabel("Does user authentication work?", report)
+    );
+    const ctx = buildQaContext(report, "Does user authentication work?", [], pin);
+    expect(ctx.indexOf("THIS QUESTION IS ABOUT: Authentication")).toBeLessThan(
+      ctx.indexOf("PROJECT:")
+    );
+    expect(ctx).toMatch(/cite it exactly as "Authentication"/);
+  });
+
+  it("leaves the context exactly as before with no pin", () => {
+    const report = buildFinalReadReport({
+      projectTitle: "Test App",
+      completenessScore: 60,
+      categoryScores: { security: { score: 3 } },
+      findings: [],
+    });
+    expect(buildQaContext(report, "does it use quantum flux?", [], null)).toBe(
+      buildQaContext(report, "does it use quantum flux?")
+    );
   });
 });

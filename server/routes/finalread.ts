@@ -63,6 +63,10 @@ import {
   starterAnswer,
   paymentAnswer,
   validateQaHistory,
+  resolveQaLabel,
+  formatLabelPin,
+  labelFallbackAnswer,
+  type QaLabel,
 } from "../../shared/finalread-qa";
 
 import type { GenerateContentConfig } from "@google/genai";
@@ -262,6 +266,20 @@ async function verifyUnknownDecline(
   }
 }
 
+// Deterministic fallback response for a resolved label: the same shape
+// as the starter/payment answers (starter: true so the client marks it
+// "[Deterministic starter answer — no charge]"), free by construction —
+// it only fires on paths that are never charged.
+function labelFallbackResponse(label: QaLabel) {
+  const fallback = labelFallbackAnswer(label);
+  return {
+    answer: fallback.answer,
+    citedFindings: fallback.citedFindings,
+    declined: false,
+    starter: true,
+  };
+}
+
 router.post(
   "/api/finalread/ask",
   requireAuth,
@@ -347,11 +365,21 @@ router.post(
       });
     }
 
+    // 2d. Deterministic topic→label resolution (general label fix): the
+    // question's topic, when the report names it, is pinned into the
+    // model prompt with its exact citable title. If the model then
+    // declines unknown or answers uncited, the route answers
+    // deterministically from the matched label instead of declining
+    // (see 4a/4b below). No new model calls; starters, payment, and
+    // runtime above keep their priority and exact behavior.
+    const labelResolution = resolveQaLabel(question, report);
+    const labelPin = formatLabelPin(labelResolution);
+
     // 3. Grounded model call with retries. Failed attempts are never charged.
     // The question rides into the context so question-matching warehouse
     // lines survive the runaway ceiling ahead of unrelated lines; the
     // conversation rides in after the report, under its own cap.
-    const prompt = systemPrompt(buildQaContext(report, question, history));
+    const prompt = systemPrompt(buildQaContext(report, question, history, labelPin));
     let parsed: any = null;
     let lastResponse: any = null;
     let modelName = "";
@@ -431,6 +459,15 @@ router.post(
           runtime: true,
         });
       } else if (parsed.declineTier === "unknown") {
+        if (labelResolution.resolved === true) {
+          // Deterministic fallback (general label fix): the question is
+          // about a label the report actually has, so answer from it
+          // instead of declining — and skip the double-check, which has
+          // nothing left to verify (the answer is grounded in the report
+          // by construction, not by model judgment). Free by
+          // construction: the decline path is never charged.
+          return res.json(labelFallbackResponse(labelResolution.label));
+        }
         const outcome = await verifyUnknownDecline(question, report, modelName);
         if (outcome.kind === "answer") {
           parsed = outcome.parsed;
@@ -449,6 +486,15 @@ router.post(
           });
         }
       } else {
+        // Ungrounded partial (a partial whose citations fail): the flat
+        // decline path. On a resolved label the deterministic fallback
+        // answers from the label instead — the same failure shape as an
+        // unknown decline on a resolved label (the model failed on a
+        // topic the report names), so the same fallback closes it.
+        // Extension beyond §3.4's enumeration; recorded in spec §7.
+        if (labelResolution.resolved === true) {
+          return res.json(labelFallbackResponse(labelResolution.label));
+        }
         return res.json({
           declined: true,
           answer: formatUnknownDecline(false),
@@ -462,6 +508,13 @@ router.post(
     const unknown = unknownCitations(parsed.citedFindings, report);
     if (unknown.length > 0 || !parsed.answer) {
       log.warn(`finalread/ask: uncited answer declined (unknown: ${unknown.join("; ")})`);
+      if (labelResolution.resolved === true) {
+        // Deterministic fallback (general label fix): the model answered
+        // from the right topic but cited a paraphrase instead of the
+        // label's exact title — the Q4 shape. Answer from the label
+        // instead of discarding the question. Free by construction.
+        return res.json(labelFallbackResponse(labelResolution.label));
+      }
       return res.json({
         declined: true,
         answer: formatUncitedDecline(),

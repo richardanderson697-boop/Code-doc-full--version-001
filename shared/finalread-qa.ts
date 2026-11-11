@@ -5,7 +5,7 @@
 // Shared between the server route and tests so the charging rules have one
 // definition.
 
-import type { FinalReadReport } from "./finalread-report";
+import type { FinalReadBucketItem, FinalReadReport } from "./finalread-report";
 
 /** Cost / time / effort questions always get the fixed no-estimates reply:
  *  no model call, no charge. The packet schema forbids effort estimates in
@@ -733,6 +733,458 @@ export function selectWarehouseLines(
   return out;
 }
 
+/** Deterministic topic→label resolver (2026-11-11, general label fix).
+ *
+ *  The failure it closes: a buyer asks about a topic the review names —
+ *  a category, a finding, the app's purpose, a shipped view — in their
+ *  own words, and the Q&A declines it or answers from the wrong material
+ *  even though the review holds the answer. Three live instances: Q4
+ *  "Does user authentication work?" declined (the model answered but
+ *  cited a paraphrase, so the citation check discarded it); Q1 on purpose
+ *  / audience declined unknown; Q2/Q3 on views answered as grounded
+ *  partials citing the wrong category (Core logic). The deterministic
+ *  shortcuts only fire on exact wordings, so these questions fell through
+ *  to the model, and the model proved it can't do the topic matching
+ *  reliably itself.
+ *
+ *  The resolver is pure and deterministic — no model calls — in the same
+ *  module as the other shortcuts. It builds a label index from the report
+ *  itself on every ask (every bucket item's title; a PURPOSE synthetic
+ *  label from the summary + verdict + score, only when the summary
+ *  exists; a STAKEHOLDER VIEW synthetic label from the route-level fact
+ *  that the report in hand IS the stakeholder view plus matching
+ *  application-map components), scores the question's terms against each
+ *  label's term set, and resolves only on a clear winner. A term alone
+ *  never creates an answer — it only resolves to a label the report
+ *  actually has; on a tie or no match the question goes to the model
+ *  exactly as today.
+ *
+ *  Matching, and why phrases are gated: the synonym table below is
+ *  hand-written and reviewable, and a multi-word entry is a PHRASE, not
+ *  loose tokens — its words count only when the phrase appears in the
+ *  question as a contiguous run (variant-aware: "investor views" matches
+ *  "investor view"). Loose tokens would misfire: "can an investor use
+ *  this report?" must resolve to PURPOSE (investor + use), but flattening
+ *  "report view" into loose tokens would also score STAKEHOLDER VIEW on
+ *  "report" and tie it. Single-word entries match as tokens, with the
+ *  same plural/singular variants as the warehouse matcher. */
+
+export type QaLabelKind = "item" | "purpose" | "stakeholder-view";
+
+/** A citable unit of the report the resolver can point a question at.
+ *  For item labels the bucket item carries the full material
+ *  (businessImplication, scan evidence, verification block); the two
+ *  synthetic labels carry theirs directly. `title` is the display title
+ *  used in the pin — for PURPOSE ("What this app is") and STAKEHOLDER
+ *  VIEW ("The stakeholder view") it is a display title only, never a
+ *  citation: PURPOSE cites nothing, STAKEHOLDER VIEW cites component
+ *  names. */
+export interface QaLabel {
+  kind: QaLabelKind;
+  title: string;
+  item?: FinalReadBucketItem;
+  summary?: string;
+  verdict?: string;
+  completenessScore?: number;
+  componentNames?: string[];
+  componentPaths?: string[];
+}
+
+/** Resolver outcome: a clear winner, or no resolution — with the tied
+ *  labels when the top score is shared, so the route can pin them and
+ *  let the model choose, without the fallback firing. */
+export type QaLabelResolution =
+  | { resolved: true; label: QaLabel }
+  | { resolved: false; tied: QaLabel[] };
+
+/** Hand-written synonym sets per label family. The table is the only
+ *  place question wording is expanded, and it is expanded
+ *  deterministically — never by a model. This is the same lesson as the
+ *  runtime classifier ("the model proved it can't classify these
+ *  reliably itself, so classification happens here, not in the prompt")
+ *  and the same discipline as the middleware-auth fix (a name list alone
+ *  never suppresses a finding; here, a term alone never creates an
+ *  answer — it only resolves to a label the report actually has). The
+ *  table is a living list: extend it when a new miss is observed. */
+const QA_LABEL_SYNONYMS: Record<string, string[]> = {
+  authentication: [
+    "authentication", "authenticate", "login", "log-in", "log in",
+    "sign-in", "signin", "sign in", "session", "sessions", "password",
+    "pin", "account", "accounts", "credentials", "user accounts", "auth",
+  ],
+  payments: [
+    "payment", "payments", "pay", "checkout", "billing", "card", "cards",
+    "stripe", "charge", "charges", "purchase", "purchases",
+  ],
+  purpose: [
+    "developer tool", "investor", "investors", "stakeholder", "purpose",
+    "what is this", "who is it for", "what does it do",
+    // NOTE: the spec's "use it for" is deliberately NOT here. After the
+    // stopword machinery it reduces to the bare verb "use" — and "use" is
+    // the generic verb of "does it use X?" questions about ANY feature,
+    // so it would mis-resolve them to PURPOSE (smoke check: "does it use
+    // quantum flux?" resolved to PURPOSE on a report with a summary).
+    // Purpose questions that name the audience ("can an investor use
+    // this report?") still resolve via "investor"; "what can I use it
+    // for?" falls through to the model, which answers it from the
+    // summary already in context.
+  ],
+  "stakeholder-view": [
+    "investor view", "stakeholder view", "investor dashboard",
+    "stakeholder dashboard", "finalread view", "report view",
+  ],
+  verdict: [
+    "finished", "complete", "done", "ready", "completeness", "score",
+  ],
+  risk: ["risk", "risks", "biggest risk", "danger", "worst"],
+  "fix-order": [
+    "fix first", "fix", "priority", "priorities", "what first", "start with",
+  ],
+  verification: [
+    "verify", "verifying", "verification", "confirm", "check",
+    "needs verifying", "unconfirmed", "flagged",
+  ],
+};
+
+/** Which synonym families a bucket item carries. Category items carry
+ *  their category's family (Authentication → the auth family, External
+ *  integrations → the payments family — the payments category is where a
+ *  payment question with no payment evidence belongs; paymentAnswer
+ *  already ran first, so this can never shadow it). Payment-evidence
+ *  findings (dead payment buttons, mocked-payment verification items)
+ *  carry the payments family so a payment-flavored question that does
+ *  NOT match isPaymentQuestion can still resolve to them. Liabilities
+ *  carry the risk and fix-order families (the question shapes that point
+ *  at what to fix and what is worst); verification items carry the
+ *  verification family. Everything else is title words only. */
+function qaItemFamilies(
+  item: FinalReadBucketItem,
+  bucket: "liabilities" | "halfBuilt" | "working" | "needsVerification"
+): string[] {
+  const families: string[] = [];
+  const title = (item.title || "").trim().toLowerCase();
+  if (title === "authentication") families.push("authentication");
+  if (title === "external integrations") families.push("payments");
+  if (DEAD_PAYMENT_TITLE.test(item.title || "")) families.push("payments");
+  if ((item.verification?.whatWeSaw || "").includes("(Mocked Payment)")) {
+    families.push("payments");
+  }
+  if (bucket === "liabilities") families.push("risk", "fix-order");
+  if (bucket === "needsVerification") families.push("verification");
+  return families;
+}
+
+/** Split a synonym family into single-word tokens and multi-word
+ *  phrases. Single words match as tokens; phrases match only as a
+ *  contiguous run in the question (see the resolver comment). Both go
+ *  through questionTerms, so hyphenated entries ("log-in") reduce to
+ *  their discriminating token ("log") and stopwords drop out of phrases
+ *  ("what is this" contributes nothing — its words are all stopwords). */
+function qaFamilyTerms(family: string): { tokens: string[]; phrases: string[][] } {
+  const tokens: string[] = [];
+  const phrases: string[][] = [];
+  for (const entry of QA_LABEL_SYNONYMS[family] || []) {
+    const words = questionTerms(entry);
+    if (words.length === 0) continue;
+    if (words.length === 1) tokens.push(words[0]);
+    else phrases.push(words);
+  }
+  return { tokens, phrases };
+}
+
+interface QaLabelEntry {
+  label: QaLabel;
+  tokens: Set<string>;
+  phrases: string[][];
+}
+
+/** Build the label index from the report itself, every ask. */
+function buildQaLabelIndex(report: FinalReadReport): QaLabelEntry[] {
+  const entries: QaLabelEntry[] = [];
+  const seenTitles = new Set<string>();
+  const addItem = (
+    item: FinalReadBucketItem,
+    bucket: "liabilities" | "halfBuilt" | "working" | "needsVerification"
+  ) => {
+    const title = (item.title || "").trim();
+    if (!title) return;
+    // Duplicate titles (e.g. three identical dead-button findings) are
+    // one label: the title is the citation either way, and keeping all
+    // three would tie the label against itself.
+    const key = title.toLowerCase();
+    if (seenTitles.has(key)) return;
+    seenTitles.add(key);
+    const tokens = new Set<string>(questionTerms(title));
+    const phrases: string[][] = [];
+    for (const family of qaItemFamilies(item, bucket)) {
+      const { tokens: ft, phrases: fp } = qaFamilyTerms(family);
+      for (const t of ft) tokens.add(t);
+      phrases.push(...fp);
+    }
+    entries.push({ label: { kind: "item", title, item }, tokens, phrases });
+  };
+  for (const item of report.liabilities) addItem(item, "liabilities");
+  for (const item of report.halfBuilt) addItem(item, "halfBuilt");
+  for (const item of report.working) addItem(item, "working");
+  for (const item of report.needsVerification) addItem(item, "needsVerification");
+
+  // PURPOSE exists only when the report carries an applicationSummary;
+  // older reports without one simply have no PURPOSE label and the
+  // question falls through to the model.
+  if (report.applicationSummary) {
+    const tokens = new Set<string>();
+    const phrases: string[][] = [];
+    for (const family of ["purpose", "verdict"]) {
+      const { tokens: ft, phrases: fp } = qaFamilyTerms(family);
+      for (const t of ft) tokens.add(t);
+      phrases.push(...fp);
+    }
+    entries.push({
+      label: {
+        kind: "purpose",
+        title: "What this app is",
+        summary: report.applicationSummary,
+        verdict: report.verdict,
+        completenessScore: report.completenessScore,
+      },
+      tokens,
+      phrases,
+    });
+  }
+
+  // STAKEHOLDER VIEW always exists: this Q&A only runs inside the
+  // FinalRead stakeholder view, so the report in hand IS the stakeholder
+  // view, whether or not the map names view components.
+  const viewComponents = (report.applicationMap?.components || []).filter((c) =>
+    /finalread|stakeholder|investor/i.test(c.name || "")
+  );
+  const sv = qaFamilyTerms("stakeholder-view");
+  entries.push({
+    label: {
+      kind: "stakeholder-view",
+      title: "The stakeholder view",
+      componentNames: viewComponents.map((c) => c.name),
+      componentPaths: viewComponents.map((c) => c.filePath).filter(Boolean),
+    },
+    tokens: new Set(sv.tokens),
+    phrases: sv.phrases,
+  });
+  return entries;
+}
+
+/** Ordered question tokens for phrase matching: the same filtering as
+ *  questionTerms (lowercase, stopwords and tokens shorter than 3 chars
+ *  dropped) but WITHOUT de-duplication, so a phrase is a contiguous run
+ *  in the question as asked. */
+function qaQuestionTokenSequence(question: string): string[] {
+  const out: string[] = [];
+  for (const raw of (question || "").toLowerCase().split(/[^a-z0-9]+/)) {
+    if (!raw || raw.length < 3 || QUESTION_STOPWORDS.has(raw)) continue;
+    out.push(raw);
+  }
+  return out;
+}
+
+/** Does a phrase appear as a contiguous, variant-aware run in the
+ *  question's token sequence? Plural/singular variants count ("investor
+ *  views" matches "investor view"), but words between the phrase's words
+ *  break it ("investor dashboard" does not match "investor view
+ *  dashboard"). */
+function qaPhraseMatches(phrase: string[], sequence: string[]): boolean {
+  if (phrase.length === 0 || phrase.length > sequence.length) return false;
+  for (let i = 0; i + phrase.length <= sequence.length; i++) {
+    let ok = true;
+    for (let j = 0; j < phrase.length; j++) {
+      if (!termVariants(phrase[j]).includes(sequence[i + j])) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/** Score one label against the question: the number of distinct
+ *  matched terms. Single tokens match by membership (plural/singular
+ *  variants); a phrase matches only as a contiguous run in the question
+ *  and then contributes its words. A word matched both as a token and
+ *  through a phrase counts once. */
+function qaLabelScore(
+  entry: QaLabelEntry,
+  terms: string[],
+  sequence: string[]
+): number {
+  const matched = new Set<string>();
+  for (const term of terms) {
+    if (termVariants(term).some((v) => entry.tokens.has(v))) matched.add(term);
+  }
+  for (const phrase of entry.phrases) {
+    if (qaPhraseMatches(phrase, sequence)) {
+      for (const w of phrase) matched.add(w);
+    }
+  }
+  return matched.size;
+}
+
+/** Resolve a question to the report label it is about, if exactly one
+ *  label clearly wins. Clear-winner rule: the top score must be strictly
+ *  greater than the runner-up's. On a tie, or on no match at all, there
+ *  is no deterministic resolution — the tied labels are returned so the
+ *  route can pin them, and the fallback never fires. A guessed pick
+ *  between tied labels would be a new way to be wrong with confidence;
+ *  the rule forbids it. */
+export function resolveQaLabel(
+  question: string,
+  report: FinalReadReport
+): QaLabelResolution {
+  const terms = questionTerms(question);
+  if (terms.length === 0) return { resolved: false, tied: [] };
+  const sequence = qaQuestionTokenSequence(question);
+  const entries = buildQaLabelIndex(report);
+  let best = 0;
+  let winners: QaLabel[] = [];
+  for (const entry of entries) {
+    const score = qaLabelScore(entry, terms, sequence);
+    if (score === 0) continue;
+    if (score > best) {
+      best = score;
+      winners = [entry.label];
+    } else if (score === best) {
+      winners.push(entry.label);
+    }
+  }
+  if (winners.length === 0) return { resolved: false, tied: [] };
+  if (winners.length === 1) return { resolved: true, label: winners[0] };
+  return { resolved: false, tied: winners };
+}
+
+/** The label's full material as pin text (businessImplication, scan
+ *  evidence, verification block where present; the summary + verdict +
+ *  score for PURPOSE; the route-level fact + map components for
+ *  STAKEHOLDER VIEW). */
+function qaLabelPinBody(label: QaLabel): string {
+  if (label.kind === "purpose") {
+    return `${label.summary} ${label.verdict} The review scored completeness ${label.completenessScore}/100.`;
+  }
+  if (label.kind === "stakeholder-view") {
+    const names = label.componentNames || [];
+    const paths = label.componentPaths || [];
+    let body =
+      "This report IS the stakeholder view — the FinalRead review written for a non-technical " +
+      "decision maker, covering the verdict, the liabilities, and what is half-built.";
+    if (names.length > 0) {
+      const listed = names
+        .map((n, i) => (paths[i] ? `${n} (${paths[i]})` : n))
+        .join(", ");
+      body += ` The review's application map names these view components: ${listed}.`;
+    }
+    return body;
+  }
+  const item = label.item!;
+  const lines = [item.businessImplication];
+  if (item.evidence && item.evidence.length > 0) {
+    lines.push(`scan evidence: ${item.evidence.join(" | ")}`);
+  }
+  if (item.verification) {
+    lines.push(`what the scan saw: ${item.verification.whatWeSaw}`);
+    lines.push(`if confirmed: ${item.verification.ifReal}`);
+    lines.push(`how a developer checks it: ${item.verification.howToCheck}`);
+  }
+  return lines.join("\n");
+}
+
+/** The citation instruction for a pin: item labels cite their exact
+ *  title; PURPOSE cites nothing (the summary is not a finding);
+ *  STAKEHOLDER VIEW cites the component names when present, nothing
+ *  when the answer rests only on the route-level fact. */
+function qaLabelCiteInstruction(label: QaLabel): string {
+  if (label.kind === "purpose") {
+    return "Answer from the app's summary, verdict, and completeness score below. This material is not a finding — cite nothing for it.";
+  }
+  if (label.kind === "stakeholder-view") {
+    return (label.componentNames || []).length > 0
+      ? "Answer from the description below. Cite the component names exactly as listed."
+      : "Answer from the description below. This material has no finding title — cite nothing for it.";
+  }
+  return `Answer from this section of the review and cite it exactly as "${label.title}".`;
+}
+
+function qaLabelPinBlock(label: QaLabel): string {
+  return (
+    `THIS QUESTION IS ABOUT: ${label.title}\n` +
+    `${qaLabelCiteInstruction(label)}\n` +
+    `${qaLabelPinBody(label)}`
+  );
+}
+
+function qaLabelShortBlock(label: QaLabel): string {
+  return `${label.title}: ${qaLabelPinBody(label).split("\n")[0]}`;
+}
+
+/** Render the pinned section for a resolution, or null when nothing
+ *  resolved and nothing tied. The pin goes ahead of the review in the
+ *  model prompt (step 2d): the matched label's exact title and full
+ *  text, so the Q4 failure — answering from the right topic with a
+ *  paraphrased citation — has nothing to paraphrase from. For a tie,
+ *  the tied labels are pinned together with the instruction that the
+ *  question may bear on more than one section and the answer must cite
+ *  whichever it relies on. */
+export function formatLabelPin(resolution: QaLabelResolution): string | null {
+  if (resolution.resolved === true) return qaLabelPinBlock(resolution.label);
+  if (resolution.tied.length === 0) return null;
+  const blocks = resolution.tied.map((l) => `- ${qaLabelShortBlock(l)}`).join("\n");
+  return (
+    `THIS QUESTION MAY BE ABOUT MORE THAN ONE SECTION OF THE REVIEW:\n${blocks}\n` +
+    `Answer from the section(s) that bear on the question and cite exactly the title(s) you relied on.`
+  );
+}
+
+/** Deterministic fallback answer from a resolved label — the general
+ *  version of the starter pills. Plain English from the label's own
+ *  material, citations set server-side so the citation check passes by
+ *  construction, exactly as paymentAnswer does. NEEDS VERIFICATION
+ *  labels render as flagged-not-established, never as fact. PURPOSE
+ *  cites nothing (the summary is not a finding), like the verdict
+ *  starter; STAKEHOLDER VIEW cites the matched component names when
+ *  present, and nothing when the answer rests only on the route-level
+ *  fact that the report IS the stakeholder view. */
+export function labelFallbackAnswer(
+  label: QaLabel
+): { answer: string; citedFindings: string[] } {
+  if (label.kind === "purpose") {
+    return {
+      answer:
+        `${label.summary} ${label.verdict} ` +
+        `The review scored completeness ${label.completenessScore}/100.`,
+      citedFindings: [],
+    };
+  }
+  if (label.kind === "stakeholder-view") {
+    const names = label.componentNames || [];
+    const answer =
+      "Yes — this report is the stakeholder view, written for a non-technical " +
+      "decision maker: the verdict, the liabilities, and what is half-built." +
+      (names.length > 0
+        ? ` The review's application map names these view components: ${names.join(", ")}.`
+        : "");
+    return { answer, citedFindings: names };
+  }
+  const item = label.item!;
+  if (item.verification) {
+    return {
+      answer:
+        `${item.title} — flagged, not established: ${item.verification.whatWeSaw} ` +
+        `How a developer checks it: ${item.verification.howToCheck}`,
+      citedFindings: [item.title],
+    };
+  }
+  return {
+    answer: `${item.title}: ${item.businessImplication}`,
+    citedFindings: [item.title],
+  };
+}
+
 /** Multi-turn conversation history: prior Q&A turns the client holds and
  *  sends with each ask. The server stays stateless — no conversation store.
  *  History is context only, never evidence: a follow-up answer's citations
@@ -858,9 +1310,17 @@ export function selectHistoryLines(
 export function buildQaContext(
   report: FinalReadReport,
   question?: string,
-  history: QaHistoryTurn[] = []
+  history: QaHistoryTurn[] = [],
+  pin?: string | null
 ): string {
   const lines: string[] = [];
+  // Step 2d pin (general label fix): the resolved label's exact title
+  // and full text go ahead of the review, so the model answers from the
+  // right section and cites the exact title. No pin → the context is
+  // exactly what it was before.
+  if (pin) {
+    lines.push(pin);
+  }
   lines.push(`PROJECT: ${report.projectTitle}`);
   if (report.applicationSummary) {
     lines.push(`WHAT THIS APP IS: ${report.applicationSummary}`);

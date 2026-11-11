@@ -432,3 +432,356 @@ describe("finalread ask multi-turn conversation", () => {
     expect(mockedCharge).not.toHaveBeenCalled();
   });
 });
+
+describe("finalread ask label resolver (general label fix)", () => {
+  // Whistle-stop as re-asked 2026-11-10: Authentication 2/10 liability,
+  // summary present, map names a FinalRead view component.
+  const whistleStopAudit = {
+    projectTitle: "Whistle Stop Cleaning",
+    completenessScore: 56,
+    applicationSummary: "A cleaning booking platform.",
+    categoryScores: {
+      authentication: {
+        score: 2,
+        reason: "No login flow exists; anyone can access admin pages.",
+      },
+      coreLogic: { score: 5, reason: "Booking flow is partly built." },
+      security: { score: 3, reason: "Gaps." },
+    },
+    applicationMap: {
+      entrypoint: "src/main.tsx",
+      components: [
+        {
+          name: "FinalReadOverlay",
+          filePath: "src/components/auditor/FinalReadOverlay.tsx",
+        },
+        { name: "BookingForm", filePath: "src/components/BookingForm.tsx" },
+      ],
+      endpoints: [
+        { method: "POST", path: "/api/bookings", purpose: "Creates a booking" },
+      ],
+    },
+  };
+
+  // Automate-AI-v4 payment evidence: three dead "Get Started" buttons
+  // plus the mocked-checkout verification item.
+  const DEAD = (line: number) => ({
+    severity: "high" as const,
+    title: 'Dead "Get Started" button — no handler',
+    file: "app/pricing/pricing-client.tsx",
+    line,
+    probe: "Dead Action",
+  });
+  const MOCKED = {
+    severity: "medium" as const,
+    title: "Checkout records sales as complete with no payment provider call",
+    file: "app/api/checkout/route.ts",
+    line: 39,
+    probe: "Mocked Payment",
+    unverified: true as const,
+  };
+  const paymentAudit = {
+    projectTitle: "Automate-AI-v4",
+    completenessScore: 62,
+    categoryScores: {
+      externalIntegrations: {
+        score: 3,
+        reason: "billing/payment processing referenced is unhandled.",
+      },
+    },
+    findings: [DEAD(18), DEAD(28), DEAD(38), MOCKED],
+  };
+
+  it("pins the resolved label into the model prompt", async () => {
+    firstCall(groundedCandidate());
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    const contents = String(mockedFallback.mock.calls[0][0].contents);
+    expect(contents).toMatch(/THIS QUESTION IS ABOUT: Authentication/);
+    expect(contents).toMatch(/cite it exactly as "Authentication"/);
+    expect(contents).toMatch(/No login flow exists/);
+  });
+
+  it("answers a resolved unknown decline deterministically from the label, free, without the double-check", async () => {
+    firstCall(unknownCandidate(), "gemini-3.6-flash");
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.starter).toBe(true);
+    expect(res.body.answer).toMatch(/^Authentication: /);
+    expect(res.body.answer).toMatch(/2\/10/);
+    expect(res.body.citedFindings).toEqual(["Authentication"]);
+    // The model was consulted once; the double-check was skipped — the
+    // answer is grounded in the report by construction, not by a second
+    // model's judgment.
+    expect(mockedFallback).toHaveBeenCalledTimes(1);
+    expect(mockedClaude).not.toHaveBeenCalled();
+    expect(mockedGeminiGenerate).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("answers a resolved uncited model answer deterministically from the label, free", async () => {
+    // The Q4 shape: the model answered from the right topic but cited
+    // its own paraphrase instead of the finding title.
+    firstCall(
+      {
+        answer: "Authentication is not really working.",
+        citedFindings: ["auth does not work"],
+        insufficientContext: false,
+      },
+      "gemini-3.6-flash"
+    );
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.starter).toBe(true);
+    expect(res.body.answer).toMatch(/^Authentication: /);
+    expect(res.body.citedFindings).toEqual(["Authentication"]);
+    expect(mockedClaude).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("answers a resolved PURPOSE decline deterministically, citing nothing", async () => {
+    firstCall(unknownCandidate(), "gemini-3.6-flash");
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({
+        question:
+          "Is this strictly a developer tool or can investors use it to understand software?",
+        audit: whistleStopAudit,
+      });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.starter).toBe(true);
+    expect(res.body.answer).toMatch(/A cleaning booking platform\./);
+    expect(res.body.answer).toMatch(/56\/100/);
+    expect(res.body.citedFindings).toEqual([]);
+    expect(mockedClaude).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("answers a resolved STAKEHOLDER VIEW decline deterministically, citing the component", async () => {
+    firstCall(unknownCandidate(), "gemini-3.6-flash");
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Is there an investor view?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.starter).toBe(true);
+    expect(res.body.answer).toMatch(/this report is the stakeholder view/);
+    expect(res.body.citedFindings).toEqual(["FinalReadOverlay"]);
+    expect(mockedClaude).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("charges a resolved grounded answer exactly once and does not fire the fallback", async () => {
+    firstCall(
+      {
+        answer: "Authentication is a gap: there is no login flow.",
+        citedFindings: ["Authentication"],
+        insufficientContext: false,
+      },
+      "gemini-3.6-flash"
+    );
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.answer).toBe("Authentication is a gap: there is no login flow.");
+    expect(res.body.citedFindings).toEqual(["Authentication"]);
+    expect(mockedCharge).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not override a grounded partial citing the matched label", async () => {
+    firstCall(
+      {
+        answer: "The review establishes the gap but not the exact login flow.",
+        citedFindings: ["Authentication"],
+        insufficientContext: true,
+        declineTier: "partial",
+      },
+      "gemini-3.6-flash"
+    );
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.answer.startsWith(PARTIAL_DECLINE_PREFIX)).toBe(true);
+    expect(mockedCharge).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers an ungrounded partial on a resolved label from the label, free", async () => {
+    // Extension beyond §3.4's enumeration (recorded in spec §7): an
+    // ungrounded partial routes to the same flat decline an unknown
+    // decline does, so the same fallback closes it.
+    firstCall(
+      {
+        answer: "Something about the login.",
+        citedFindings: ["Quantum flux capacitor"],
+        insufficientContext: true,
+        declineTier: "partial",
+      },
+      "gemini-3.6-flash"
+    );
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.starter).toBe(true);
+    expect(res.body.answer).toMatch(/^Authentication: /);
+    expect(res.body.citedFindings).toEqual(["Authentication"]);
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("leaves an unresolved unknown decline on the current double-check path", async () => {
+    firstCall(unknownCandidate(), "gemini-3.6-flash");
+    mockedClaude.mockResolvedValueOnce({
+      text: JSON.stringify(unknownCandidate()),
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    } as any);
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does it mention quantum flux?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(true);
+    expect(res.body.answer).toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
+    expect(res.body.answer).toContain(FREE_DECLINE_REPHRASE_NOTE);
+    expect(mockedClaude).toHaveBeenCalledTimes(1);
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("pins tied labels for the model and does not fire the fallback", async () => {
+    // "what is the worst problem?" is a rephrasing of the biggest-risk
+    // starter (the exact wording is a starter pill and never reaches
+    // the model); it matches the risk family on both liabilities equally.
+    firstCall(unknownCandidate(), "gemini-3.6-flash");
+    mockedClaude.mockResolvedValueOnce({
+      text: JSON.stringify(unknownCandidate()),
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    } as any);
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "what is the worst problem?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    const contents = String(mockedFallback.mock.calls[0][0].contents);
+    expect(contents).toMatch(/MORE THAN ONE SECTION OF THE REVIEW/);
+    expect(contents).toMatch(/- Authentication: /);
+    expect(contents).toMatch(/- Security: /);
+    // The fallback did not fire: the decline went through the
+    // double-check and came back marked.
+    expect(res.body.declined).toBe(true);
+    expect(res.body.answer).toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
+    expect(mockedClaude).toHaveBeenCalledTimes(1);
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("leaves the double-check unmarked when verification returns an empty answer without declining", async () => {
+    // §4.5 logged check: the third unmarked branch (after skipped and
+    // failed) — the verifier answered nothing and did not decline, so
+    // the check did not complete and the decline carries no marking.
+    firstCall(unknownCandidate(), "gemini-3.6-flash");
+    mockedClaude.mockResolvedValueOnce({
+      text: JSON.stringify({
+        answer: "",
+        citedFindings: [],
+        insufficientContext: false,
+      }),
+      usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5, totalTokenCount: 15 },
+    } as any);
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "Does it mention quantum flux?", audit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(true);
+    expect(res.body.answer).not.toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
+    expect(res.body.answer).toContain(FREE_DECLINE_REPHRASE_NOTE);
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("still answers Q5 grounded, charged once (regression)", async () => {
+    firstCall(
+      {
+        answer: "Users log in through the admin pages, but there is no login flow.",
+        citedFindings: ["Authentication"],
+        insufficientContext: false,
+      },
+      "gemini-3.6-flash"
+    );
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "How do users login?", audit: whistleStopAudit });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.answer).toMatch(/no login flow/);
+    expect(mockedCharge).toHaveBeenCalledTimes(1);
+  });
+
+  it("still takes the deterministic payment path for the four live payment questions (regression)", async () => {
+    for (const q of [
+      "does this application accept payments",
+      "does it collect payments",
+      "Are payments mocked?",
+      "our payments mocked?",
+    ]) {
+      const res = await request(app())
+        .post("/api/finalread/ask")
+        .send({ question: q, audit: paymentAudit });
+      expect(res.status).toBe(200);
+      expect(res.body.declined).toBe(false);
+      expect(res.body.starter).toBe(true);
+      expect(res.body.answer).toMatch(/"Get Started" button/);
+      expect(res.body.answer).toMatch(/flagged, not established/);
+      expect(res.body.citedFindings).toContain(
+        'Dead "Get Started" button — no handler'
+      );
+      expect(res.body.citedFindings).toContain(
+        "Checkout records sales as complete with no payment provider call"
+      );
+    }
+    expect(mockedFallback).not.toHaveBeenCalled();
+    expect(mockedClaude).not.toHaveBeenCalled();
+    expect(mockedCharge).not.toHaveBeenCalled();
+  });
+
+  it("still answers a buyer-dive follow-up grounded, with history, charged once (regression)", async () => {
+    // The Automate-AI-v4 multi-turn pattern: a core question surfaces a
+    // function, the buyer dives into a specific one. "What does the
+    // checkout button do?" is not a payment-classifier question (no
+    // payment verb), so it reaches the model with the dead-button label
+    // pinned — and the grounded answer charges exactly once.
+    const history = [
+      {
+        question: "does this application accept payments",
+        answer: "No working payment path was found.",
+        citedFindings: ['Dead "Get Started" button — no handler'],
+      },
+    ];
+    firstCall(
+      {
+        answer: "The Get Started button does nothing when clicked.",
+        citedFindings: ['Dead "Get Started" button — no handler'],
+        insufficientContext: false,
+      },
+      "gemini-3.6-flash"
+    );
+    const res = await request(app())
+      .post("/api/finalread/ask")
+      .send({ question: "What does the checkout button do?", audit: paymentAudit, history });
+    expect(res.status).toBe(200);
+    expect(res.body.declined).toBe(false);
+    expect(res.body.answer).toMatch(/does nothing when clicked/);
+    const contents = String(mockedFallback.mock.calls[0][0].contents);
+    expect(contents).toMatch(/THIS QUESTION IS ABOUT: Dead "Get Started" button/);
+    expect(contents).toMatch(/CONVERSATION SO FAR/);
+    expect(mockedCharge).toHaveBeenCalledTimes(1);
+  });
+});
