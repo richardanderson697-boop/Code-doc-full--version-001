@@ -240,6 +240,12 @@ function findDeadActions(code: string, filePath: string): DeadActionIssue[] {
   if (!JSX_FILE.test(filePath)) return [];
   const paymentPage = PAYMENT_PATH.test(filePath);
   const out: DeadActionIssue[] = [];
+  // Open <form> elements, tracked across the whole file: a submit button is
+  // wired when its enclosing form has a submit handler or a native action,
+  // however far above the form tag sits. The old 400-char lookback missed
+  // real forms (Pantry-ledger InventoryWorkspace: form at :384, button at
+  // :526) and the detector called five working buttons dead.
+  const formStack: string[] = [];
   const n = code.length;
   let i = 0;
   let line = 1;
@@ -312,6 +318,34 @@ function findDeadActions(code: string, filePath: string): DeadActionIssue[] {
       i++;
       continue;
     }
+    // Track <form> opens and </form> closes so a submit button can be
+    // matched to its enclosing form wherever the form tag sits.
+    if (ch === "<") {
+      if (code.startsWith("<form", i)) {
+        const after = code[i + 5] ?? "";
+        if (after === "" || /[\s>/]/.test(after)) {
+          const parsedForm = parseJsxTag(code, i);
+          if (parsedForm) {
+            for (let k = i; k <= parsedForm.end; k++) if (code[k] === "\n") line++;
+            if (!/\/>$/.test(parsedForm.tagText)) {
+              formStack.push(parsedForm.tagText);
+            }
+            i = parsedForm.end + 1;
+            continue;
+          }
+        }
+      } else if (code.startsWith("</form", i)) {
+        const after = code[i + 7] ?? "";
+        if (after === "" || /[\s>/]/.test(after)) {
+          const gt = code.indexOf(">", i);
+          if (gt !== -1) {
+            formStack.pop();
+            i = gt + 1;
+            continue;
+          }
+        }
+      }
+    }
     const name = tagNameAt(i);
     if (!name) {
       i++;
@@ -362,11 +396,19 @@ function findDeadActions(code: string, filePath: string): DeadActionIssue[] {
     const asChildWired =
       /\basChild\b/.test(tagText) && /<(Link|a)\b[^>]*\bhref\s*=/.test(children);
     if (asChildWired) continue;
-    if (
-      /\btype\s*=\s*["']submit["']/.test(tagText) &&
-      lastOpenBeforeClose(before, /<form\b[^>]*>/g, "</form>")
-    ) {
-      continue;
+    // A submit button — or a button with no type, which defaults to submit
+    // in HTML — inside a form with a submit handler or a native action is
+    // wired: the form submission is the wiring. A submit button in a form
+    // with neither onSubmit nor action still counts as dead: in a SPA it
+    // submits nowhere. (An anchor is not a submit button; the exemption
+    // does not apply to <a>.)
+    const typeMatch = /\btype\s*=\s*["']([^"']*)["']/.exec(tagText);
+    const buttonType = typeMatch ? typeMatch[1].toLowerCase() : "submit";
+    if (buttonType === "submit" && name !== "a") {
+      const form = formStack[formStack.length - 1];
+      if (form && (/\bonSubmit\s*=/.test(form) || /\baction\s*=/.test(form))) {
+        continue;
+      }
     }
 
     out.push({
