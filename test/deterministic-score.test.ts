@@ -959,6 +959,70 @@ export function formatPrice(total: number): string {
     }
   );
 
+  // Stripe CAP C + keyword precision spec (Diamond Dynasty): Whistle-stop
+  // has REAL Stripe usage with no webhook (STRIPE_SECRET_KEY env refs +
+  // admin Stripe-status route, no SDK import), so CAP C must still fire
+  // there. Diamond Dynasty has only the turf-mowing STRIPES pattern, so
+  // CAP C and both dangling paths must not fire there.
+  pinIt(join(REPO_ROOT, "whistle-stop-cleaning-check"))(
+    "pins Whistle-stop CAP C: real Stripe env keys, no webhook (Fix 1 must not regress it)",
+    () => {
+      const a = computeDeterministicAssessment(
+        readRepo(join(REPO_ROOT, "whistle-stop-cleaning-check")),
+        emptyPreflight()
+      );
+      expect(a.capsApplied.some((c) => c.startsWith("CAP C"))).toBe(true);
+      expect(a.missingFeatures.some((m) => m.feature === "Add Stripe webhook handler")).toBe(true);
+      expect(a.categories.externalIntegrations.score).toBe(0);
+    }
+  );
+
+  pinIt(join(REPO_ROOT, "diamond-dynasty-check", "Diamond-dynasty-baseball--main"))(
+    "pins Diamond Dynasty: STRIPES turf pattern is not Stripe (Fix 1/2)",
+    () => {
+      const a = computeDeterministicAssessment(
+        readRepo(join(REPO_ROOT, "diamond-dynasty-check", "Diamond-dynasty-baseball--main")),
+        emptyPreflight()
+      );
+      expect(a.capsApplied.some((c) => c.startsWith("CAP C"))).toBe(false);
+      expect(a.missingFeatures.some((m) => m.feature === "Add Stripe webhook handler")).toBe(false);
+      expect(a.categories.externalIntegrations.score).toBe(10);
+      expect(a.categories.externalIntegrations.note).toBe("not-in-scope");
+      expect(a.categories.databaseLayer.score).toBe(10);
+      expect(a.categories.backgroundAutomation.applicable).toBe(false);
+      expect(a.completenessScore).toBe(89);
+    }
+  );
+
+  pinIt(join(REPO_ROOT, "diamond-dynasty-check", "Diamond-dynasty-baseball--main"))(
+    "pins Diamond Dynasty: Firebase web key demoted to info, Security uncapped (Fix 3)",
+    () => {
+      const files = readRepo(join(REPO_ROOT, "diamond-dynasty-check", "Diamond-dynasty-baseball--main"));
+      const preflight = {
+        ...emptyPreflight(90),
+        findings: [
+          {
+            severity: "high",
+            probe: "Secret Scanner",
+            title: "Google API Key found in source",
+            file: "firebase-applet-config.json",
+            line: 4,
+            evidence: '  "apiKey": "AIzaSyDkX7p2Qw9Rt4Vb8Nm1Kj6Hg3Fd0Sa5Cx"',
+            remediation: "Remove this credential from source immediately. Rotate it in the issuing service.",
+            cwe: "CWE-798",
+          },
+        ] as PreFlightReport["findings"],
+      };
+      const a = computeDeterministicAssessment(files, preflight);
+      const f = a.calibratedPreflightFindings[0];
+      expect(f.severity).toBe("info");
+      expect(f.title).toMatch(/Firebase web API key/);
+      expect(a.categories.security.score).toBe(9);
+      expect(a.capsApplied.join(" ")).not.toMatch(/Google API Key/);
+      expect(a.completenessScore).toBe(88);
+    }
+  );
+
   it("pins the self-scan at 10 with the computation stated in the evidence", () => {
     const a = computeDeterministicAssessment(readRepo(process.cwd()), emptyPreflight());
     expect(a.categories.coreLogic.score).toBe(10);
@@ -966,5 +1030,166 @@ export function formatPrice(total: number): string {
     expect(ev).toMatch(/logic-purporting non-test files contain real logic/);
     expect(ev).toMatch(/No stubs found\./);
     expect(ev).toMatch(/0 fake-success findings\. No cap\./);
+  });
+});
+
+describe("Stripe CAP C + keyword precision (Diamond Dynasty spec)", () => {
+  const APIZA_KEY = "AIzaSyDkX7p2Qw9Rt4Vb8Nm1Kj6Hg3Fd0Sa5Cx";
+
+  function apiKeyFinding(overrides: Record<string, unknown>) {
+    return {
+      severity: "high",
+      probe: "Secret Scanner",
+      title: "Google API Key found in source",
+      file: "firebase-applet-config.json",
+      line: 4,
+      evidence: `  "apiKey": "${APIZA_KEY}"`,
+      remediation: "Remove this credential from source immediately. Rotate it in the issuing service.",
+      cwe: "CWE-798",
+      ...overrides,
+    };
+  }
+
+  function preflightWith(findings: unknown[], score = 90): PreFlightReport {
+    return { ...emptyPreflight(score), findings: findings as PreFlightReport["findings"] };
+  }
+
+  it("1. STRIPES turf pattern only: no CAP C, no webhook fix, not dangling", () => {
+    const files = [
+      ...HEALTHY_NEXT,
+      wf(
+        "src/data/stadiums.ts",
+        `export type TurfPattern = 'STRIPES' | 'CHECKERBOARD' | 'CONCENTRIC' | 'DIAMOND';\n\nexport const STADIUMS = [{ name: "Park", turfPattern: 'STRIPES' as TurfPattern }];\n`
+      ),
+      wf(
+        "src/components/LiveGameCanvas.tsx",
+        `import { STADIUMS } from '../data/stadiums';\nexport function draw(stadium: any, ctx: any) {\n  if (stadium.turfPattern === 'STRIPES') {\n    for (let x = 40; x < 800; x += 28) ctx.fillRect(x, 40, 14, 600);\n  }\n}\n`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.capsApplied.some((c) => c.startsWith("CAP C"))).toBe(false);
+    expect(a.missingFeatures.some((m) => m.feature === "Add Stripe webhook handler")).toBe(false);
+    expect(a.categories.externalIntegrations.score).toBe(10);
+    expect(a.categories.externalIntegrations.note).toBe("not-in-scope");
+  });
+
+  it("2. Stripe import, no webhook: CAP C fires, fix cites the import line", () => {
+    const files = [
+      wf("package.json", JSON.stringify({ dependencies: { next: "14.0.0", stripe: "1.0.0" } })),
+      wf("app/layout.tsx", "export default function L({c}) { return c; }"),
+      wf("app/page.tsx", "export default function P() { return <div/>; }"),
+      wf("lib/stripe.ts", `import Stripe from 'stripe';\nexport const stripe = new Stripe('sk_test');`),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.capsApplied.some((c) => c.startsWith("CAP C"))).toBe(true);
+    const fix = a.missingFeatures.find((m) => m.feature === "Add Stripe webhook handler");
+    expect(fix).toBeDefined();
+    expect(fix!.evidence[0]).toMatch(/lib\/stripe\.ts:1/);
+    expect(fix!.evidence[0]).toMatch(/Stripe import found/);
+  });
+
+  it("3. STRIPE_SECRET_KEY env reference, no SDK import: CAP C fires (Whistle-stop shape)", () => {
+    const files = [
+      ...HEALTHY_NEXT,
+      wf(
+        "server.ts",
+        `let dynamicStripeSecretKey = process.env.STRIPE_SECRET_KEY || "";\n\nexport function stripeStatus() {\n  return { configured: Boolean(dynamicStripeSecretKey) };\n}\n`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.capsApplied.some((c) => c.startsWith("CAP C"))).toBe(true);
+    const fix = a.missingFeatures.find((m) => m.feature === "Add Stripe webhook handler");
+    expect(fix).toBeDefined();
+    expect(fix!.evidence[0]).toMatch(/server\.ts:1/);
+    expect(fix!.evidence[0]).toMatch(/Stripe key reference found/);
+  });
+
+  it("4. game schedule in a schema description: background automation N/A, not dangling", () => {
+    const files = [
+      ...HEALTHY_NEXT,
+      wf(
+        "firebase-blueprint.json",
+        JSON.stringify(
+          { FranchiseStateChunk: { description: "Partitioned player pool, schedule, or draft state chunk belonging to a franchise." } },
+          null,
+          2
+        )
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.backgroundAutomation.applicable).toBe(false);
+    expect(a.categories.backgroundAutomation.note).toBe("not-applicable");
+  });
+
+  it("5. cron reference with no implementation: background automation dangling (3/10)", () => {
+    // A node-cron import or cron.schedule call would hit the implementation
+    // branch and score 10 — the referenced branch is for a cron reference
+    // without the implementation shape, so the fixture is a bare reference.
+    const files = [
+      ...HEALTHY_NEXT,
+      wf(
+        "src/jobs.ts",
+        `export const NIGHTLY_JOB = { kind: "cron", expression: "0 2 * * *" };\n\nexport function describeJobs() {\n  return [NIGHTLY_JOB];\n}\n`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.backgroundAutomation.score).toBe(3);
+    expect(a.categories.backgroundAutomation.note).toBe("dangling-automation");
+    expect(a.categories.backgroundAutomation.evidence.join(" ")).toMatch(/src\/jobs\.ts:1/);
+  });
+
+  it("6. 'Pay with Stripe' button, no backend: external integrations dangling (3/10)", () => {
+    const files = [
+      ...HEALTHY_NEXT,
+      wf(
+        "src/components/CheckoutButton.tsx",
+        `export function CheckoutButton() {\n  return <button onClick={() => {}}>Pay with Stripe</button>;\n}\n`
+      ),
+    ];
+    const a = computeDeterministicAssessment(files, emptyPreflight());
+    expect(a.categories.externalIntegrations.score).toBe(3);
+    expect(a.categories.externalIntegrations.note).toBe("dangling-integration");
+    expect(a.categories.externalIntegrations.evidence.join(" ")).toMatch(/CheckoutButton\.tsx:2/);
+  });
+
+  it("7. AIza key in a Firebase web config: demoted to info, Security uncapped", () => {
+    const config = JSON.stringify(
+      {
+        projectId: "keen-truth-469421-c7",
+        appId: "1:789558686318:web:9d08940adc83f44fac2c7f",
+        apiKey: APIZA_KEY,
+        authDomain: "keen-truth-469421-c7.firebaseapp.com",
+        storageBucket: "keen-truth-469421-c7.firebasestorage.app",
+        messagingSenderId: "789558686318",
+      },
+      null,
+      2
+    );
+    const files = [...HEALTHY_NEXT, wf("firebase-applet-config.json", config)];
+    const a = computeDeterministicAssessment(files, preflightWith([apiKeyFinding({})]));
+    const f = a.calibratedPreflightFindings[0];
+    expect(f.severity).toBe("info");
+    expect(f.title).toMatch(/Firebase web API key/);
+    expect(f.remediation).toMatch(/do NOT rotate as a leak/);
+    expect(a.categories.security.score).toBe(9);
+    expect(a.capsApplied.join(" ")).not.toMatch(/Google API Key/);
+  });
+
+  it("8. bare AIza key in a server file: still high, Security capped at 6", () => {
+    const files = [
+      ...HEALTHY_NEXT,
+      wf(
+        "server.ts",
+        `const GEMINI_API_KEY = "${APIZA_KEY}";\n\nexport function geminiKey() {\n  return GEMINI_API_KEY;\n}\n`
+      ),
+    ];
+    const a = computeDeterministicAssessment(
+      files,
+      preflightWith([apiKeyFinding({ file: "server.ts", line: 1 })])
+    );
+    const f = a.calibratedPreflightFindings[0];
+    expect(f.severity).toBe("high");
+    expect(a.categories.security.score).toBe(6);
+    expect(a.capsApplied.join(" ")).toMatch(/caps Security at 6\/10/);
   });
 });

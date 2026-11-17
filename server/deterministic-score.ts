@@ -380,7 +380,10 @@ export function extractDesignDeclarations(
 }
 const PAYMENT_REF = /(stripe|checkout|payment|billing|subscription)/i;
 const AUTOMATION_IMPL = /(node-cron|cron\.schedule|setInterval\s*\(|bullmq|inngest|trigger\.dev|new\s+Worker|webhook)/i;
-const AUTOMATION_REF = /(webhook|cron|schedule|worker|queue|background\sjob)/i;
+// (AUTOMATION_REF retired by the Stripe CAP C + keyword precision spec:
+// the dangling-automation check now uses findDanglingAutomationReference,
+// which requires automation terms in their automation sense. PAYMENT_REF
+// stays: CAP B's hollow-claim check still uses it.)
 /** The four missing pieces of background automation (§B3): a webhook
  *  handler alone is event-driven automation, not a scheduler, queue,
  *  worker, or retry/reconciliation loop. The packet renders these as a
@@ -395,6 +398,131 @@ const AUTOMATION_CHECKLIST = [
 // integrations. EXT_SDK_USE requires an import or API call.)
 const EXT_SDK_USE =
   /\bimport\s+[^;]*?\b(stripe|openai|anthropic|twilio|sendgrid|elevenlabs|resend)\b|\brequire\s*\(\s*['"][^'"]*\b(stripe|openai|anthropic|twilio|sendgrid|elevenlabs|resend)\b[^'"]*['"]\s*\)|\bnew\s+(Stripe|OpenAI|Anthropic|Twilio)\s*\(|\bstripe\.\w+\s*[.(]|\bopenai\.\w+\s*[.(]/i;
+
+// Corroborated Stripe presence (Stripe CAP C + keyword precision spec, Fix 1):
+// the PAYMENT_PROVIDER_USE shape (server/deterministic-scan.ts:88) restricted
+// to Stripe — an import/require of the stripe module, a `new Stripe(`
+// construction, a member call (`stripe.charges.create`), or the closing line
+// of a multi-line import (`} from 'stripe'`). A bare word mention (a comment,
+// a label, a colour/pattern name, a plural like the turf-mowing `STRIPES`)
+// does not count.
+const STRIPE_SDK_USE =
+  /\bimport\s+[^;]*\bstripe\b|\brequire\s*\([^)]*\bstripe\b|\bnew\s+Stripe\s*\(|\bstripe\s*\.\s*\w+|\bfrom\s+['"]stripe['"]/i;
+// A Stripe key or config reference: env names (including the VITE_-prefixed
+// publishable key) or a key literal. Whistle-stop has no SDK import — its
+// STRIPE_SECRET_KEY env reference is the corroboration that keeps CAP C
+// firing there.
+const STRIPE_KEY_USE =
+  /STRIPE_(SECRET|PUBLISHABLE|WEBHOOK_SECRET)_KEY\b|\b(sk_live|sk_test|pk_live|pk_test)_[A-Za-z0-9]{10,}\b|\bwhsec_[A-Za-z0-9]{10,}\b/;
+
+/** First file:line with corroborated Stripe use (SDK import/call or
+ *  key/config reference), or null. Matched against stripped content
+ *  (comments blanked, line numbers kept), so a comment mentioning Stripe
+ *  can never corroborate. `kind` names the corroboration for the evidence. */
+function stripePaymentEvidence(sig: WorkspaceSignals): { path: string; line: number; kind: "import" | "key" } | null {
+  for (const f of sig.files) {
+    const lines = f.strippedContent.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (STRIPE_SDK_USE.test(lines[i])) return { path: f.path, line: i + 1, kind: "import" };
+      if (STRIPE_KEY_USE.test(lines[i])) return { path: f.path, line: i + 1, kind: "key" };
+    }
+  }
+  return null;
+}
+
+// Payment terms in their payment sense (Fix 2). A whole-word provider name
+// on a line that also names the payment, a generic payment term in a
+// checkout/pricing/billing file, or a corroborated key/config reference.
+// Plurals and domain words (STRIPES), realtime subscribe* listeners (a
+// whole-word boundary already excludes the subscribeToX shape), and data
+// descriptions never count.
+const PAYMENT_PROVIDER_WORD = /\b(stripe|paypal|square|paddle|lemonsqueezy|braintree)\b/i;
+const PAYMENT_CONTEXT_WORD = /\b(pay|payment|payments|billing|checkout|charge|price|purchase|subscription|card|ach)\b/i;
+const PAYMENT_GENERIC_WORD = /\b(checkout|payment|payments|billing|subscription)\b/i;
+const PAYMENT_PATH = /(pricing|checkout|billing|subscribe|payment)/i;
+
+/** First file:line referencing a payment integration with no implementation,
+ *  in its payment sense, or null. A "Pay with Stripe" button label counts
+ *  (by design — it is a user-facing promise); a turf pattern does not. */
+function findDanglingPaymentReference(sig: WorkspaceSignals): { path: string; line: number } | null {
+  for (const f of sig.files) {
+    const lines = f.strippedContent.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (STRIPE_KEY_USE.test(line)) return { path: f.path, line: i + 1 };
+      if (PAYMENT_PROVIDER_WORD.test(line) && (PAYMENT_CONTEXT_WORD.test(line) || PAYMENT_PATH.test(f.path))) {
+        return { path: f.path, line: i + 1 };
+      }
+      if (PAYMENT_PATH.test(f.path) && PAYMENT_GENERIC_WORD.test(line)) {
+        return { path: f.path, line: i + 1 };
+      }
+    }
+  }
+  return null;
+}
+
+// Automation terms in their automation sense (Fix 2). Strong terms (webhook,
+// cron, background job) count as whole words anywhere; weak terms (schedule,
+// worker, queue) need automation context in the same file — a strong term,
+// an automation dependency, or an implementation-shaped reference
+// (setInterval, cron.schedule, a queue name). A game/class/project schedule
+// in a description, and domain uses of queue/worker with no automation
+// signal (an OCR worker pool, a toast queue), never count.
+const AUTOMATION_STRONG_WORD = /\b(webhook|webhooks|cron|crons|background\sjob)\b/i;
+const AUTOMATION_WEAK_WORD = /\b(schedule|scheduled|scheduler|worker|queue)\b/i;
+const AUTOMATION_CONTEXT = /node-cron|cron\.schedule|setInterval\s*\(|trigger\.dev|new\s+Worker|\b(bullmq|inngest|agenda|webhook|cron)\b/i;
+
+/** First file:line referencing background automation with no implementation,
+ *  in its automation sense, or null. */
+function findDanglingAutomationReference(sig: WorkspaceSignals): { path: string; line: number } | null {
+  for (const f of sig.files) {
+    const strongLine = findLine(f.strippedContent, AUTOMATION_STRONG_WORD);
+    if (strongLine != null) return { path: f.path, line: strongLine };
+    if (AUTOMATION_CONTEXT.test(f.strippedContent)) {
+      const weakLine = findLine(f.strippedContent, AUTOMATION_WEAK_WORD);
+      if (weakLine != null) return { path: f.path, line: weakLine };
+    }
+  }
+  return null;
+}
+
+// Firebase web API keys are public by design (2026-10-22 disposition): they
+// ship to every browser, and the guard is HTTP-referrer + API restrictions +
+// Firestore rules — not rotation. The vendor secret probe cannot tell a
+// Firebase web key from a server secret, so this first-party post-filter
+// demotes the finding to info with the correct disposition when the key sits
+// in a Firebase web config. Vendor engine untouched.
+const FIREBASE_WEB_KEY_TITLE = /google api key/i;
+const FIREBASE_CONFIG_PATH = /firebase[^/]*config|firebaseConfig/i;
+const FIREBASE_MARKERS = ["projectId", "appId", "authDomain", "storageBucket", "messagingSenderId"];
+
+function isFirebaseWebConfig(path: string, content: string): boolean {
+  if (FIREBASE_CONFIG_PATH.test(path)) return true;
+  if (!/\bapiKey\b/.test(content)) return false;
+  const present = FIREBASE_MARKERS.filter((m) => new RegExp(`\\b${m}\\b`).test(content));
+  return present.length >= 3 || (present.includes("projectId") && present.includes("appId"));
+}
+
+/** Demote "Google API Key" PreFlight findings that are Firebase web keys to
+ *  info with the Firebase disposition. Fail-safe: a key with no Firebase
+ *  context, or in a file outside the workspace, stands as reported. Runs
+ *  when the calibrated findings are built, so scoreSecurity, the
+ *  finding-cap pass, and the report all see the demoted finding. */
+function demoteFirebaseWebKeyFindings(files: WorkspaceFile[], findings: PreFlightFinding[]): PreFlightFinding[] {
+  return findings.map((f) => {
+    if (!FIREBASE_WEB_KEY_TITLE.test(f.title)) return f;
+    const file = files.find((w) => w.path === f.file);
+    if (!file) return f;
+    if (!isFirebaseWebConfig(file.path, file.content)) return f;
+    return {
+      ...f,
+      severity: "info",
+      title: "Firebase web API key (public by design)",
+      remediation:
+        "Firebase web API key — public by design; verify HTTP-referrer restrictions and API restrictions in Cloud Console and Firestore rules; do NOT rotate as a leak.",
+    };
+  });
+}
 
 function isCodeFile(path: string): boolean {
   return /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(path);
@@ -1389,16 +1517,14 @@ function scoreBackgroundAutomation(sig: WorkspaceSignals): CategoryResult {
     evidence.push("no scheduled jobs, queues, workers, or webhook retry/reconciliation logic");
     return { score: 6, max: 10, evidence, checklist: [...AUTOMATION_CHECKLIST] };
   }
-  const referenced = anyFile(sig, (f) => hasWord(f.strippedContent, AUTOMATION_REF) || hasWord(f.strippedContent, PAYMENT_REF));
+  const referenced = findDanglingAutomationReference(sig) ?? findDanglingPaymentReference(sig);
   // A scheduler/queue/worker dependency with no code usage yet still counts
   // as "in scope" — the rule is "no such dependency anywhere", not "no import".
   const automationDep = depNames(sig).some((d) => /(cron|bull|queue|worker|schedule|inngest|agenda)/i.test(d));
   if (referenced || automationDep) {
     if (automationDep && !referenced) evidence.push(`package.json depends on automation (${depNames(sig).filter((d) => /(cron|bull|queue|worker|schedule|inngest|agenda)/i.test(d)).join(", ")}) with no implementation`);
     else {
-      const rLine =
-        findLine(referenced!.content, AUTOMATION_REF) ?? findLine(referenced!.content, PAYMENT_REF);
-      evidence.push(ev(referenced!.path, rLine, "references automation/webhooks with no implementation"));
+      evidence.push(ev(referenced!.path, referenced!.line, "references automation/webhooks with no implementation"));
     }
     return { score: 3, max: 10, evidence, note: "dangling-automation", checklist: [...AUTOMATION_CHECKLIST] };
   }
@@ -1433,9 +1559,9 @@ function scoreExternalIntegrations(sig: WorkspaceSignals): CategoryResult {
     return { score: 10, max: 10, evidence };
   }
 
-  const referenced = anyFile(sig, (f) => hasWord(f.strippedContent, PAYMENT_REF));
+  const referenced = findDanglingPaymentReference(sig);
   if (referenced) {
-    evidence.push(ev(referenced.path, findLine(referenced.content, PAYMENT_REF), "references payments/integrations with no implementation"));
+    evidence.push(ev(referenced.path, referenced.line, "references payments/integrations with no implementation"));
     return { score: 3, max: 10, evidence, note: "dangling-integration" };
   }
   evidence.push("no external integrations referenced — not in scope by design");
@@ -1650,8 +1776,7 @@ function scoreDocumentation(sig: WorkspaceSignals): CategoryResult {
 // ---------------------------------------------------------------------------
 
 function stripePresentWithoutWebhook(sig: WorkspaceSignals): boolean {
-  const stripeFile = anyFile(sig, (f) => /stripe/i.test(f.strippedContent));
-  if (!stripeFile) return false;
+  if (!stripePaymentEvidence(sig)) return false;
   const webhook = sig.files.some(
     (f) => /webhook/i.test(f.path) || /webhook/i.test(f.strippedContent)
   );
@@ -1738,9 +1863,9 @@ function computeMissingFeatures(
 
   // Structural gaps (highest priority).
   if (stripePresentWithoutWebhook(sig)) {
-    const f = anyFile(sig, (x) => /stripe/i.test(x.content));
+    const evd = stripePaymentEvidence(sig)!;
     push("Add Stripe webhook handler", CATEGORY_LABELS.externalIntegrations, [
-      `${f!.path} (Stripe referenced, no webhook route found)`,
+      `${evd.path}:${evd.line} (Stripe ${evd.kind === "key" ? "key reference" : "import"} found, no webhook route found)`,
     ]);
   }
   const authCat = categories.authentication;
@@ -2193,10 +2318,14 @@ export function computeDeterministicAssessment(
   // calibration does not touch it. The verified gates also feed the auth
   // category (a route-level gate alone scores 3, not 0).
   const middlewareResolution = downgradeMiddlewareGatedNoAuthFindings(files, preflight.findings);
+  // Firebase web keys (Fix 3): demoted to info with the Firebase disposition
+  // BEFORE the no-auth calibration below, so scoreSecurity, the finding-cap
+  // pass, and the report all see the demoted finding.
+  const firebaseDemoted = demoteFirebaseWebKeyFindings(files, middlewareResolution.findings);
   const calibratedPreflight: PreFlightReport = {
     ...preflight,
     findings: calibrateNoAuthFindings(
-      { ...preflight, findings: middlewareResolution.findings },
+      { ...preflight, findings: firebaseDemoted },
       deterministicFindings
     ),
   };
