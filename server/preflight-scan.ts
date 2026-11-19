@@ -34,6 +34,9 @@ import {
 } from "./preflight/vendor/lib/probes/v2/app-shape.js";
 import { computeScore } from "./preflight/vendor/lib/scoring.js";
 import { dropContentOnlyTaintFindings } from "./preflight/taint-path-filter";
+import { calibrateDestructiveHandlerFindings } from "./preflight/destructive-handler-filter";
+import { calibrateRlsFindings } from "./preflight/rls-scope-filter";
+import { calibrateSsrfTaintFindings } from "./preflight/ssrf-taint-filter";
 
 export type { PreFlightFinding, PreFlightReport };
 
@@ -514,10 +517,22 @@ export function runPreFlightScan(
   // argument of the sink call is request-derived. The filter is
   // fail-closed — anything it cannot establish keeps the finding.
   const fileContents = new Map(selected.map((f) => [f.path, f.content]));
-  const findings: PreFlightFinding[] = dropContentOnlyTaintFindings(
-    rawFindings,
+  // Detector-precision calibration (finalread-detector-precision-fix-spec,
+  // Items 1-3): first-party post-filters that re-examine the vendored
+  // probes' findings against the source. The vendored engine is untouched;
+  // each filter is fail-closed — anything it cannot establish keeps the
+  // finding or routes it to verification, never silently drops.
+  const calibratedFindings = calibrateSsrfTaintFindings(
+    calibrateRlsFindings(
+      calibrateDestructiveHandlerFindings(
+        dropContentOnlyTaintFindings(rawFindings, fileContents),
+        fileContents
+      ),
+      fileContents
+    ),
     fileContents
-  ).map((f: any) => ({
+  );
+  const findings: PreFlightFinding[] = calibratedFindings.map((f: any) => ({
     // Unrecognized severities become "info", which would hide a more severe
     // finding, so record the original for the caller and the tests.
     severity: SEVERITIES.has(f?.severity) ? f.severity : "info",
