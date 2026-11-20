@@ -37,6 +37,15 @@ import { dropContentOnlyTaintFindings } from "./preflight/taint-path-filter";
 import { calibrateDestructiveHandlerFindings } from "./preflight/destructive-handler-filter";
 import { calibrateRlsFindings } from "./preflight/rls-scope-filter";
 import { calibrateSsrfTaintFindings } from "./preflight/ssrf-taint-filter";
+// Gap detectors (finalread-gap-detectors-spec.md, APPROVED 2026-11-20):
+// first-party TypeScript probes for rate limiting, CSRF, debug mode,
+// secret logging, and file-upload validation. Not Opengrep rules (these
+// five are "absence + cross-file" detectors) and not vendored edits.
+import { probeRateLimit, RATE_LIMIT_PROBE } from "./preflight/rate-limit-probe";
+import { probeCsrfProtection, CSRF_PROBE } from "./preflight/csrf-probe";
+import { probeDebugMode, DEBUG_MODE_PROBE } from "./preflight/debug-mode-probe";
+import { probeSecretLogging, SECRET_LOGGING_PROBE } from "./preflight/secret-logging-probe";
+import { probeFileUploadValidation, FILE_UPLOAD_PROBE } from "./preflight/file-upload-probe";
 
 export type { PreFlightFinding, PreFlightReport };
 
@@ -416,6 +425,18 @@ export interface RunPreFlightScanOptions {
   crossFilePassBudgetMs?: number;
 }
 
+// Gap detectors (finalread-gap-detectors-spec.md): the five first-party
+// probes, run over the same selected files as the vendored engine and
+// Opengrep. Module-level so the probe count and the run share one list.
+const GAP_PROBES: { name: string; fn: (files: ScanInputFile[]) => PreFlightFinding[] }[] = [
+  { name: RATE_LIMIT_PROBE, fn: probeRateLimit },
+  { name: CSRF_PROBE, fn: probeCsrfProtection },
+  { name: DEBUG_MODE_PROBE, fn: probeDebugMode },
+  { name: SECRET_LOGGING_PROBE, fn: probeSecretLogging },
+  { name: FILE_UPLOAD_PROBE, fn: probeFileUploadValidation },
+];
+const GAP_PROBE_COUNT = GAP_PROBES.length;
+
 /**
  * Main entry point for preflight scanning. Runs a 384KB+ repo in batches of
  * 2 files through the vendored engine (per-file findings, coverage-only risk),
@@ -573,6 +594,23 @@ export function runPreFlightScan(
     log.warn(`PreFlight probe "opengrep" failed: ${og.failure.error}`);
   }
   findings.push(...og.findings);
+
+  // Gap-detector pass (finalread-gap-detectors-spec.md): the five
+  // first-party probes run over the same selected files. Each never
+  // throws; a failure is recorded as a probe failure so the report says
+  // "not measured" instead of "clean". The engine's score is kept as-is:
+  // these findings cap FinalRead category scores (via
+  // reconcileFindingCaps) but do not move the raw PreFlight score —
+  // the same as Opengrep today (follow-up: unified scoring).
+  for (const { name, fn } of GAP_PROBES) {
+    try {
+      findings.push(...fn(selected));
+    } catch (err: any) {
+      const error = err?.message || String(err);
+      probeFailures.push({ probe: name, error });
+      log.warn(`PreFlight probe "${name}" failed: ${error}`);
+    }
+  }
   findings.sort(
     (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity)
   );
@@ -584,7 +622,7 @@ export function runPreFlightScan(
 
   return {
     engine: "PreFlight",
-    probeCount: safeProbeCount() + og.rulesRun,
+    probeCount: safeProbeCount() + og.rulesRun + GAP_PROBE_COUNT,
     filesScanned: selected.length,
     filesSkipped: skipped,
     score: typeof result?.score === "number" ? result.score : 0,
