@@ -1,0 +1,425 @@
+// The workspace intelligence scan, extracted from
+// server/routes/intelligence.ts so it can run outside an HTTP request:
+// the FinalRead missing-audit report job (processPendingReportJobs in
+// server/finalread-projects.ts) and the server-side re-scan both re-run
+// the same scan the route runs, over server-loaded files.
+//
+// The route keeps the HTTP concerns (source selection, credit gate,
+// charge/entitlement consumption, frozen-version bookkeeping); this module
+// owns the scan itself: PreFlight + deterministic assessment + model call
+// + citation verification. On a model failure the thrown error carries
+// `.preflight` / `.calibratedPreflight` so the caller can still hand the
+// client the deterministic findings instead of a bare error (same
+// contract as the route's catch).
+import { generateWithFallback, extractUsage } from "./gemini";
+import { runPreFlightScan, formatFindingsForPrompt } from "./preflight-scan";
+import type { PreFlightReport } from "../shared/preflight-types";
+import {
+  computeDeterministicAssessment,
+  formatAssessmentForPrompt,
+  fallbackReason,
+  fallbackMissingReason,
+  CATEGORY_KEYS,
+  type CategoryKey,
+} from "./deterministic-score";
+import { verifyReportCitations, repairImportMap } from "./citation-verify";
+import {
+  findReadmeFile,
+  extractReadmeTitle,
+  extractReadmeTagline,
+} from "./readme-identity";
+import { getWorkspaceSource } from "./workspace-store";
+
+export interface IntelligenceScanFile {
+  path: string;
+  content: string;
+  lineCount: number;
+}
+
+export interface IntelligenceScanResult {
+  /** The parsed audit object (the intelligence report the route serves). */
+  audit: any;
+  /** Raw model usage, for the caller's metering/charge. */
+  usage: any;
+  modelName: string;
+}
+
+const INTEL_SYSTEM_PROMPT = `You are VibeCoder Project Intelligence Engine, an elite full-workspace software architect. 
+Your task is to analyze the complete set of files in this project workspace, build a comprehensive file ledger, construct a complete application architecture map, and evaluate the overall codebase completeness score out of 100.
+
+Since you are analyzing the entire project, you must look across ALL files to find implementations of features (e.g. database connections in server.ts or data directories, routing, utilities, frontend components in src/). Do not grade the app based on a single file.
+
+Your response must be returned STRICTLY in this JSON format:
+{
+  "totalFiles": number,
+  "totalLines": number,
+  "overallSummary": string,
+  "completenessScore": number,
+  "categoryScores": {
+    "serverStarts": { "score": number, "max": 10, "reason": string },
+    "authentication": { "score": number, "max": 10, "reason": string },
+    "databaseLayer": { "score": number, "max": 10, "reason": string },
+    "errorHandling": { "score": number, "max": 10, "reason": string },
+    "coreLogic": { "score": number, "max": 10, "reason": string },
+    "backgroundAutomation": { "score": number, "max": 10, "reason": string },
+    "externalIntegrations": { "score": number, "max": 10, "reason": string },
+    "security": { "score": number, "max": 10, "reason": string },
+    "performance": { "score": number, "max": 10, "reason": string },
+    "documentationVerified": { "score": number, "max": 10, "reason": string }
+  },
+  "fileLedger": [
+    {
+      "filePath": string,
+      "lineCount": number,
+      "description": string,
+      "contribution": string
+    }
+  ],
+  "applicationMap": {
+    "entrypoint": string,
+    "components": [
+      { "name": string, "filePath": string, "imports": [string] }
+    ],
+    "endpoints": [
+      { "method": string, "path": string, "purpose": string }
+    ]
+  },
+  "missingFeatures": [
+    { "feature": string, "category": string, "reason": string }
+  ]
+}
+
+CRITICAL RULES FOR PROJECT SCOPE ANALYSIS & INTENT DETECTION:
+0. DETERMINISTIC GROUND TRUTH (OVERRIDES YOUR JUDGMENT ON NUMBERS AND IMPORTS):
+   - The user message ends with a DETERMINISTIC GROUND TRUTH block listing the 10 category scores, the missing-features list, the total completeness score, and a per-file import map, all computed from scan evidence. These are FINAL.
+   - You MUST copy each category's score EXACTLY into categoryScores.<key>.score (max stays 10).
+   - If the ground truth marks a category N/A, write score 0 for it and state in the reason that the category is not applicable to this project (the server replaces it with the N/A marker).
+   - You MUST reproduce missingFeatures EXACTLY: same feature and category strings, same order. Do not add, remove, split, or reword entries.
+   - completenessScore MUST equal the exact total shown (it is the precomputed sum).
+   - You MUST reproduce the import map EXACTLY in applicationMap.components[].imports: every specifier listed for a file, no additions, no drops. Match components to files by filePath.
+   - Your judgment lives in the WORDS, not the numbers: write truthful, specific "reason" strings for every category and every missing feature, CITING the evidence anchors provided (file:line). Write overallSummary, fileLedger, and the rest of applicationMap from the code as usual.
+   - Do not invent scores, do not invent missing features, do not hallucinate files. If the evidence says a capability is not in scope, say so in the reason — the score already reflects it.
+0. DOMAIN INTENT & SCOPE DETECTION:
+   - First, determine the application's intended domain and architectural scope by inspecting README.md, package.json description, component names, comments, and API endpoints.
+   - STATELESS / PRIVACY-FIRST / STANDALONE UTILITIES: If the application is intentionally designed as a client-side utility, calculator, converter, generator, audio tool, or privacy-first app that requires no user accounts, database persistence, or payment processing, DO NOT PENALIZE the app for omitting them!
+   - Award 10/10 for authentication, databaseLayer, and/or externalIntegrations if they are intentionally omitted by design, stating in the reason: "Not required for this stateless tool by intentional design scope."
+   - ONLY penalize authentication, databaseLayer, or payments if there are "broken loops" or "dangling references" (e.g. code/UI references user logins, user profiles, paid credits, or Stripe payments, but the corresponding backend endpoints/webhooks are missing or broken).
+
+1. OVERALL SUMMARY: Provide a highly polished summary in clear English describing what this accumulated set of files represents, its design philosophy, and what functions it enables.
+2. FILE LEDGER: Every file in the project (excluding ignored ones) must have an entry detailing its business purpose ("description") and its exact value or contribution to the app's overall goals ("contribution").
+3. APPLICATION MAP:
+   - Identify the main entrypoint (e.g. index.html, src/main.tsx, or server.ts).
+   - List each key frontend React component, its file path, and imports.
+   - List each backend Express route, its HTTP method, its route path, and what business purpose it serves.
+4. CATEGORY SCORE INTEGRITY (ACCURATE & DOMAIN-AWARE EVALUATION):
+   Evaluate real, functional completeness relative to the app's intended scope, NOT arbitrary feature count:
+   - serverStarts: Rate the backend Express server integration or frontend build/routing entrypoint. If the project is a Next.js app but is missing app/page.tsx, app/layout.tsx, or has no frontend "front door", rate this Category 2/10 or lower, explaining that a user hitting the URL will experience a 404.
+   - authentication: Look across all files. If user sign-in or sessions are active, score highly. If the app needs logins but they are broken/stubbed, rate 0/10. Award 10/10 if authentication is irrelevant or intentionally omitted for this app's design scope.
+   - databaseLayer: Look for DB storage setups. If DB files exist without active collections/tables, score low. If a DB is missing but needed for user state, score low. Award 10/10 if the app is a stateless/client-side tool by design.
+   - errorHandling: Rate try/catch blocks and active error boundaries.
+   - coreLogic: Rate the level of active, completed domain logic.
+   - backgroundAutomation: Rate active cron/intervals/workers. Do NOT default to 10/10 if critical automation or webhooks (e.g. Stripe webhook handlers) are missing while payment helper files exist.
+   - externalIntegrations: Rate active API integrations or award 10/10 if external services are not part of the design scope.
+   - security: Score security practices (CORS, PORT bindings, no secrets committed, or privacy/data minimization practices).
+   - performance: Rate code organization and build readiness.
+   - documentationVerified: Rate TypeScript interfaces, comments, and file descriptions.
+
+5. ACCURATE SCORING HARD-CAPS (MANDATORY):
+   - CAP A (Missing Front Door / Routing): If the frontend is largely missing, lacks core page-level views/routes, or lacks main routing files (e.g., has isolated standalone components like ReferralStats or NegotiationReport but lacks app/page.tsx or app/layout.tsx to mount and route them), the total completenessScore MUST BE COERCED AND HARD-CAPPED AT A MAXIMUM OF 30/100. Lower category scores (like serverStarts and coreLogic) proportionally.
+   - CAP B (Incomplete API Infrastructure): If the ecosystem lists features like user logins, credit balances, purchases, and webhooks, but only has ONE single API endpoint actually implemented (e.g. /api/analyze), the total completenessScore MUST BE HARD-CAPPED AT A MAXIMUM OF 45/100.
+   - CAP C (Broken Loop / Missing Webhooks): If helper utilities like Stripe clients are present but critical webhooks (like /api/stripe/webhook or similar) are missing, deduct at least 4 points from externalIntegrations and databaseLayer.
+   
+The total completenessScore is computed server-side (rescaled over the applicable categories) — reproduce the exact total shown in the ground truth block. Keep the assessment professional, objective, realistic, and critical. Every claim in the reasons must cite evidence from the code provided; do not invent or hallucinate files.`;
+
+const INTEL_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    totalFiles: { type: "INTEGER" },
+    totalLines: { type: "INTEGER" },
+    overallSummary: { type: "STRING" },
+    completenessScore: { type: "INTEGER" },
+    categoryScores: {
+      type: "OBJECT",
+      properties: {
+        serverStarts: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        authentication: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        databaseLayer: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        errorHandling: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        coreLogic: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        backgroundAutomation: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        externalIntegrations: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        security: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        performance: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        },
+        documentationVerified: {
+          type: "OBJECT",
+          properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
+          required: ["score", "max", "reason"]
+        }
+      },
+      required: [
+        "serverStarts", "authentication", "databaseLayer", "errorHandling", "coreLogic",
+        "backgroundAutomation", "externalIntegrations", "security", "performance", "documentationVerified"
+      ]
+    },
+    fileLedger: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          filePath: { type: "STRING" },
+          lineCount: { type: "INTEGER" },
+          description: { type: "STRING" },
+          contribution: { type: "STRING" }
+        },
+        required: ["filePath", "lineCount", "description", "contribution"]
+      }
+    },
+    applicationMap: {
+      type: "OBJECT",
+      properties: {
+        entrypoint: { type: "STRING" },
+        components: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              name: { type: "STRING" },
+              filePath: { type: "STRING" },
+              imports: { type: "ARRAY", items: { type: "STRING" } }
+            },
+            required: ["name", "filePath", "imports"]
+          }
+        },
+        endpoints: {
+          type: "ARRAY",
+          items: {
+            type: "OBJECT",
+            properties: {
+              method: { type: "STRING" },
+              path: { type: "STRING" },
+              purpose: { type: "STRING" }
+            },
+            required: ["method", "path", "purpose"]
+          }
+        }
+      },
+      required: ["entrypoint", "components", "endpoints"]
+    },
+    missingFeatures: {
+      type: "ARRAY",
+      items: {
+        type: "OBJECT",
+        properties: {
+          feature: { type: "STRING" },
+          category: { type: "STRING" },
+          reason: { type: "STRING" }
+        },
+        required: ["feature", "category", "reason"]
+      }
+    }
+  },
+  required: [
+    "totalFiles", "totalLines", "overallSummary", "completenessScore",
+    "categoryScores", "fileLedger", "applicationMap", "missingFeatures"
+  ]
+};
+
+/**
+ * Run the whole-workspace intelligence scan over the given files and
+ * return the parsed audit. The caller owns charging, entitlements, and
+ * frozen-version bookkeeping; this function only scans. Throws on a
+ * model failure (with `.preflight` / `.calibratedPreflight` attached so
+ * the caller can still return the deterministic findings).
+ */
+export async function runIntelligenceScan(
+  files: IntelligenceScanFile[],
+  opts: { userId: string; fromWorkspace: boolean }
+): Promise<IntelligenceScanResult> {
+  let preflight: PreFlightReport | undefined;
+  let calibratedPreflight: PreFlightReport | undefined;
+  try {
+    const totalFiles = files.length;
+    const totalLines = files.reduce((acc, f) => acc + f.lineCount, 0);
+
+    // PreFlight deterministic pass over the whole workspace: line-anchored
+    // security/quality findings the LLM report can cite as ground truth.
+    preflight = runPreFlightScan(files.map((f) => ({ path: f.path, content: f.content })));
+
+    // Deterministic assessment: the 10 category scores, the missing-features
+    // list, and the total are computed from scan evidence (pure functions —
+    // identical input always yields identical numbers). The model explains
+    // these facts; it does not invent or adjust them.
+    const assessment = computeDeterministicAssessment(files, preflight);
+    calibratedPreflight = { ...preflight, findings: assessment.calibratedPreflightFindings };
+
+    // Build workspace context string for Gemini
+    let workspaceContext = `You are evaluating a React/TypeScript project with ${totalFiles} file(s) totaling ${totalLines} line(s) of code.\n\n`;
+    files.forEach((f) => {
+      workspaceContext += `--- FILE: ${f.path} (${f.lineCount} lines) ---\n`;
+      workspaceContext += f.content;
+      workspaceContext += `\n---------------------------------------------\n\n`;
+    });
+    workspaceContext += `\n---\n${formatFindingsForPrompt(calibratedPreflight)}\nWhen scoring the "security" category, weigh these deterministic findings; cite them by file and line in the reason instead of guessing.\n`;
+    workspaceContext += `\n---\n${formatAssessmentForPrompt(assessment)}\n`;
+
+    const { response: intelResponse, modelName } = await generateWithFallback({
+      contents: workspaceContext,
+      config: {
+        systemInstruction: INTEL_SYSTEM_PROMPT,
+        temperature: 0.1,
+        responseMimeType: "application/json",
+        responseSchema: INTEL_SCHEMA as any,
+      },
+    });
+
+    const responseText = intelResponse.text || "";
+    let cleanText = responseText.trim();
+    const startIdx = cleanText.indexOf("{");
+    const endIdx = cleanText.lastIndexOf("}");
+    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+      cleanText = cleanText.substring(startIdx, endIdx + 1);
+    }
+
+    const parsedIntel = JSON.parse(cleanText);
+    // Attach the deterministic report for the dedicated UI panel — the
+    // calibrated findings (§5), so the panel shows the reframed no-auth
+    // finding, not the uncalibrated critical.
+    parsedIntel.preflight = calibratedPreflight;
+
+    // Enforce determinism: the served report always carries the computed
+    // scores and missing-feature list, even if the model drifted. The model's
+    // reason strings are kept (that is its job now); numbers are facts.
+    if (parsedIntel.categoryScores && typeof parsedIntel.categoryScores === "object") {
+      for (const key of CATEGORY_KEYS) {
+        const cat = parsedIntel.categoryScores[key] || {};
+        const det = assessment.categories[key];
+        const applicable = det.applicable !== false;
+        parsedIntel.categoryScores[key] = {
+          score: applicable ? det.score : null,
+          max: 10,
+          applicable,
+          designDeclaration: det.designDeclaration,
+          reason:
+            typeof cat.reason === "string" && cat.reason.trim().length > 0
+              ? cat.reason
+              : fallbackReason(key, assessment),
+        };
+      }
+    }
+    parsedIntel.completenessScore = assessment.completenessScore;
+    // How many of the 10 rubric categories apply — the client shows
+    // "N of 10 categories applicable" so the rescaling is never hidden.
+    parsedIntel.applicableCategories = assessment.applicableCount;
+    {
+      const modelMissing = Array.isArray(parsedIntel.missingFeatures) ? parsedIntel.missingFeatures : [];
+      const reasonByFeature = new Map<string, string>();
+      for (const m of modelMissing) {
+        if (m && typeof m.feature === "string" && typeof m.reason === "string" && m.reason.trim()) {
+          if (!reasonByFeature.has(m.feature)) reasonByFeature.set(m.feature, m.reason);
+        }
+      }
+      parsedIntel.missingFeatures = assessment.missingFeatures.map((f) => ({
+        feature: f.feature,
+        category: f.category,
+        reason: reasonByFeature.get(f.feature) || fallbackMissingReason(f),
+      }));
+    }
+    // Expose the deterministic assessment for debugging/transparency.
+    parsedIntel.deterministicAssessment = {
+      capsApplied: assessment.capsApplied,
+      evidence: Object.fromEntries(
+        CATEGORY_KEYS.map((k) => [k, assessment.categories[k].evidence])
+      ),
+      // Per-category checklists (background automation only — the scorer
+      // attaches one only where a category is half-built or a liability)
+      // plus the scanner / metric versions, so the report and the
+      // developer handoff packet can state what produced them (§B3, §B6).
+      checklists: Object.fromEntries(
+        CATEGORY_KEYS.filter((k) => assessment.categories[k].checklist).map((k) => [
+          k,
+          assessment.categories[k].checklist,
+        ])
+      ),
+      scannerVersion: assessment.scannerVersion,
+      metricVersion: assessment.metricVersion,
+      // Deterministic findings (dead payment buttons, mocked-payment
+      // routes): the overlay appends these to the audit input's findings
+      // so the report builder buckets them — liabilities for dead payment
+      // buttons, needs-verification for mocked payments.
+      findings: assessment.deterministicFindings,
+    };
+    // Citation grounding: verify every `file:line` citation in the model's
+    // free-text reasons against the actual workspace files and drop what
+    // cannot be verified, so unsupported claims never reach the report.
+    // Dropped applicationMap imports are repaired from the deterministic
+    // import map (ground truth).
+    const citationResult = verifyReportCitations(parsedIntel, files, {
+      categoryReason: (key) => fallbackReason(key as CategoryKey, assessment),
+      missingReason: (feature) => `Flagged by deterministic scan: ${feature}`,
+    });
+    const importsRepaired = repairImportMap(parsedIntel, assessment.importMap);
+    parsedIntel.verification = {
+      citationsChecked: citationResult.citationsChecked,
+      citationsDropped: citationResult.citationsDropped,
+      droppedCitations: citationResult.droppedCitations,
+      importsRepaired,
+    };
+    // Report header identity (display-only, never scored): the README's
+    // own H1 and tagline, plus the recorded import source. A source read
+    // failure must never fail the scan — the header just falls back.
+    if (opts.fromWorkspace) {
+      const readme = findReadmeFile(files);
+      if (readme) {
+        const displayName = extractReadmeTitle(readme.content);
+        const readmeTagline = extractReadmeTagline(readme.content);
+        if (displayName) parsedIntel.displayName = displayName;
+        if (readmeTagline) parsedIntel.readmeTagline = readmeTagline;
+      }
+      const importSource = await getWorkspaceSource(opts.userId).catch(() => undefined);
+      if (importSource) parsedIntel.importSource = importSource;
+    }
+    return { audit: parsedIntel, usage: extractUsage(intelResponse), modelName };
+  } catch (err: any) {
+    // The deterministic scan runs before the model call, so a model outage
+    // should still hand the caller the findings instead of a bare error.
+    (err as any).preflight = calibratedPreflight ?? preflight;
+    (err as any).calibratedPreflight = calibratedPreflight;
+    throw err;
+  }
+}

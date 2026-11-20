@@ -8,6 +8,7 @@ import {
   FINALREAD_RESCAN_PACK_ID,
   grantRescanEntitlements,
 } from "./finalread-rescans";
+import { processPendingActivationsForUser } from "./finalread-projects";
 
 interface ModelRate {
   inputPerMillion: number;
@@ -157,6 +158,18 @@ export async function claimPendingCredits(userId: string, email: string): Promis
     }
   }
   if (claimed > 0) log.info(`Claimed ${claimed} pending credits for ${cleanEmail}`);
+  // A parked FinalRead purchase made with an invite code claims its code
+  // activation too (spec §10.5): the buyer gets the report once their
+  // account exists. Runs even when no credits were claimed — a parked
+  // activation can exist without a park row only if the webhook parked
+  // the activation but the credit park failed, which cannot happen (the
+  // activation is created after the park row in the same branch), so this
+  // is belt-and-braces for a partially-parked purchase.
+  try {
+    await processPendingActivationsForUser(userId, cleanEmail);
+  } catch (err) {
+    log.error(`Failed to process pending FinalRead activations for ${cleanEmail}:`, err);
+  }
   return claimed;
 }
 

@@ -39,8 +39,14 @@ import {
   CLAUDE_SONNET_MODEL,
 } from "../anthropic";
 import { log } from "../logger";
-import { requireAuth, requireCredits, AuthedRequest } from "../middleware/requireAuth";
+import { requireAuth, checkCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
+import {
+  appendQaTurn,
+  getQaHistoryForVersion,
+  hasBuyerAccess,
+  resolveAskTarget,
+} from "../finalread-projects";
 import {
   buildFinalReadReport,
   type FinalReadAuditInput,
@@ -62,7 +68,6 @@ import {
   pickVerificationModel,
   starterAnswer,
   paymentAnswer,
-  validateQaHistory,
   resolveQaLabel,
   formatLabelPin,
   labelFallbackAnswer,
@@ -283,30 +288,85 @@ function labelFallbackResponse(label: QaLabel) {
 router.post(
   "/api/finalread/ask",
   requireAuth,
-  requireCredits("finalreadAsk"),
   asyncRoute(async (req: AuthedRequest, res) => {
-    const { question, audit, history: rawHistory } = req.body || {};
+    const userId = req.user!.id;
+    const { question, reportId, reviewId } = req.body || {};
     if (!question || typeof question !== "string" || !question.trim()) {
       return res.status(400).json({ error: "A question is required" });
     }
-    if (!audit || typeof audit !== "object") {
-      return res.status(400).json({ error: "An audit result is required to answer from" });
+    if (
+      (typeof reportId !== "string" || !reportId.trim()) &&
+      (typeof reviewId !== "string" || !reviewId.trim())
+    ) {
+      return res.status(400).json({ error: "A report id is required to answer from" });
     }
-    // History is client-held and sent with each ask; the server holds no
-    // conversation state. Malformed history is rejected before any
-    // shortcut or model call. The deterministic shortcuts below ignore
-    // history entirely — a follow-up that IS a runtime question still gets
-    // the fixed runtime decline, never an answer built from the previous
-    // turn's line numbers.
-    const validated = validateQaHistory(rawHistory);
-    if (validated.ok === false) {
-      return res.status(400).json({ error: validated.error });
+    // 0. Resolve the STORED report. A client-supplied audit or history in
+    // the body is IGNORED — the server loads the stored report and
+    // evidence by the report id (spec §5.4, §8). An unknown id is a 404,
+    // never an enumeration.
+    const target = await resolveAskTarget({
+      reportId: typeof reportId === "string" ? reportId.trim() : undefined,
+      reviewId: typeof reviewId === "string" ? reviewId.trim() : undefined,
+    });
+    if (!target) {
+      return res.status(404).json({ error: "Report not found." });
     }
-    const history = validated.history;
+    // 0b. Paid buyer-access FIRST, then the credit gate (spec §5.4, §10).
+    // A project review's Q&A belongs to the buyer who paid for it; the
+    // seller has no paid access and is rejected here (criterion 10) — the
+    // seller sees the Q&A log (read-only, §5.6 option (a)) but cannot ask.
+    // An entry-flow review (no project) belongs to the owner who paid for
+    // it themselves.
+    let authorized = false;
+    if (target.review.project_id) {
+      authorized = await hasBuyerAccess(userId, target.review.id);
+    } else {
+      authorized =
+        target.review.seller_user_id === userId &&
+        !!target.review.purchase_stripe_event_id;
+    }
+    if (!authorized) {
+      return res.status(403).json({
+        error: "This report's Q&A is only available to the buyer who paid for it.",
+      });
+    }
+    // The credit gate, after authorization (same 402 shape as before).
+    const check = await checkCredits(userId, "finalreadAsk");
+    if (check.ok === false) return res.status(402).json(check.body);
+
+    // Every 200 response with an answer is recorded as a Q&A turn on the
+    // version (spec §5.6): the seller sees the full log, the buyer resumes
+    // from it. 400/502 responses record nothing. A recording failure never
+    // fails the answer — the turn is best-effort, the answer is the product.
+    const recordTurn = async (answer: string, citedFindings: string[]) => {
+      try {
+        await appendQaTurn({
+          versionId: target.version.id,
+          reviewId: target.review.id,
+          buyerUserId: userId,
+          question: question.trim(),
+          answer,
+          citedFindings,
+        });
+      } catch (err: any) {
+        log.warn(`finalread/ask: could not record Q&A turn: ${err?.message || err}`);
+      }
+    };
+    const respond = async (payload: { answer: string; citedFindings?: string[]; [key: string]: any }) => {
+      await recordTurn(payload.answer, payload.citedFindings ?? []);
+      return res.json(payload);
+    };
+
+    // The conversation is server-held: the stored Q&A history for this
+    // version. A client-supplied history is ignored (spec §8). The
+    // deterministic shortcuts below ignore history entirely — a follow-up
+    // that IS a runtime question still gets the fixed runtime decline,
+    // never an answer built from the previous turn's line numbers.
+    const history = await getQaHistoryForVersion(target.version.id);
 
     // 1. Cost/time/effort questions: fixed reply, no model call, no charge.
     if (isNoEstimatesQuestion(question)) {
-      return res.json({
+      return respond({
         answer: NO_ESTIMATES_REPLY,
         citedFindings: [],
         declined: false,
@@ -314,10 +374,11 @@ router.post(
       });
     }
 
-    // 2. Rebuild the report server-side; never trust client-built buckets.
+    // 2. Rebuild the report server-side from the STORED audit; never trust
+    // client-built buckets (and never read a client-supplied audit).
     let report;
     try {
-      report = buildFinalReadReport(audit as FinalReadAuditInput);
+      report = buildFinalReadReport(target.audit as FinalReadAuditInput);
     } catch {
       return res.status(400).json({ error: "The audit result could not be read" });
     }
@@ -326,7 +387,7 @@ router.post(
     // no charge, and they can never decline.
     const starter = starterAnswer(question, report);
     if (starter) {
-      return res.json({
+      return respond({
         answer: starter.answer,
         citedFindings: starter.citedFindings,
         declined: false,
@@ -342,7 +403,7 @@ router.post(
     // evidence; otherwise the question falls through to the model.
     const payment = paymentAnswer(question, report);
     if (payment) {
-      return res.json({
+      return respond({
         answer: payment.answer,
         citedFindings: payment.citedFindings,
         declined: false,
@@ -356,7 +417,7 @@ router.post(
     // Fixed reply, no model call, no charge. Same response shape as the
     // model's own runtime tier (4a) so the client needs no new handling.
     if (isRuntimeQuestion(question)) {
-      return res.json({
+      return respond({
         declined: true,
         answer: RUNTIME_DECLINE_REPLY,
         citedFindings: [],
@@ -451,7 +512,7 @@ router.post(
         parsed.answer = PARTIAL_DECLINE_PREFIX + parsed.answer;
         // Falls through to 4b (citation check, already satisfied) and 5 (charge).
       } else if (parsed.declineTier === "runtime") {
-        return res.json({
+        return respond({
           declined: true,
           answer: RUNTIME_DECLINE_REPLY,
           citedFindings: [],
@@ -466,7 +527,7 @@ router.post(
           // nothing left to verify (the answer is grounded in the report
           // by construction, not by model judgment). Free by
           // construction: the decline path is never charged.
-          return res.json(labelFallbackResponse(labelResolution.label));
+          return respond(labelFallbackResponse(labelResolution.label));
         }
         const outcome = await verifyUnknownDecline(question, report, modelName);
         if (outcome.kind === "answer") {
@@ -478,7 +539,7 @@ router.post(
           }
           // Falls through to 4b (citation check) and 5 (charge once).
         } else {
-          return res.json({
+          return respond({
             declined: true,
             answer: outcome.answer,
             citedFindings: [],
@@ -493,9 +554,9 @@ router.post(
         // topic the report names), so the same fallback closes it.
         // Extension beyond §3.4's enumeration; recorded in spec §7.
         if (labelResolution.resolved === true) {
-          return res.json(labelFallbackResponse(labelResolution.label));
+          return respond(labelFallbackResponse(labelResolution.label));
         }
-        return res.json({
+        return respond({
           declined: true,
           answer: formatUnknownDecline(false),
           citedFindings: [],
@@ -513,9 +574,9 @@ router.post(
         // from the right topic but cited a paraphrase instead of the
         // label's exact title — the Q4 shape. Answer from the label
         // instead of discarding the question. Free by construction.
-        return res.json(labelFallbackResponse(labelResolution.label));
+        return respond(labelFallbackResponse(labelResolution.label));
       }
-      return res.json({
+      return respond({
         declined: true,
         answer: formatUncitedDecline(),
         citedFindings: [],
@@ -530,7 +591,7 @@ router.post(
       "ai finalread ask"
     );
     if (balance != null) res.set("X-Credits-Balance", String(balance));
-    return res.json({
+    return respond({
       answer: parsed.answer,
       citedFindings: parsed.citedFindings,
       declined: false,

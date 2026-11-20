@@ -1,4 +1,4 @@
-// FinalRead re-scan entitlements + the minimal frozen-version record.
+// FinalRead re-scan entitlements + the versioned review model.
 //
 // A $199 FinalRead Review buys one complete review plus 2 re-scans: after
 // the seller's developer modifies the code to fix findings, the buyer
@@ -8,13 +8,17 @@
 //
 // - Entitlements are granted at webhook time, idempotent on the Stripe
 //   event id (same rule as addCredits). They expire 90 days after purchase.
-// - The frozen version is the minimal pinned-version record the billing
-//   spec defines (version id + content hash + buyer + purchase). It is NOT
-//   the full transaction workflow: no invite links, no report-entry codes,
-//   no seller responses, no remediation loop. A scan of a frozen review
-//   compares the scanned files' content hash against the frozen hash:
-//   identical code is not a re-scan (no charge, no consumption), changed
-//   code is.
+// - The review is the overall diligence engagement (one per project, one
+//   buyer per project for the pilot). A review has immutable VERSION rows:
+//   one per code snapshot. A re-scan creates a NEW version row; it never
+//   overwrites the previous one (the old updateReviewVersionHash call is
+//   removed — see the seller project-saving spec, Revision 2, §6.4).
+// - The legacy `finalread_review_versions` table (frozen-version record:
+//   id + user_id + purchase + content_hash) is repurposed by the schema
+//   migration (server/finalread-projects.ts): its rows become
+//   `finalread_reviews` rows, and their content_hash becomes the initial
+//   version row's hash. The versions table is recreated with the version
+//   schema below.
 import crypto from "crypto";
 import { getDb } from "./store";
 
@@ -35,13 +39,28 @@ export interface RescanEntitlementRow {
   expires_at: string;
 }
 
-export interface ReviewVersionRow {
+/** The overall diligence engagement: one per project (one buyer per project for the pilot). */
+export interface FinalReadReviewRow {
   id: string;
-  user_id: string;
+  project_id: string | null;
+  seller_user_id: string;
   purchase_stripe_event_id: string | null;
-  content_hash: string;
+  /** DEPRECATED: kept for the legacy migration only. New reviews store NULL here; the hash lives on the version rows. */
+  content_hash: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** ONE immutable assessment of a particular code snapshot. Never updated. */
+export interface ReviewVersionRow {
+  id: string;
+  review_id: string;
+  project_id: string | null;
+  version_number: number;
+  content_hash: string;
+  audit_snapshot_id: string | null;
+  stripe_event_id: string | null;
+  created_at: string;
 }
 
 function expiryFor(purchasedAt: Date): Date {
@@ -149,36 +168,139 @@ export async function findLatestFinalReadPurchase(userId: string): Promise<strin
   return row ? row.stripe_event_id : null;
 }
 
-/** Create the frozen-version record for a first FinalRead review. */
-export async function createReviewVersion(
-  userId: string,
-  purchaseStripeEventId: string | null,
-  contentHash: string
-): Promise<ReviewVersionRow> {
-  const id = `frv_${crypto.randomUUID()}`;
+/**
+ * Create a review (the engagement) with its first version row. Used by the
+ * entry flow (no project): the caller is the buyer, the review is created
+ * from their scan, and the version row carries the scanned hash. The
+ * project flow creates its review the same way at the initial scan (via
+ * createFinalReadReview below, with a project id); the version row for a
+ * project review is created at payment time instead (see
+ * server/finalread-projects.ts), so this function is the entry-flow path.
+ */
+export async function createFinalReadReview(opts: {
+  sellerUserId: string;
+  projectId?: string | null;
+  purchaseStripeEventId?: string | null;
+  contentHash: string;
+  stripeEventId?: string | null;
+}): Promise<{ review: FinalReadReviewRow; version: ReviewVersionRow }> {
+  const db = getDb();
+  const reviewId = `frv_${crypto.randomUUID()}`;
+  const versionId = `frvv_${crypto.randomUUID()}`;
   const now = new Date().toISOString();
-  await getDb().run(
-    "INSERT INTO finalread_review_versions (id, user_id, purchase_stripe_event_id, content_hash, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6)",
-    [id, userId, purchaseStripeEventId, contentHash, now, now]
+  await db.run(
+    "INSERT INTO finalread_reviews (id, project_id, seller_user_id, purchase_stripe_event_id, content_hash, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    [
+      reviewId,
+      opts.projectId ?? null,
+      opts.sellerUserId,
+      opts.purchaseStripeEventId ?? null,
+      null,
+      now,
+      now,
+    ]
   );
-  const row = await getDb().get<ReviewVersionRow>(
+  await db.run(
+    "INSERT INTO finalread_review_versions (id, review_id, project_id, version_number, content_hash, audit_snapshot_id, stripe_event_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    [
+      versionId,
+      reviewId,
+      opts.projectId ?? null,
+      1,
+      opts.contentHash,
+      null,
+      opts.stripeEventId ?? opts.purchaseStripeEventId ?? null,
+      now,
+    ]
+  );
+  const review = await db.get<FinalReadReviewRow>(
+    "SELECT * FROM finalread_reviews WHERE id = $1",
+    [reviewId]
+  );
+  const version = await db.get<ReviewVersionRow>(
+    "SELECT * FROM finalread_review_versions WHERE id = $1",
+    [versionId]
+  );
+  if (!review || !version) throw new Error("Failed to create FinalRead review");
+  return { review, version };
+}
+
+/** Create one immutable version row for an existing review. */
+export async function createReviewVersionRow(opts: {
+  reviewId: string;
+  projectId?: string | null;
+  versionNumber: number;
+  contentHash: string;
+  auditSnapshotId?: string | null;
+  stripeEventId?: string | null;
+}): Promise<ReviewVersionRow> {
+  const db = getDb();
+  const id = `frvv_${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
+  await db.run(
+    "INSERT INTO finalread_review_versions (id, review_id, project_id, version_number, content_hash, audit_snapshot_id, stripe_event_id, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    [
+      id,
+      opts.reviewId,
+      opts.projectId ?? null,
+      opts.versionNumber,
+      opts.contentHash,
+      opts.auditSnapshotId ?? null,
+      opts.stripeEventId ?? null,
+      now,
+    ]
+  );
+  const row = await db.get<ReviewVersionRow>(
     "SELECT * FROM finalread_review_versions WHERE id = $1",
     [id]
   );
-  if (!row) throw new Error("Failed to create frozen review version");
+  if (!row) throw new Error("Failed to create review version");
   return row;
 }
 
+/** A version row by its id. */
 export async function getReviewVersion(id: string): Promise<ReviewVersionRow | undefined> {
-  return getDb().get<ReviewVersionRow>("SELECT * FROM finalread_review_versions WHERE id = $1", [
-    id,
-  ]);
+  return getDb().get<ReviewVersionRow>(
+    "SELECT * FROM finalread_review_versions WHERE id = $1",
+    [id]
+  );
 }
 
-/** The scanned code changed: the new version becomes the frozen one. */
-export async function updateReviewVersionHash(id: string, contentHash: string): Promise<void> {
-  await getDb().run(
-    "UPDATE finalread_review_versions SET content_hash = $1, updated_at = $2 WHERE id = $3",
-    [contentHash, new Date().toISOString(), id]
+/** All versions of a review, oldest first. */
+export async function getReviewVersions(reviewId: string): Promise<ReviewVersionRow[]> {
+  return getDb().all<ReviewVersionRow>(
+    "SELECT * FROM finalread_review_versions WHERE review_id = $1 ORDER BY version_number ASC, created_at ASC",
+    [reviewId]
   );
+}
+
+/** The latest version of a review (the current frozen version), if any. */
+export async function getLatestReviewVersion(
+  reviewId: string
+): Promise<ReviewVersionRow | undefined> {
+  return getDb().get<ReviewVersionRow>(
+    "SELECT * FROM finalread_review_versions WHERE review_id = $1 ORDER BY version_number DESC, created_at DESC LIMIT 1",
+    [reviewId]
+  );
+}
+
+/**
+ * A review with its latest version. Returns undefined when the review does
+ * not exist; version is undefined when the review has no version row yet
+ * (a project review whose report has not been generated — the missing-audit
+ * edge case).
+ */
+export async function getFinalReadReview(
+  reviewId: string
+): Promise<
+  | { review: FinalReadReviewRow; version: ReviewVersionRow | undefined }
+  | undefined
+> {
+  const review = await getDb().get<FinalReadReviewRow>(
+    "SELECT * FROM finalread_reviews WHERE id = $1",
+    [reviewId]
+  );
+  if (!review) return undefined;
+  const version = await getLatestReviewVersion(reviewId);
+  return { review, version };
 }

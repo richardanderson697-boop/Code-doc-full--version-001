@@ -1,7 +1,9 @@
 // FinalRead ask route: the double-check, charging, and note-scoping wiring
 // that pure guardrail tests can't see. Model calls, auth, and billing are
 // mocked; the report build, citation check, and decline routing are real.
-import { describe, it, expect, vi, beforeEach } from "vitest";
+// The route answers from a STORED report (spec §5.4, §8): the tests seed
+// stored reports from the audit fixtures and ask by report id.
+import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
 import express from "express";
 import request from "supertest";
 
@@ -27,6 +29,7 @@ vi.mock("../server/middleware/requireAuth", () => ({
     next();
   },
   requireCredits: () => (_req: any, _res: any, next: any) => next(),
+  checkCredits: async () => ({ ok: true }),
 }));
 
 vi.mock("../server/credits", () => ({
@@ -40,6 +43,9 @@ import {
 } from "../server/anthropic";
 import { chargeForCall } from "../server/credits";
 import finalreadRouter from "../server/routes/finalread";
+import { initStore, getDb } from "../server/store";
+import { createFinalReadReview } from "../server/finalread-rescans";
+import { appendQaTurn, createVersionReport } from "../server/finalread-projects";
 import {
   PARTIAL_DECLINE_PREFIX,
   RUNTIME_DECLINE_REPLY,
@@ -53,6 +59,56 @@ const mockedClaude = vi.mocked(generateWithClaude);
 const mockedGeminiGenerate = vi.mocked(ai.models.generateContent);
 const mockedClaudeConfigured = vi.mocked(isClaudeConfigured);
 const mockedCharge = vi.mocked(chargeForCall);
+
+// Stored reports the route answers from (spec §5.4, §8). The ask route
+// loads the report by id from the store; the audit fixtures below are the
+// seed data, never a request field. The seeded reviews are entry-flow
+// (no project): the owner ("test-user") paid for them, so the route's
+// paid-buyer authorization passes.
+let reportId = "";
+let reportVersionId = "";
+let reportReviewId = "";
+let whistleReportId = "";
+let whistleReportVersionId = "";
+let paymentReportId = "";
+let paymentReportVersionId = "";
+
+async function seedReport(
+  auditInput: any,
+  tag: string
+): Promise<{ reviewId: string; reportId: string; versionId: string }> {
+  const { review } = await createFinalReadReview({
+    sellerUserId: "test-user",
+    projectId: null,
+    purchaseStripeEventId: `evt_test_seed_${tag}`,
+    contentHash: `seedhash_${tag}`,
+    stripeEventId: `evt_test_seed_${tag}`,
+  });
+  const { version, report } = await createVersionReport(getDb(), {
+    reviewId: review.id,
+    projectId: null,
+    versionNumber: 2,
+    contentHash: `seedhash_${tag}`,
+    audit: auditInput,
+    stripeEventId: `evt_test_seed_${tag}`,
+  });
+  return { reviewId: review.id, reportId: report.id, versionId: version.id };
+}
+
+beforeAll(async () => {
+  await initStore();
+  const db = getDb();
+  await db.run(
+    db.dialect === "postgres"
+      ? "INSERT INTO users (id, email, password_hash, password_salt, credits_balance, created_at) VALUES ($1, $2, $3, $4, 0, $5) ON CONFLICT (id) DO NOTHING"
+      : "INSERT OR IGNORE INTO users (id, email, password_hash, password_salt, credits_balance, created_at) VALUES ($1, $2, $3, $4, 0, $5)",
+    ["test-user", "test-user@x.io", "x", "y", new Date().toISOString()]
+  );
+  const seeded = await seedReport(audit, "main");
+  reportId = seeded.reportId;
+  reportVersionId = seeded.versionId;
+  reportReviewId = seeded.reviewId;
+});
 
 const audit = {
   projectTitle: "Test App",
@@ -107,7 +163,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it use speech synthesis?", audit });
+      .send({ question: "Does it use speech synthesis?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
@@ -132,7 +188,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it use speech synthesis?", audit });
+      .send({ question: "Does it use speech synthesis?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
@@ -151,7 +207,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it mention quantum flux?", audit });
+      .send({ question: "Does it mention quantum flux?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
@@ -166,7 +222,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it mention quantum flux?", audit });
+      .send({ question: "Does it mention quantum flux?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
@@ -181,7 +237,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it mention quantum flux?", audit });
+      .send({ question: "Does it mention quantum flux?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
@@ -204,7 +260,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Are ElevenLabs keys stored?", audit });
+      .send({ question: "Are ElevenLabs keys stored?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
@@ -219,7 +275,7 @@ describe("finalread ask double-check", () => {
     // any model call, so the model must never be consulted.
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "What happens under load?", audit });
+      .send({ question: "What happens under load?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
@@ -243,7 +299,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "How does it behave when traffic grows?", audit });
+      .send({ question: "How does it behave when traffic grows?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
@@ -265,7 +321,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it use quantum flux?", audit });
+      .send({ question: "Does it use quantum flux?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
@@ -278,7 +334,7 @@ describe("finalread ask double-check", () => {
   it("keeps the note off estimate replies and makes no model call", async () => {
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "How much will it cost to fix?", audit });
+      .send({ question: "How much will it cost to fix?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.answer).not.toContain(FREE_DECLINE_REPHRASE_NOTE);
@@ -301,7 +357,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Are ElevenLabs keys stored?", audit });
+      .send({ question: "Are ElevenLabs keys stored?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
@@ -322,7 +378,7 @@ describe("finalread ask double-check", () => {
 
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it use quantum flux?", audit });
+      .send({ question: "Does it use quantum flux?", reportId });
 
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
@@ -333,6 +389,9 @@ describe("finalread ask double-check", () => {
 });
 
 describe("finalread ask multi-turn conversation", () => {
+  // The conversation is server-held (spec §8): turns are recorded on the
+  // version by every 200 answer, and the next ask loads them. A
+  // client-supplied history is ignored.
   const history = [
     {
       question: "What's the biggest risk?",
@@ -342,10 +401,20 @@ describe("finalread ask multi-turn conversation", () => {
   ];
 
   it("carries prior turns into the model prompt, after the report, and charges once", async () => {
+    // Seed the stored turn the follow-up should carry (the route loads
+    // the version's Q&A history; the client-sent history below is ignored).
+    await appendQaTurn({
+      versionId: reportVersionId,
+      reviewId: reportReviewId,
+      buyerUserId: "test-user",
+      question: "What's the biggest risk?",
+      answer: "The biggest risk is the hardcoded secret.",
+      citedFindings: ["Hardcoded secret"],
+    });
     firstCall(groundedCandidate());
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "What about the second finding?", audit, history });
+      .send({ question: "What about the second finding?", reportId, history });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     const contents = String(mockedFallback.mock.calls[0][0].contents);
@@ -358,7 +427,9 @@ describe("finalread ask multi-turn conversation", () => {
     expect(mockedCharge).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects malformed history with 400 and makes no model call", async () => {
+  it("ignores client-supplied history, malformed or not, and makes no model call for a starter", async () => {
+    // The conversation is server-held: a client-sent history — even a
+    // malformed one — is ignored, never validated and never a 400.
     for (const bad of [
       "nope",
       [{ question: 1, answer: "x", citedFindings: [] }],
@@ -366,8 +437,9 @@ describe("finalread ask multi-turn conversation", () => {
     ]) {
       const res = await request(app())
         .post("/api/finalread/ask")
-        .send({ question: "Is this app finished?", audit, history: bad });
-      expect(res.status).toBe(400);
+        .send({ question: "What's the biggest risk?", reportId, history: bad });
+      expect(res.status).toBe(200);
+      expect(res.body.starter).toBe(true);
     }
     expect(mockedFallback).not.toHaveBeenCalled();
     expect(mockedCharge).not.toHaveBeenCalled();
@@ -376,7 +448,7 @@ describe("finalread ask multi-turn conversation", () => {
   it("still gives a runtime follow-up the fixed decline, free, with no model call", async () => {
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "What happens if the server goes down?", audit, history });
+      .send({ question: "What happens if the server goes down?", reportId, history });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
     expect(res.body.answer).toBe(RUNTIME_DECLINE_REPLY);
@@ -388,7 +460,7 @@ describe("finalread ask multi-turn conversation", () => {
   it("still answers a starter pill deterministically as a follow-up, free", async () => {
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "What's the biggest risk?", audit, history });
+      .send({ question: "What's the biggest risk?", reportId, history });
     expect(res.status).toBe(200);
     expect(res.body.starter).toBe(true);
     expect(res.body.declined).toBe(false);
@@ -399,7 +471,7 @@ describe("finalread ask multi-turn conversation", () => {
   it("still gives a no-estimates follow-up the fixed reply, free", async () => {
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "How much would it cost to fix?", audit, history });
+      .send({ question: "How much would it cost to fix?", reportId, history });
     expect(res.status).toBe(200);
     expect(res.body.noEstimates).toBe(true);
     expect(res.body.answer).toBe(NO_ESTIMATES_REPLY);
@@ -407,7 +479,10 @@ describe("finalread ask multi-turn conversation", () => {
     expect(mockedCharge).not.toHaveBeenCalled();
   });
 
-  it("declines free when a follow-up answer cites a finding that only exists in history", async () => {
+  it("declines free when a follow-up answer cites a finding that only exists in client-sent history", async () => {
+    // The phantom finding lives only in the client-sent history, which
+    // the server ignores — so the model's citation of it is still
+    // ungrounded in the report and declines free.
     const phantomHistory = [
       {
         question: "Is there a flux capacitor?",
@@ -424,7 +499,7 @@ describe("finalread ask multi-turn conversation", () => {
       .post("/api/finalread/ask")
       .send({
         question: "Tell me more about the flux capacitor.",
-        audit,
+        reportId,
         history: phantomHistory,
       });
     expect(res.status).toBe(200);
@@ -492,11 +567,31 @@ describe("finalread ask label resolver (general label fix)", () => {
     findings: [DEAD(18), DEAD(28), DEAD(38), MOCKED],
   };
 
+  beforeAll(async () => {
+    const whistle = await seedReport(whistleStopAudit, "whistle");
+    whistleReportId = whistle.reportId;
+    whistleReportVersionId = whistle.versionId;
+    const payment = await seedReport(paymentAudit, "payment");
+    paymentReportId = payment.reportId;
+    paymentReportVersionId = payment.versionId;
+    // The buyer-dive regression seeds a stored turn on the payment
+    // report's version, so the follow-up's prompt carries the server-held
+    // conversation (client-supplied history is ignored, spec §8).
+    await appendQaTurn({
+      versionId: payment.versionId,
+      reviewId: payment.reviewId,
+      buyerUserId: "test-user",
+      question: "does this application accept payments",
+      answer: "No working payment path was found.",
+      citedFindings: ['Dead "Get Started" button — no handler'],
+    });
+  });
+
   it("pins the resolved label into the model prompt", async () => {
     firstCall(groundedCandidate());
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+      .send({ question: "Does user authentication work?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     const contents = String(mockedFallback.mock.calls[0][0].contents);
     expect(contents).toMatch(/THIS QUESTION IS ABOUT: Authentication/);
@@ -508,7 +603,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     firstCall(unknownCandidate(), "gemini-3.6-flash");
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+      .send({ question: "Does user authentication work?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.starter).toBe(true);
@@ -537,7 +632,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     );
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+      .send({ question: "Does user authentication work?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.starter).toBe(true);
@@ -554,7 +649,7 @@ describe("finalread ask label resolver (general label fix)", () => {
       .send({
         question:
           "Is this strictly a developer tool or can investors use it to understand software?",
-        audit: whistleStopAudit,
+        reportId: whistleReportId,
       });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
@@ -570,7 +665,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     firstCall(unknownCandidate(), "gemini-3.6-flash");
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Is there an investor view?", audit: whistleStopAudit });
+      .send({ question: "Is there an investor view?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.starter).toBe(true);
@@ -591,7 +686,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     );
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+      .send({ question: "Does user authentication work?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.answer).toBe("Authentication is a gap: there is no login flow.");
@@ -611,7 +706,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     );
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+      .send({ question: "Does user authentication work?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.answer.startsWith(PARTIAL_DECLINE_PREFIX)).toBe(true);
@@ -633,7 +728,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     );
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does user authentication work?", audit: whistleStopAudit });
+      .send({ question: "Does user authentication work?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.starter).toBe(true);
@@ -650,7 +745,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     } as any);
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it mention quantum flux?", audit: whistleStopAudit });
+      .send({ question: "Does it mention quantum flux?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
     expect(res.body.answer).toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
@@ -670,7 +765,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     } as any);
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "what is the worst problem?", audit: whistleStopAudit });
+      .send({ question: "what is the worst problem?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     const contents = String(mockedFallback.mock.calls[0][0].contents);
     expect(contents).toMatch(/MORE THAN ONE SECTION OF THE REVIEW/);
@@ -699,7 +794,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     } as any);
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "Does it mention quantum flux?", audit });
+      .send({ question: "Does it mention quantum flux?", reportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(true);
     expect(res.body.answer).not.toContain(DOUBLE_CHECKED_DECLINE_PREFIX);
@@ -718,7 +813,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     );
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "How do users login?", audit: whistleStopAudit });
+      .send({ question: "How do users login?", reportId: whistleReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.answer).toMatch(/no login flow/);
@@ -734,7 +829,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     ]) {
       const res = await request(app())
         .post("/api/finalread/ask")
-        .send({ question: q, audit: paymentAudit });
+        .send({ question: q, reportId: paymentReportId });
       expect(res.status).toBe(200);
       expect(res.body.declined).toBe(false);
       expect(res.body.starter).toBe(true);
@@ -757,14 +852,9 @@ describe("finalread ask label resolver (general label fix)", () => {
     // function, the buyer dives into a specific one. "What does the
     // checkout button do?" is not a payment-classifier question (no
     // payment verb), so it reaches the model with the dead-button label
-    // pinned — and the grounded answer charges exactly once.
-    const history = [
-      {
-        question: "does this application accept payments",
-        answer: "No working payment path was found.",
-        citedFindings: ['Dead "Get Started" button — no handler'],
-      },
-    ];
+    // pinned — and the grounded answer charges exactly once. The prior
+    // turn is the STORED one (seeded in beforeAll on the payment
+    // report's version); no client-sent history is needed.
     firstCall(
       {
         answer: "The Get Started button does nothing when clicked.",
@@ -775,7 +865,7 @@ describe("finalread ask label resolver (general label fix)", () => {
     );
     const res = await request(app())
       .post("/api/finalread/ask")
-      .send({ question: "What does the checkout button do?", audit: paymentAudit, history });
+      .send({ question: "What does the checkout button do?", reportId: paymentReportId });
     expect(res.status).toBe(200);
     expect(res.body.declined).toBe(false);
     expect(res.body.answer).toMatch(/does nothing when clicked/);
