@@ -2170,7 +2170,11 @@ function findingCategories(f: PreFlightFinding): CategoryKey[] {
 // rubric categories its findings are about. Deliberate: an auth finding hits
 // authentication AND security (two legitimate dimensions of the same defect),
 // but never a third category via keyword coincidence.
-const PROBE_CATEGORY_MAP: Record<string, CategoryKey[]> = {
+// Gap detectors (finalread-gap-detectors-spec.md, APPROVED 2026-11-20):
+// the five first-party probes below are additive entries; the map is
+// exported so the gap-detector test can assert each probe name maps to
+// its categories (a probe name drifting from its map entry must fail).
+export const PROBE_CATEGORY_MAP: Record<string, CategoryKey[]> = {
   "API Route Auth": ["authentication", "security"],
   "Demo Bypass": ["authentication", "security"],
   "Auth Weakness": ["authentication", "security"],
@@ -2214,6 +2218,11 @@ const PROBE_CATEGORY_MAP: Record<string, CategoryKey[]> = {
   "GitHub Actions": ["security", "backgroundAutomation"],
   "Iframe Sandbox": ["security"],
   "Python Security": ["security"],
+  "Rate Limit": ["authentication", "security"],
+  "CSRF Protection": ["authentication", "security"],
+  "Debug Mode": ["security"],
+  "Secret Logging": ["security"],
+  "File Upload Validation": ["security"],
 };
 
 // ---------------------------------------------------------------------------
