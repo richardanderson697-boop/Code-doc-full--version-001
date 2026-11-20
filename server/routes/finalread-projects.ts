@@ -21,6 +21,7 @@ import {
   closeFinalReadProject,
   createFinalReadProject,
   createInviteCode,
+  generateReportForPaidEntryReview,
   getFinalReadProjectForSeller,
   getInviteCodesForProject,
   getLatestReportForReview,
@@ -223,9 +224,22 @@ router.get("/api/finalread/reviews/:id/report", requireAuth, asyncRoute(async (r
   const userId = req.user!.id;
   const found = await getFinalReadReview(req.params.id);
   if (!found) return res.status(404).json({ error: "Review not found." });
-  const review = found.review;
+  let review = found.review;
   const isSeller = review.seller_user_id === userId;
   const isBuyer = await hasBuyerAccess(userId, review.id);
+  // Lazy entry-report generation (gate spec §5): an entry-flow review
+  // has no project and no invite code, so no webhook generates its
+  // report. The first paid fetch generates it from the stored pending
+  // audit — the payment-time trigger for the entry flow. A seller who
+  // has not paid gets nothing generated (the helper returns undefined)
+  // and the 403 below still answers.
+  if (isSeller && !review.project_id) {
+    const generated = await generateReportForPaidEntryReview(review.id, userId);
+    if (generated) {
+      const refound = await getFinalReadReview(review.id);
+      if (refound) review = refound.review;
+    }
+  }
   const paid = !!review.purchase_stripe_event_id;
   if (!isBuyer && !(isSeller && paid)) {
     return res.status(403).json({ error: "This report is only available to the buyer who paid for it." });

@@ -1,8 +1,10 @@
-// FinalRead stakeholder overlay: the business-UI view of an audit result for
-// a non-technical decision maker. Everything on screen is built from the real
-// audit result via shared/finalread-report.ts — no code, no file paths, no
-// diffs on this surface. Plain Tailwind utilities (no global CSS), so the
-// overlay cannot affect the rest of the app.
+// FinalRead stakeholder overlay: the business-UI view of a STORED paid
+// report for a non-technical decision maker. The report is the stored
+// finalread_reports row (built server-side at payment from the pending
+// audit) — the overlay never builds a report from a client-supplied audit
+// (stakeholder-view gate spec §2). No code, no file paths, no diffs on
+// this surface. Plain Tailwind utilities (no global CSS), so the overlay
+// cannot affect the rest of the app.
 //
 // Print: the overlay is portaled to document.body, and index.css hides #root
 // in print while this view is open, so printing yields only the report.
@@ -30,9 +32,9 @@ import {
 import { apiFetch } from "../../utils/apiFetch";
 import { speakText, stopSpeech } from "../../utils/speechUtils";
 import {
-  buildFinalReadReport,
   type FinalReadAuditInput,
   type FinalReadBucketItem,
+  type FinalReadReport,
 } from "../../../shared/finalread-report";
 import {
   renderMultiFindingPacket,
@@ -80,7 +82,9 @@ function deterministicFindings(intelResult: any): Array<{
 }
 
 /** Convert the workspace intelligence result into the overlay's audit input.
- *  Exported so the host panel (IntelligenceReport) can build it. */
+ *  Retained for the mapping tests (test/finalread-overlay-mapping.test.ts).
+ *  NO render path uses it anymore: the overlay renders only a stored paid
+ *  report (gate spec §2), so a raw scan audit never reaches the overlay. */
 export function intelResultToFinalReadInput(
   intelResult: any,
   projectTitle?: string
@@ -298,13 +302,16 @@ function BucketSection({
 }
 
 export default function FinalReadOverlay({
-  audit,
+  report,
+  reportId,
   onClose,
 }: {
-  audit: FinalReadAuditInput;
+  /** The STORED paid report (a finalread_reports row, built server-side at payment). The overlay renders it as-is — it never builds a report from a client-supplied audit (gate spec §2). */
+  report: FinalReadReport;
+  /** The stored report's id — what the Q&A route answers from (spec §5.4). */
+  reportId: string;
   onClose: () => void;
 }) {
-  const report = useMemo(() => buildFinalReadReport(audit), [audit]);
 
   // Q&A state — a thread, not a single answer. Each turn keeps its
   // question, answer, cited findings, and decline state, so follow-ups
@@ -370,17 +377,15 @@ export default function FinalReadOverlay({
     stopSpeech();
     setSpeakingIdx(null);
     try {
+      // The Q&A route answers from the STORED report by id (spec §5.4):
+      // a client-supplied audit or history in the body is ignored
+      // server-side, so none is sent.
       const res = await apiFetch("/api/finalread/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           question: trimmed,
-          audit,
-          history: qaThread.map((t) => ({
-            question: t.question,
-            answer: t.answer,
-            citedFindings: t.citedFindings,
-          })),
+          reportId,
         }),
       });
       const data = await res.json().catch(() => ({}));

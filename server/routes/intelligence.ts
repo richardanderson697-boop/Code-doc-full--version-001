@@ -10,7 +10,6 @@ import { chargeForCall } from "../credits";
 import { runIntelligenceScan } from "../intelligence-scan";
 import {
   consumeRescanEntitlement,
-  createFinalReadReview,
   findLatestFinalReadPurchase,
   findUsableEntitlement,
   getFinalReadReview,
@@ -22,6 +21,7 @@ import {
 } from "../finalread-rescans";
 import {
   createAuditSnapshot,
+  createEntryReview,
   createProjectReview,
   createVersionReport,
   deletePendingAuditSnapshots,
@@ -69,7 +69,18 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
         ? body.projectId.trim()
         : undefined;
     if (finalreadReviewIdEarly && !projectIdEarly) {
-      return res.status(400).json({ error: "A re-scan must carry the project id." });
+      // Entry-flow reviews have no project: a re-run names only the
+      // review id. The project-id requirement binds PROJECT re-scans to
+      // their saved project; an entry review (project_id NULL) has no
+      // project to bind to, and the FinalRead decision below still
+      // authorizes the caller (seller or paid buyer) and 404s strangers —
+      // so this only lets a known entry review past the fast-fail.
+      // (Build decision: the entry re-run previously 400d here, which
+      // blocked the paid re-scan for entry reviews — gate spec §8.)
+      const entryReview = await getFinalReadReview(finalreadReviewIdEarly);
+      if (!entryReview || entryReview.review.project_id) {
+        return res.status(400).json({ error: "A re-scan must carry the project id." });
+      }
     }
 
     // Project binding (spec §7.1, §11). A projectId routes the scan
@@ -250,7 +261,10 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
         if (!review) {
           return res.status(404).json({ error: "Review not found." });
         }
-        if (review.project_id !== projectId) {
+        // NULL (an entry-flow review, no project) and undefined (no
+        // projectId in the request) both mean "no project" — compare them
+        // as equal, or every entry re-run 400s here.
+        if ((review.project_id ?? undefined) !== projectId) {
           return res.status(400).json({ error: "That review does not belong to this project." });
         }
         pendingSnapshot = await getPendingAuditSnapshot(review.id);
@@ -391,14 +405,23 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
         parsedIntel.finalreadReportId = report.id;
         parsedIntel.projectId = review.project_id;
       } else if (body.finalread === true) {
-        // Entry flow (no project): a first review freezes version 1 now.
+        // Entry flow (no project): the review is created with NO version
+        // row, and the scan's audit is stored as a PENDING audit keyed by
+        // this review id (gate spec §5 — the same pending-audit mechanism
+        // as a project initial scan). Version 1 + the report are created
+        // at payment time from the pending audit, so the report can be
+        // generated without a second scan. The caller already holding a
+        // $199 purchase is recorded from creation (as before); a purchase
+        // that lands after the scan is claimed at the first paid report
+        // fetch (generateReportForPaidEntryReview).
         const purchaseEventId = await findLatestFinalReadPurchase(userId);
-        const { review: newReview } = await createFinalReadReview({
-          sellerUserId: userId,
-          projectId: null,
-          purchaseStripeEventId: purchaseEventId,
+        const newReview = await createEntryReview(userId, purchaseEventId);
+        await createAuditSnapshot({
+          reviewId: newReview.id,
+          versionId: null,
+          audit: parsedIntel,
           contentHash,
-          stripeEventId: purchaseEventId,
+          status: "pending",
         });
         parsedIntel.finalreadReviewId = newReview.id;
       }
