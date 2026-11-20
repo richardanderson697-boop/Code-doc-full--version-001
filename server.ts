@@ -15,6 +15,7 @@ import coldAuditRouter from "./server/routes/cold-audit";
 import workspaceRouter from "./server/routes/workspace";
 import intelligenceRouter from "./server/routes/intelligence";
 import finalreadRouter from "./server/routes/finalread";
+import finalreadProjectsRouter from "./server/routes/finalread-projects";
 import { ensureOpengrepBinary } from "./server/preflight/opengrep/runner";
 import { warnIfEphemeralDataDir } from "./server/db";
 
@@ -71,6 +72,7 @@ app.use(coldAuditRouter);
 app.use(workspaceRouter);
 app.use(intelligenceRouter);
 app.use(finalreadRouter);
+app.use(finalreadProjectsRouter);
 
 // Global Error Handling Middleware to catch JSON body parsing & payload limits
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

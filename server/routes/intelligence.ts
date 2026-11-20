@@ -1,39 +1,38 @@
-﻿// Whole-workspace project intelligence route.
+// Whole-workspace project intelligence route.
 import { Router } from "express";
 import { asyncRoute } from "../async-route";
-import { formatGeminiError, generateWithFallback, extractUsage } from "../gemini";
+import { formatGeminiError } from "../gemini";
 import { WorkspaceFile, cleanWorkspacePath, countLines } from "../workspace";
-import { listWorkspaceFiles, getWorkspaceFile, getWorkspaceSource } from "../workspace-store";
-import {
-  findReadmeFile,
-  extractReadmeTitle,
-  extractReadmeTagline,
-} from "../readme-identity";
-import { runPreFlightScan, formatFindingsForPrompt } from "../preflight-scan";
-import type { PreFlightReport } from "../../shared/preflight-types";
-import {
-  computeDeterministicAssessment,
-  formatAssessmentForPrompt,
-  fallbackReason,
-  fallbackMissingReason,
-  CATEGORY_KEYS,
-  type CategoryKey,
-} from "../deterministic-score";
-import { verifyReportCitations, repairImportMap } from "../citation-verify";
+import { listWorkspaceFiles, getWorkspaceFile } from "../workspace-store";
 import { log } from "../logger";
 import { requireAuth, checkCredits, AuthedRequest } from "../middleware/requireAuth";
 import { chargeForCall } from "../credits";
+import { runIntelligenceScan } from "../intelligence-scan";
 import {
   consumeRescanEntitlement,
-  createReviewVersion,
+  createFinalReadReview,
   findLatestFinalReadPurchase,
   findUsableEntitlement,
-  getReviewVersion,
+  getFinalReadReview,
+  getLatestReviewVersion,
   hashReviewContent,
-  updateReviewVersionHash,
+  type FinalReadReviewRow,
   type RescanEntitlementRow,
   type ReviewVersionRow,
 } from "../finalread-rescans";
+import {
+  createAuditSnapshot,
+  createProjectReview,
+  createVersionReport,
+  deletePendingAuditSnapshots,
+  getFinalReadProject,
+  getPendingAuditSnapshot,
+  hasBuyerAccess,
+  setProjectReview,
+  type AuditSnapshotRow,
+  type FinalReadProjectRow,
+} from "../finalread-projects";
+import { getDb } from "../store";
 
 const router = Router();
 
@@ -50,34 +49,87 @@ const MAX_INTEL_TOTAL_BYTES = 5 * 1024 * 1024;
 // of unchanged code — skips the gate entirely, and that decision needs
 // the resolved files (the content hash) before it can be made. The gate
 // itself is unchanged (min balance 40, same 402 shape) for every
-// credit-charged run.
+// credit-charged run. A seller's initial scan of a saved FinalRead project
+// skips the gate too (spec §7.1, §10) — but only when all four conditions
+// hold (draft project, caller is the seller, no review yet, server-loaded
+// saved files); anything else pays the normal gate.
 router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
-  // Hoisted so the error path can return it: the deterministic scan runs
-  // before the model call, so a model outage should still hand the client
-  // the findings instead of a bare error (same contract as cold-audit).
-  let preflight: PreFlightReport | undefined;
-  let calibratedPreflight: PreFlightReport | undefined;
   try {
-    let files: WorkspaceFile[] = [];
     const userId = req.user!.id;
+    const body = (req.body as any) ?? {};
+    // A re-scan must carry the project id (spec §11) — checked before any
+    // file resolution, so the answer is a 400 whether or not the caller
+    // has workspace files of their own.
+    const finalreadReviewIdEarly =
+      typeof body.finalreadReviewId === "string" && body.finalreadReviewId.trim()
+        ? body.finalreadReviewId.trim()
+        : undefined;
+    const projectIdEarly =
+      typeof body.projectId === "string" && body.projectId.trim()
+        ? body.projectId.trim()
+        : undefined;
+    if (finalreadReviewIdEarly && !projectIdEarly) {
+      return res.status(400).json({ error: "A re-scan must carry the project id." });
+    }
+
+    // Project binding (spec §7.1, §11). A projectId routes the scan
+    // through the seller's saved project, loaded server-side from the
+    // SELLER's workspace — whoever the caller is (a buyer re-scanning
+    // reads the seller's code, never their own workspace and never a
+    // client-supplied source). The fetch is deliberately NOT owner-scoped
+    // here: authorization happens in the FinalRead decision below, via
+    // the review (the seller or a paid buyer); the seller-only project
+    // endpoints in routes/finalread-projects.ts stay owner-scoped.
+    let project: FinalReadProjectRow | undefined;
+    const projectId =
+      typeof body.projectId === "string" && body.projectId.trim()
+        ? body.projectId.trim()
+        : undefined;
+    if (projectId) {
+      project = await getFinalReadProject(projectId);
+      if (!project) return res.status(404).json({ error: "Project not found." });
+      // A project scan never takes a client-supplied source: the buyer
+      // never supplies a path or code, and the seller's initial scan runs
+      // from the saved project files only. Client-supplied codeFiles or
+      // paths with a projectId are rejected, not silently ignored (§11).
+      if (Array.isArray(body.codeFiles) && body.codeFiles.length > 0) {
+        return res.status(400).json({
+          error: "A project scan runs from the saved project files; codeFiles are not accepted with a projectId.",
+        });
+      }
+      if (Array.isArray(body.paths) && body.paths.length > 0) {
+        return res.status(400).json({
+          error: "A project scan runs from the saved project files; paths are not accepted with a projectId.",
+        });
+      }
+    }
+
+    // Source selection, in priority order. The client may name the exact
+    // source it wants scored; the server never guesses.
+    let files: WorkspaceFile[] = [];
     // Only the whole-workspace run may donate a README title or an import
     // source to the report header: selected paths and pasted code are
     // fragments, and their README (if any) is not the project's identity.
     let fromWorkspace = false;
 
-    // Source selection, in priority order. The client may name the exact
-    // source it wants scored; the server never guesses.
-    //
-    // 1. codeFiles: raw code supplied by the client (e.g. the active editor
-    //    code). Virtual files: the path is a display label only, the content
-    //    never touches disk.
-    const codeFiles = (req.body as any)?.codeFiles;
-    if (Array.isArray(codeFiles) && codeFiles.length > 0) {
-      if (codeFiles.length > MAX_INTEL_FILES) {
+    if (project) {
+      // 0. A project scan: the seller's saved project files, loaded
+      //    server-side from the SELLER's workspace. Nothing client-supplied
+      //    reaches the scan.
+      const saved = await listWorkspaceFiles(project.seller_user_id);
+      if (saved.length > 0) {
+        files = saved.map((f) => ({ path: f.path, content: f.content, lineCount: f.lineCount }));
+        fromWorkspace = true;
+      }
+    } else if (Array.isArray(body.codeFiles) && body.codeFiles.length > 0) {
+      // 1. codeFiles: raw code supplied by the client (e.g. the active editor
+      //    code). Virtual files: the path is a display label only, the content
+      //    never touches disk.
+      if (body.codeFiles.length > MAX_INTEL_FILES) {
         return res.status(400).json({ error: `Too many files (limit ${MAX_INTEL_FILES}).` });
       }
       let totalChars = 0;
-      for (const f of codeFiles) {
+      for (const f of body.codeFiles) {
         if (!f || typeof f.path !== "string" || typeof f.content !== "string") {
           return res.status(400).json({ error: "Each code file needs a string path and string content." });
         }
@@ -91,14 +143,13 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
         const label = f.path.trim().replace(/^\/+/, "").replace(/\.\./g, "").slice(0, 300) || "pasted-code.txt";
         files.push({ path: label, content: f.content, lineCount: countLines(f.content) });
       }
-    } else if (Array.isArray((req.body as any)?.paths) && (req.body as any).paths.length > 0) {
+    } else if (Array.isArray(body.paths) && body.paths.length > 0) {
       // 2. paths: selected files from the user's own uploaded workspace,
       //    resolved strictly inside their per-user directory.
-      const paths = (req.body as any).paths;
-      if (paths.length > MAX_INTEL_FILES) {
+      if (body.paths.length > MAX_INTEL_FILES) {
         return res.status(400).json({ error: `Too many files (limit ${MAX_INTEL_FILES}).` });
       }
-      for (const p of paths) {
+      for (const p of body.paths) {
         if (typeof p !== "string" || p.length === 0) {
           return res.status(400).json({ error: "Invalid file path." });
         }
@@ -134,49 +185,113 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
       });
     }
 
-    // FinalRead re-scan decision (billing spec §3.2). A call from the
-    // FinalRead entry carries `finalread: true` on the first review, or
+    // FinalRead decision (spec §7.1, §11). A call from the FinalRead entry
+    // carries `finalread: true` on the first review, or
     // `finalreadReviewId` on a re-run of a review the server already
-    // froze. Workspace scans never send either and never touch this.
+    // created. A project scan is always a FinalRead call. Workspace scans
+    // never send either and never touch this.
     //
-    // - Identical code (hash matches the frozen version) is not a re-scan:
-    //   no model call, no charge, no entitlement consumed — the buyer is
-    //   told the code is unchanged and the previous report still stands.
+    // - Identical code (hash matches the frozen version / pending audit)
+    //   is not a re-scan: no model call, no charge, no entitlement
+    //   consumed — the caller is told the code is unchanged and the
+    //   previous report still stands.
     // - Changed code with a usable entitlement is covered: no credit gate,
     //   no charge; one entitlement is consumed when the scan succeeds
     //   (at the charge site below, mirroring the existing charge-on-model-
     //   success behavior — a failed scan consumes nothing).
     // - Changed code without one falls back to the normal credit path.
-    const body = (req.body as any) ?? {};
+    // - A re-scan must carry the project id, and the server verifies the
+    //   project exists, the review belongs to it, and the caller is the
+    //   seller or a paid buyer. An unknown review id, or someone else's
+    //   review, is a 404 — never silently treated as a first review (that
+    //   was the cross-app hole: a different app's code plus a usable
+    //   entitlement read as a free re-scan and overwrote the frozen hash).
     const finalreadReviewId =
       typeof body.finalreadReviewId === "string" && body.finalreadReviewId.trim()
         ? body.finalreadReviewId.trim()
         : undefined;
-    const isFinalReadCall = body.finalread === true || finalreadReviewId !== undefined;
-    let frozenVersion: ReviewVersionRow | undefined;
+    const isFinalReadCall =
+      body.finalread === true || finalreadReviewId !== undefined || project !== undefined;
+    let review: FinalReadReviewRow | undefined;
+    let latestVersion: ReviewVersionRow | undefined;
+    let pendingSnapshot: AuditSnapshotRow | undefined;
     let usableEntitlement: RescanEntitlementRow | undefined;
     let rescanCovered = false;
     // The hash of exactly the files this scan grades, reused by the
     // frozen-version bookkeeping after a successful scan.
     let contentHash: string | undefined;
+    // Which FinalRead shape this call is (exactly one is true per call):
+    let isProjectInitialScan = false;
+    let isInitialScanRerun = false;
+    let isRescan = false;
+    // The seller's initial scan of a saved project is free — but ONLY when
+    // all four conditions hold (spec §7.1, §10): (a) the request carries a
+    // projectId for a saved FinalRead project in draft, (b) the caller IS
+    // the seller (enforced by the owner-scoped project fetch above),
+    // (c) the scan is the INITIAL scan (the project has no review yet),
+    // (d) the source is the seller's saved project files loaded
+    // server-side (enforced by the projectId path rejecting client files).
+    let freeSellerScan = false;
+
     if (isFinalReadCall) {
       contentHash = hashReviewContent(files);
       if (finalreadReviewId) {
-        const found = await getReviewVersion(finalreadReviewId);
-        // Another buyer's review id is not this buyer's review: treat the
-        // call as a first review (a fresh frozen record), never as a
-        // re-scan of someone else's code.
-        if (found && found.user_id === userId) frozenVersion = found;
-      }
-      if (frozenVersion) {
-        if (contentHash === frozenVersion.content_hash) {
-          return res.status(200).json({
-            codeUnchanged: true,
-            finalreadReviewId: frozenVersion.id,
-            message:
-              "The code hasn't changed since the last review — no re-scan needed. Your previous report still stands.",
-          });
+        // Explicit re-scan by review id. (The project-id requirement is
+        // enforced before file resolution, above.)
+        const found = await getFinalReadReview(finalreadReviewId);
+        if (found) {
+          const isSeller = found.review.seller_user_id === userId;
+          const isBuyer = await hasBuyerAccess(userId, finalreadReviewId);
+          if (isSeller || isBuyer) {
+            review = found.review;
+            latestVersion = found.version;
+          }
         }
+        if (!review) {
+          return res.status(404).json({ error: "Review not found." });
+        }
+        if (review.project_id !== projectId) {
+          return res.status(400).json({ error: "That review does not belong to this project." });
+        }
+        pendingSnapshot = await getPendingAuditSnapshot(review.id);
+        isRescan = latestVersion !== undefined;
+        isInitialScanRerun = latestVersion === undefined;
+      } else if (project) {
+        // A project scan without a review id: the initial scan, or a
+        // re-run of it (the seller re-scanning before payment). Only the
+        // project owner may scan without naming a review — a buyer names
+        // the review they paid for.
+        if (project.seller_user_id !== userId) {
+          return res.status(404).json({ error: "Project not found." });
+        }
+        if (project.finalread_review_id) {
+          const found = await getFinalReadReview(project.finalread_review_id);
+          if (found) {
+            review = found.review;
+            latestVersion = found.version;
+            pendingSnapshot = await getPendingAuditSnapshot(review.id);
+            isRescan = latestVersion !== undefined;
+            isInitialScanRerun = latestVersion === undefined;
+          }
+        }
+        if (!review) {
+          isProjectInitialScan = true;
+          freeSellerScan = project.status === "draft";
+        }
+      }
+      // Identical code is not a re-scan: no model call, no charge, no
+      // entitlement consumed. Compared against the frozen version when
+      // the review is paid, the pending audit when it is not.
+      const frozenHash = latestVersion?.content_hash ?? pendingSnapshot?.content_hash;
+      if (frozenHash && contentHash === frozenHash && review) {
+        return res.status(200).json({
+          codeUnchanged: true,
+          finalreadReviewId: review.id,
+          message:
+            "The code hasn't changed since the last review — no re-scan needed. Your previous report still stands.",
+        });
+      }
+      if (isRescan) {
         usableEntitlement = await findUsableEntitlement(userId);
         rescanCovered = usableEntitlement !== undefined;
       }
@@ -184,274 +299,26 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
 
     // The credit gate, for credit-charged runs only. Entitlement-covered
     // re-scans skip it (a buyer with 0 credits and a re-scan left can
-    // still re-scan); identical-code re-runs never reach here.
-    if (!rescanCovered) {
+    // still re-scan); a seller's free initial project scan skips it;
+    // identical-code re-runs never reach here.
+    if (!rescanCovered && !freeSellerScan) {
       const check = await checkCredits(userId, "intelligence");
       // NB: `check.ok === false` (not `!check.ok`): this codebase is not
       // strict-mode, and the truthiness form does not narrow the union.
       if (check.ok === false) return res.status(402).json(check.body);
     }
 
-    const totalFiles = files.length;
-    const totalLines = files.reduce((acc, f) => acc + f.lineCount, 0);
+    // The scan itself (PreFlight + deterministic assessment + model call +
+    // citation verification). The route keeps the charging and the
+    // frozen-version bookkeeping; the scan lives in intelligence-scan.ts
+    // so the server-side re-scan job can run the same scan.
+    const scan = await runIntelligenceScan(files, { userId, fromWorkspace });
 
-    // PreFlight deterministic pass over the whole workspace: line-anchored
-    // security/quality findings the LLM report can cite as ground truth.
-    preflight = runPreFlightScan(files.map(f => ({ path: f.path, content: f.content })));
-
-    // Deterministic assessment: the 10 category scores, the missing-features
-    // list, and the total are computed from scan evidence (pure functions —
-    // identical input always yields identical numbers). The model explains
-    // these facts; it does not invent or adjust them. Computed before the
-    // prompt digest because the assessment calibrates the PreFlight
-    // findings (README-truth spec §5: a no-auth finding on a route whose
-    // handler returns only hardcoded values is reframed critical → high),
-    // and the digest, the report, and the Q&A must all see the same
-    // calibrated view.
-    const assessment = computeDeterministicAssessment(files, preflight);
-    calibratedPreflight = { ...preflight, findings: assessment.calibratedPreflightFindings };
-
-    // Build workspace context string for Gemini
-    let workspaceContext = `You are evaluating a React/TypeScript project with ${totalFiles} file(s) totaling ${totalLines} line(s) of code.\n\n`;
-    files.forEach(f => {
-      workspaceContext += `--- FILE: ${f.path} (${f.lineCount} lines) ---\n`;
-      // If code file is extremely large, send a subset, but most are small so send full content for extreme precision
-      workspaceContext += f.content;
-      workspaceContext += `\n---------------------------------------------\n\n`;
-    });
-    workspaceContext += `\n---\n${formatFindingsForPrompt(calibratedPreflight)}\nWhen scoring the "security" category, weigh these deterministic findings; cite them by file and line in the reason instead of guessing.\n`;
-
-    workspaceContext += `\n---\n${formatAssessmentForPrompt(assessment)}\n`;
-
-    const INTEL_SYSTEM_PROMPT = `You are VibeCoder Project Intelligence Engine, an elite full-workspace software architect. 
-Your task is to analyze the complete set of files in this project workspace, build a comprehensive file ledger, construct a complete application architecture map, and evaluate the overall codebase completeness score out of 100.
-
-Since you are analyzing the entire project, you must look across ALL files to find implementations of features (e.g. database connections in server.ts or data directories, routing, utilities, frontend components in src/). Do not grade the app based on a single file.
-
-Your response must be returned STRICTLY in this JSON format:
-{
-  "totalFiles": number,
-  "totalLines": number,
-  "overallSummary": string,
-  "completenessScore": number,
-  "categoryScores": {
-    "serverStarts": { "score": number, "max": 10, "reason": string },
-    "authentication": { "score": number, "max": 10, "reason": string },
-    "databaseLayer": { "score": number, "max": 10, "reason": string },
-    "errorHandling": { "score": number, "max": 10, "reason": string },
-    "coreLogic": { "score": number, "max": 10, "reason": string },
-    "backgroundAutomation": { "score": number, "max": 10, "reason": string },
-    "externalIntegrations": { "score": number, "max": 10, "reason": string },
-    "security": { "score": number, "max": 10, "reason": string },
-    "performance": { "score": number, "max": 10, "reason": string },
-    "documentationVerified": { "score": number, "max": 10, "reason": string }
-  },
-  "fileLedger": [
-    {
-      "filePath": string,
-      "lineCount": number,
-      "description": string,
-      "contribution": string
-    }
-  ],
-  "applicationMap": {
-    "entrypoint": string,
-    "components": [
-      { "name": string, "filePath": string, "imports": [string] }
-    ],
-    "endpoints": [
-      { "method": string, "path": string, "purpose": string }
-    ]
-  },
-  "missingFeatures": [
-    { "feature": string, "category": string, "reason": string }
-  ]
-}
-
-CRITICAL RULES FOR PROJECT SCOPE ANALYSIS & INTENT DETECTION:
-0. DETERMINISTIC GROUND TRUTH (OVERRIDES YOUR JUDGMENT ON NUMBERS AND IMPORTS):
-   - The user message ends with a DETERMINISTIC GROUND TRUTH block listing the 10 category scores, the missing-features list, the total completeness score, and a per-file import map, all computed from scan evidence. These are FINAL.
-   - You MUST copy each category's score EXACTLY into categoryScores.<key>.score (max stays 10).
-   - If the ground truth marks a category N/A, write score 0 for it and state in the reason that the category is not applicable to this project (the server replaces it with the N/A marker).
-   - You MUST reproduce missingFeatures EXACTLY: same feature and category strings, same order. Do not add, remove, split, or reword entries.
-   - completenessScore MUST equal the exact total shown (it is the precomputed sum).
-   - You MUST reproduce the import map EXACTLY in applicationMap.components[].imports: every specifier listed for a file, no additions, no drops. Match components to files by filePath.
-   - Your judgment lives in the WORDS, not the numbers: write truthful, specific "reason" strings for every category and every missing feature, CITING the evidence anchors provided (file:line). Write overallSummary, fileLedger, and the rest of applicationMap from the code as usual.
-   - Do not invent scores, do not invent missing features, do not hallucinate files. If the evidence says a capability is not in scope, say so in the reason — the score already reflects it.
-0. DOMAIN INTENT & SCOPE DETECTION:
-   - First, determine the application's intended domain and architectural scope by inspecting README.md, package.json description, component names, comments, and API endpoints.
-   - STATELESS / PRIVACY-FIRST / STANDALONE UTILITIES: If the application is intentionally designed as a client-side utility, calculator, converter, generator, audio tool, or privacy-first app that requires no user accounts, database persistence, or payment processing, DO NOT PENALIZE the app for omitting them!
-   - Award 10/10 for authentication, databaseLayer, and/or externalIntegrations if they are intentionally omitted by design, stating in the reason: "Not required for this stateless tool by intentional design scope."
-   - ONLY penalize authentication, databaseLayer, or payments if there are "broken loops" or "dangling references" (e.g. code/UI references user logins, user profiles, paid credits, or Stripe payments, but the corresponding backend endpoints/webhooks are missing or broken).
-
-1. OVERALL SUMMARY: Provide a highly polished summary in clear English describing what this accumulated set of files represents, its design philosophy, and what functions it enables.
-2. FILE LEDGER: Every file in the project (excluding ignored ones) must have an entry detailing its business purpose ("description") and its exact value or contribution to the app's overall goals ("contribution").
-3. APPLICATION MAP:
-   - Identify the main entrypoint (e.g. index.html, src/main.tsx, or server.ts).
-   - List each key frontend React component, its file path, and imports.
-   - List each backend Express route, its HTTP method, its route path, and what business purpose it serves.
-4. CATEGORY SCORE INTEGRITY (ACCURATE & DOMAIN-AWARE EVALUATION):
-   Evaluate real, functional completeness relative to the app's intended scope, NOT arbitrary feature count:
-   - serverStarts: Rate the backend Express server integration or frontend build/routing entrypoint. If the project is a Next.js app but is missing app/page.tsx, app/layout.tsx, or has no frontend "front door", rate this Category 2/10 or lower, explaining that a user hitting the URL will experience a 404.
-   - authentication: Look across all files. If user sign-in or sessions are active, score highly. If the app needs logins but they are broken/stubbed, rate 0/10. Award 10/10 if authentication is irrelevant or intentionally omitted for this app's design scope.
-   - databaseLayer: Look for DB storage setups. If DB files exist without active collections/tables, score low. If a DB is missing but needed for user state, score low. Award 10/10 if the app is a stateless/client-side tool by design.
-   - errorHandling: Rate try/catch blocks and active error boundaries.
-   - coreLogic: Rate the level of active, completed domain logic.
-   - backgroundAutomation: Rate active cron/intervals/workers. Do NOT default to 10/10 if critical automation or webhooks (e.g. Stripe webhook handlers) are missing while payment helper files exist.
-   - externalIntegrations: Rate active API integrations or award 10/10 if external services are not part of the design scope.
-   - security: Score security practices (CORS, PORT bindings, no secrets committed, or privacy/data minimization practices).
-   - performance: Rate code organization and build readiness.
-   - documentationVerified: Rate TypeScript interfaces, comments, and file descriptions.
-
-5. ACCURATE SCORING HARD-CAPS (MANDATORY):
-   - CAP A (Missing Front Door / Routing): If the frontend is largely missing, lacks core page-level views/routes, or lacks main routing files (e.g., has isolated standalone components like ReferralStats or NegotiationReport but lacks app/page.tsx or app/layout.tsx to mount and route them), the total completenessScore MUST BE COERCED AND HARD-CAPPED AT A MAXIMUM OF 30/100. Lower category scores (like serverStarts and coreLogic) proportionally.
-   - CAP B (Incomplete API Infrastructure): If the ecosystem lists features like user logins, credit balances, purchases, and webhooks, but only has ONE single API endpoint actually implemented (e.g. /api/analyze), the total completenessScore MUST BE HARD-CAPPED AT A MAXIMUM OF 45/100.
-   - CAP C (Broken Loop / Missing Webhooks): If helper utilities like Stripe clients are present but critical webhooks (like /api/stripe/webhook or similar) are missing, deduct at least 4 points from externalIntegrations and databaseLayer.
-   
-The total completenessScore is computed server-side (rescaled over the applicable categories) — reproduce the exact total shown in the ground truth block. Keep the assessment professional, objective, realistic, and critical. Every claim in the reasons must cite evidence from the code provided; do not invent or hallucinate files.`;
-
-    const INTEL_SCHEMA = {
-      type: "OBJECT",
-      properties: {
-        totalFiles: { type: "INTEGER" },
-        totalLines: { type: "INTEGER" },
-        overallSummary: { type: "STRING" },
-        completenessScore: { type: "INTEGER" },
-        categoryScores: {
-          type: "OBJECT",
-          properties: {
-            serverStarts: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            authentication: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            databaseLayer: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            errorHandling: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            coreLogic: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            backgroundAutomation: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            externalIntegrations: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            security: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            performance: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            },
-            documentationVerified: {
-              type: "OBJECT",
-              properties: { score: { type: "INTEGER" }, max: { type: "INTEGER" }, reason: { type: "STRING" } },
-              required: ["score", "max", "reason"]
-            }
-          },
-          required: [
-            "serverStarts", "authentication", "databaseLayer", "errorHandling", "coreLogic",
-            "backgroundAutomation", "externalIntegrations", "security", "performance", "documentationVerified"
-          ]
-        },
-        fileLedger: {
-          type: "ARRAY",
-          items: {
-            type: "OBJECT",
-            properties: {
-              filePath: { type: "STRING" },
-              lineCount: { type: "INTEGER" },
-              description: { type: "STRING" },
-              contribution: { type: "STRING" }
-            },
-            required: ["filePath", "lineCount", "description", "contribution"]
-          }
-        },
-        applicationMap: {
-          type: "OBJECT",
-          properties: {
-            entrypoint: { type: "STRING" },
-            components: {
-              type: "ARRAY",
-              items: {
-                type: "OBJECT",
-                properties: {
-                  name: { type: "STRING" },
-                  filePath: { type: "STRING" },
-                  imports: { type: "ARRAY", items: { type: "STRING" } }
-                },
-                required: ["name", "filePath", "imports"]
-              }
-            },
-            endpoints: {
-              type: "ARRAY",
-              items: {
-                type: "OBJECT",
-                properties: {
-                  method: { type: "STRING" },
-                  path: { type: "STRING" },
-                  purpose: { type: "STRING" }
-                },
-                required: ["method", "path", "purpose"]
-              }
-            }
-          },
-          required: ["entrypoint", "components", "endpoints"]
-        },
-        missingFeatures: {
-          type: "ARRAY",
-          items: {
-            type: "OBJECT",
-            properties: {
-              feature: { type: "STRING" },
-              category: { type: "STRING" },
-              reason: { type: "STRING" }
-            },
-            required: ["feature", "category", "reason"]
-          }
-        }
-      },
-      required: [
-        "totalFiles", "totalLines", "overallSummary", "completenessScore",
-        "categoryScores", "fileLedger", "applicationMap", "missingFeatures"
-      ]
-    };
-
-    const { response: intelResponse, modelName } = await generateWithFallback({
-      contents: workspaceContext,
-      config: {
-        systemInstruction: INTEL_SYSTEM_PROMPT,
-        temperature: 0.1,
-        responseMimeType: "application/json",
-        responseSchema: INTEL_SCHEMA as any,
-      },
-    });
     // Payment for the run: an entitlement-covered re-scan consumes one
     // entitlement instead of charging credits (atomic decrement — a lost
-    // race falls back to the credit charge below). Every other run charges
-    // the metered cost as before. A failed model call never reaches here,
+    // race falls back to the credit charge below). A seller's free initial
+    // project scan is charged to nobody. Every other run charges the
+    // metered cost as before. A failed model call never reaches here,
     // so neither a charge nor a consumption happens on an outage.
     let intelBalance: number | null = null;
     let rescanEntitlementUsed = false;
@@ -462,130 +329,78 @@ The total completenessScore is computed server-side (rescaled over the applicabl
         rescanEntitlementsRemaining = usableEntitlement.remaining - 1;
       }
     }
-    if (!rescanEntitlementUsed) {
-      intelBalance = await chargeForCall(req.user!.id, extractUsage(intelResponse), modelName, "project intelligence");
+    if (!rescanEntitlementUsed && !freeSellerScan) {
+      intelBalance = await chargeForCall(userId, scan.usage, scan.modelName, "project intelligence");
       if (intelBalance != null) res.set("X-Credits-Balance", String(intelBalance));
     }
 
-    const responseText = intelResponse.text || "";
-    let cleanText = responseText.trim();
-    const startIdx = cleanText.indexOf("{");
-    const endIdx = cleanText.lastIndexOf("}");
-    if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-      cleanText = cleanText.substring(startIdx, endIdx + 1);
-    }
-
-    const parsedIntel = JSON.parse(cleanText);
-    // Attach the deterministic report for the dedicated UI panel — the
-    // calibrated findings (§5), so the panel shows the reframed no-auth
-    // finding, not the uncalibrated critical.
-    parsedIntel.preflight = calibratedPreflight;
-
-    // Enforce determinism: the served report always carries the computed
-    // scores and missing-feature list, even if the model drifted. The model's
-    // reason strings are kept (that is its job now); numbers are facts.
-    if (parsedIntel.categoryScores && typeof parsedIntel.categoryScores === "object") {
-      for (const key of CATEGORY_KEYS) {
-        const cat = parsedIntel.categoryScores[key] || {};
-        const det = assessment.categories[key];
-        const applicable = det.applicable !== false;
-        parsedIntel.categoryScores[key] = {
-          score: applicable ? det.score : null,
-          max: 10,
-          applicable,
-          designDeclaration: det.designDeclaration,
-          reason:
-            typeof cat.reason === "string" && cat.reason.trim().length > 0
-              ? cat.reason
-              : fallbackReason(key, assessment),
-        };
-      }
-    }
-    parsedIntel.completenessScore = assessment.completenessScore;
-    // How many of the 10 rubric categories apply — the client shows
-    // "N of 10 categories applicable" so the rescaling is never hidden.
-    parsedIntel.applicableCategories = assessment.applicableCount;
-    {
-      const modelMissing = Array.isArray(parsedIntel.missingFeatures) ? parsedIntel.missingFeatures : [];
-      const reasonByFeature = new Map<string, string>();
-      for (const m of modelMissing) {
-        if (m && typeof m.feature === "string" && typeof m.reason === "string" && m.reason.trim()) {
-          if (!reasonByFeature.has(m.feature)) reasonByFeature.set(m.feature, m.reason);
-        }
-      }
-      parsedIntel.missingFeatures = assessment.missingFeatures.map((f) => ({
-        feature: f.feature,
-        category: f.category,
-        reason: reasonByFeature.get(f.feature) || fallbackMissingReason(f),
-      }));
-    }
-    // Expose the deterministic assessment for debugging/transparency.
-    parsedIntel.deterministicAssessment = {
-      capsApplied: assessment.capsApplied,
-      evidence: Object.fromEntries(
-        CATEGORY_KEYS.map((k) => [k, assessment.categories[k].evidence])
-      ),
-      // Per-category checklists (background automation only — the scorer
-      // attaches one only where a category is half-built or a liability)
-      // plus the scanner / metric versions, so the report and the
-      // developer handoff packet can state what produced them (§B3, §B6).
-      checklists: Object.fromEntries(
-        CATEGORY_KEYS.filter((k) => assessment.categories[k].checklist).map((k) => [
-          k,
-          assessment.categories[k].checklist,
-        ])
-      ),
-      scannerVersion: assessment.scannerVersion,
-      metricVersion: assessment.metricVersion,
-      // Deterministic findings (dead payment buttons, mocked-payment
-      // routes): the overlay appends these to the audit input's findings
-      // so the report builder buckets them — liabilities for dead payment
-      // buttons, needs-verification for mocked payments.
-      findings: assessment.deterministicFindings,
-    };
-    // Citation grounding: verify every `file:line` citation in the model's
-    // free-text reasons against the actual workspace files and drop what
-    // cannot be verified, so unsupported claims never reach the report.
-    // Dropped applicationMap imports are repaired from the deterministic
-    // import map (ground truth).
-    const citationResult = verifyReportCitations(parsedIntel, files, {
-      categoryReason: (key) => fallbackReason(key as CategoryKey, assessment),
-      missingReason: (feature) => `Flagged by deterministic scan: ${feature}`,
-    });
-    const importsRepaired = repairImportMap(parsedIntel, assessment.importMap);
-    parsedIntel.verification = {
-      citationsChecked: citationResult.citationsChecked,
-      citationsDropped: citationResult.citationsDropped,
-      droppedCitations: citationResult.droppedCitations,
-      importsRepaired,
-    };
-    // Report header identity (display-only, never scored): the README's
-    // own H1 and tagline, plus the recorded import source. A source read
-    // failure must never fail the scan — the header just falls back.
-    if (fromWorkspace) {
-      const readme = findReadmeFile(files);
-      if (readme) {
-        const displayName = extractReadmeTitle(readme.content);
-        const readmeTagline = extractReadmeTagline(readme.content);
-        if (displayName) parsedIntel.displayName = displayName;
-        if (readmeTagline) parsedIntel.readmeTagline = readmeTagline;
-      }
-      const importSource = await getWorkspaceSource(userId).catch(() => undefined);
-      if (importSource) parsedIntel.importSource = importSource;
-    }
-    // FinalRead frozen-version bookkeeping, after a successful scan only.
-    // A re-scan's new code becomes the frozen version; a first review
-    // freezes its first version and hands the client the review id so
-    // later re-runs can name it. A failed scan never reaches here, so a
-    // failed re-scan never advances the frozen version or spends anything.
+    const parsedIntel = scan.audit;
+    // FinalRead bookkeeping, after a successful scan only. A re-scan's new
+    // code becomes a NEW immutable version; a first review freezes its
+    // first version and hands the client the review id so later re-runs
+    // can name it. A failed scan never reaches here, so a failed re-scan
+    // never advances the frozen version or spends anything.
     if (isFinalReadCall && contentHash) {
-      if (frozenVersion) {
-        await updateReviewVersionHash(frozenVersion.id, contentHash);
-        parsedIntel.finalreadReviewId = frozenVersion.id;
-      } else {
+      if (isProjectInitialScan && project) {
+        // The review is created with NO version row: version 1 is created
+        // at payment time from this pending snapshot (spec §5.2). The
+        // seller sees the developer view (this scan result); the full
+        // report + Q&A are paid-only.
+        const newReview = await createProjectReview(project.id, userId);
+        await createAuditSnapshot({
+          reviewId: newReview.id,
+          versionId: null,
+          audit: parsedIntel,
+          contentHash,
+          status: "pending",
+        });
+        await setProjectReview(project.id, newReview.id);
+        parsedIntel.finalreadReviewId = newReview.id;
+        parsedIntel.projectId = project.id;
+      } else if (isInitialScanRerun && review) {
+        // The seller re-ran the initial scan before payment: the pending
+        // audit is replaced (the seller has not paid yet, so the pending
+        // audit is not a paid artifact and the newest scan is the pinned
+        // assessment). Still gated + charged like any other scan — the
+        // free boundary is the FIRST scan only (finalread_review_id NULL).
+        await deletePendingAuditSnapshots(review.id);
+        await createAuditSnapshot({
+          reviewId: review.id,
+          versionId: null,
+          audit: parsedIntel,
+          contentHash,
+          status: "pending",
+        });
+        parsedIntel.finalreadReviewId = review.id;
+        parsedIntel.projectId = review.project_id;
+      } else if (isRescan && review) {
+        // A re-scan creates a NEW immutable version (snapshot + version +
+        // report), never an update to the frozen one (§12).
+        const latest = await getLatestReviewVersion(review.id);
+        const versionNumber = latest ? latest.version_number + 1 : 1;
+        const { version, report } = await createVersionReport(getDb(), {
+          reviewId: review.id,
+          projectId: review.project_id,
+          versionNumber,
+          contentHash,
+          audit: parsedIntel,
+          stripeEventId: review.purchase_stripe_event_id,
+        });
+        parsedIntel.finalreadReviewId = review.id;
+        parsedIntel.finalreadVersionId = version.id;
+        parsedIntel.finalreadReportId = report.id;
+        parsedIntel.projectId = review.project_id;
+      } else if (body.finalread === true) {
+        // Entry flow (no project): a first review freezes version 1 now.
         const purchaseEventId = await findLatestFinalReadPurchase(userId);
-        const version = await createReviewVersion(userId, purchaseEventId, contentHash);
-        parsedIntel.finalreadReviewId = version.id;
+        const { review: newReview } = await createFinalReadReview({
+          sellerUserId: userId,
+          projectId: null,
+          purchaseStripeEventId: purchaseEventId,
+          contentHash,
+          stripeEventId: purchaseEventId,
+        });
+        parsedIntel.finalreadReviewId = newReview.id;
       }
       parsedIntel.rescanEntitlementUsed = rescanEntitlementUsed;
       if (rescanEntitlementsRemaining !== undefined) {
@@ -595,13 +410,16 @@ The total completenessScore is computed server-side (rescaled over the applicabl
     res.json(parsedIntel);
   } catch (error: any) {
     log.error("Project Intelligence API Error:", error);
+    // The deterministic scan runs before the model call, so a model outage
+    // still hands the client the findings instead of a bare error (same
+    // contract as before — the scan attaches them to the thrown error).
+    const calibratedPreflight = (error as any)?.calibratedPreflight;
+    const preflight = (error as any)?.preflight;
     res.status(500).json({
       error: formatGeminiError(error),
       ...(calibratedPreflight ? { preflight: calibratedPreflight } : preflight ? { preflight } : {}),
     });
   }
 }));
-
-
 
 export default router;
