@@ -20,9 +20,8 @@ import {
   AuthRequiredError,
   CreditsRequiredError,
 } from "../../utils/apiFetch";
-import FinalReadOverlay, {
-  intelResultToFinalReadInput,
-} from "./FinalReadOverlay";
+import FinalReadOverlay from "./FinalReadOverlay";
+import FinalReadWaiting from "./FinalReadWaiting";
 import {
   createEntryReview,
   reviewHasReport,
@@ -99,6 +98,65 @@ export default function FinalReadEntry({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const stageTimer = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Stakeholder-view gate (gate spec §2, §5): the overlay renders ONLY
+  // from a stored paid report, never from a scan's raw audit. After a
+  // scan (or on an adopted review) the gate is resolved by review id
+  // against the server — paid → the stored report; unpaid → the payment
+  // prompt (a buyer) or the waiting state (a seller). The raw audit
+  // never opens the overlay.
+  type GateState = "idle" | "loading" | "paid" | "waiting" | "payment" | "generating";
+  const [gate, setGate] = useState<GateState>("idle");
+  const [paidReport, setPaidReport] = useState<{ report: any; reportId: string } | null>(null);
+  const [gateMessage, setGateMessage] = useState("");
+  const [gateReviewId, setGateReviewId] = useState<string | null>(null);
+
+  const resolveGate = async (reviewId: string | undefined, sellerPath: boolean) => {
+    // No review id: no paid report can exist (a plain workspace scan) —
+    // the seller waits; a buyer is prompted to pay.
+    if (!reviewId) {
+      setGate(sellerPath ? "waiting" : "payment");
+      return;
+    }
+    setGateReviewId(reviewId);
+    setGate("loading");
+    try {
+      const res = await fetch(
+        `/api/finalread/reviews/${encodeURIComponent(reviewId)}/report`,
+        { credentials: "include" }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setPaidReport({ report: data.report, reportId: data.reportId });
+        setGate("paid");
+      } else if (res.status === 202) {
+        setGateMessage(
+          typeof data.message === "string" && data.message
+            ? data.message
+            : "The report is being generated. Please check back shortly."
+        );
+        setGate("generating");
+      } else {
+        // 403/404 (no paid report) and any other failure close the gate:
+        // never render the report on an error.
+        setGate(sellerPath ? "waiting" : "payment");
+      }
+    } catch {
+      setGate(sellerPath ? "waiting" : "payment");
+    }
+  };
+
+  // Open the $199 checkout through the existing pricing modal (the same
+  // path the credits gate uses): the entry is in FinalRead mode, so the
+  // modal lists the FinalRead pack. No new checkout UI.
+  const openPayment = async () => {
+    const me = await fetchMe().catch(() => null);
+    window.dispatchEvent(
+      new CustomEvent("codedoc:credits-required", {
+        detail: { balance: me?.credits ?? 0, required: 400 },
+      })
+    );
+  };
+
   // Adopted mode is decided at mount: the entry opened onto a review that
   // already exists in the shared state. It is never re-derived while
   // mounted, so closing a just-finished ingest report returns to the
@@ -107,6 +165,18 @@ export default function FinalReadEntry({
   const [continueAtMount] = useState(
     () => sharedReview != null && !reviewHasReport(sharedReview)
   );
+
+  // Adopted mode resolves the gate at mount (gate spec §5): the shared
+  // review may already have a paid report (open it) or not — a
+  // workspace-originated review waits on the buyer; an entry-originated
+  // one is prompted to pay.
+  useEffect(() => {
+    if (adoptedAtMount && sharedReview?.intelResult) {
+      void resolveGate(sharedReview.finalreadReviewId, sharedReview.source === "workspace");
+    }
+    // Mount-only, like adoptedAtMount itself.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Everything the buyer does here is FinalRead: every credit gate in this
   // flow offers the FinalRead price list instead of consumer packs.
@@ -216,6 +286,10 @@ export default function FinalReadEntry({
           : createEntryReview(title, parsed, reviewId);
       onSharedReviewChange?.(next);
       setPhase("done");
+      // The stakeholder view does NOT open from the raw scan (gate spec
+      // §5): resolve the gate for this review — paid → the stored report;
+      // unpaid → the payment prompt (this entry is the buyer flow).
+      void resolveGate(reviewId, false);
     } catch (e: any) {
       if (e instanceof AuthRequiredError) {
         setPhase("idle");
@@ -347,31 +421,105 @@ export default function FinalReadEntry({
     setIntelResult(null);
     setError("");
     setNotice("");
+    setGate("idle");
+    setPaidReport(null);
+    setGateReviewId(null);
+    setGateMessage("");
     void fetchMe().then((u) => setBalance(u ? u.credits : null));
   };
 
-  // The completed stakeholder view takes over the screen, as it does in the
-  // main app. Closing it returns to this entry screen for another review.
-  if (phase === "done" && intelResult) {
+  // The gate surface (gate spec §5): what the entry shows after a scan
+  // (or on an adopted review) instead of the stakeholder view from the
+  // raw audit. Paid → the stored report, same overlay as before.
+  // Unpaid → the payment prompt (buyer) or the waiting state (seller).
+  const renderGate = (onClose: () => void) => {
+    if (gate === "paid" && paidReport) {
+      return (
+        <FinalReadOverlay
+          report={paidReport.report}
+          reportId={paidReport.reportId}
+          onClose={onClose}
+        />
+      );
+    }
+    if (gate === "waiting") {
+      return <FinalReadWaiting onClose={onClose} />;
+    }
+    if (gate === "generating") {
+      return <FinalReadWaiting message={gateMessage} onClose={onClose} />;
+    }
+    if (gate === "payment") {
+      return (
+        <div className="flex-1 overflow-y-auto">
+          <div className="max-w-3xl mx-auto px-4 py-8 md:py-12 select-text">
+            <div className="bg-slate-900 border border-indigo-500/25 rounded-2xl p-8 md:p-10 text-center space-y-4">
+              <h2 className="text-xl font-extrabold tracking-tight text-slate-100">
+                Your review is ready
+              </h2>
+              <p className="text-sm text-slate-400 leading-relaxed max-w-md mx-auto">
+                The scan finished. The full report — plain-English findings,
+                the verdict, and stakeholder Q&amp;A — opens once the $199
+                review is paid for.
+              </p>
+              <p className="text-xs text-indigo-200">
+                <span className="font-bold text-sm text-indigo-100">$199</span>
+                {"  "}· one complete review · includes 2 re-scans after fixes
+              </p>
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => void openPayment()}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-500 hover:bg-indigo-400 text-white text-xs font-bold rounded-xl transition"
+                >
+                  Buy the $199 review
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void resolveGate(gateReviewId ?? undefined, false)}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-white/5 hover:bg-white/10 text-slate-200 text-xs font-bold rounded-xl border border-slate-700 transition"
+                >
+                  I&apos;ve paid — open my report
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={onClose}
+                className="text-xs text-slate-500 hover:text-slate-300 transition"
+              >
+                Back
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    // Loading (or idle): the gate is resolving — honest progress.
     return (
-      <FinalReadOverlay
-        audit={intelResultToFinalReadInput(intelResult, projectTitle)}
-        onClose={resetToEntry}
-      />
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-3xl mx-auto px-4 py-8 md:py-12 text-center">
+          <Loader2 className="w-10 h-10 animate-spin text-indigo-400 mx-auto mb-4" />
+          <p className="text-sm font-semibold text-slate-200">
+            Checking your report…
+          </p>
+        </div>
+      </div>
     );
+  };
+
+  // The completed scan resolves the gate instead of opening the
+  // stakeholder view from the raw audit (gate spec §5). Closing returns
+  // to this entry screen for another review.
+  if (phase === "done" && intelResult) {
+    return renderGate(resetToEntry);
   }
 
-  // Adopted mode: the entry opened onto a finished shared review, so the
-  // report renders immediately — no upload, no second scan, no new charge.
-  // Closing it returns to the workspace (the review came from there), not
-  // to this entry's upload hero.
+  // Adopted mode: the entry opened onto a finished shared review — no
+  // upload, no second scan, no new charge. The gate was resolved at
+  // mount, so this renders the paid report or the waiting/payment state.
+  // Closing it returns to the workspace (the review came from there),
+  // not to this entry's upload hero.
   if (adoptedAtMount && sharedReview?.intelResult) {
-    return (
-      <FinalReadOverlay
-        audit={intelResultToFinalReadInput(sharedReview.intelResult, sharedReview.title)}
-        onClose={onExit}
-      />
-    );
+    return renderGate(onExit);
   }
 
   const working = phase === "uploading" || phase === "scanning";
@@ -471,6 +619,13 @@ export default function FinalReadEntry({
                     setProjectTitle(sharedReview.title);
                     setIntelResult(sharedReview.intelResult);
                     setPhase("done");
+                    // The report opens only from a stored paid report
+                    // (gate spec §5) — resolve the gate for this review
+                    // instead of rendering the raw audit.
+                    void resolveGate(
+                      sharedReview.finalreadReviewId,
+                      sharedReview.source === "workspace"
+                    );
                   }}
                   className="inline-flex items-center gap-2 px-5 py-2.5 bg-indigo-500 hover:bg-indigo-400 text-white text-xs font-bold rounded-xl transition"
                 >

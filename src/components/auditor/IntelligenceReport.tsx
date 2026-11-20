@@ -6,7 +6,8 @@ import { Activity, AlertCircle, Brain, Check, CheckCircle2, CheckSquare, Copy, F
 import PreFlightFindingsPanel from "./PreFlightFindingsPanel";
 import AstVoiceSummaryCard from "../AstVoiceSummaryCard";
 import VoiceReadoutButton from "../VoiceReadoutButton";
-import FinalReadOverlay, { intelResultToFinalReadInput } from "./FinalReadOverlay";
+import FinalReadOverlay from "./FinalReadOverlay";
+import FinalReadWaiting from "./FinalReadWaiting";
 
 interface IntelligenceReportProps {
   intelResult: any;
@@ -17,16 +18,64 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
   const [intelReportCopied, setIntelReportCopied] = useState(false);
   const [fileLedgerSearch, setFileLedgerSearch] = useState("");
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null);
-  const [finalreadOpen, setFinalreadOpen] = useState(false);
+
+  // Stakeholder-view gate (gate spec §2, §4): the overlay renders ONLY
+  // from a stored paid report, never from this scan's raw audit. The
+  // button asks the server whether a paid report exists for the review
+  // (evaluated at open time); before payment the seller gets the waiting
+  // state. A plain workspace scan has no review id at all, so it waits
+  // without a fetch.
+  type FinalReadGate = "closed" | "loading" | "waiting" | "generating" | "open";
+  const [finalreadGate, setFinalreadGate] = useState<FinalReadGate>("closed");
+  const [paidReport, setPaidReport] = useState<{ report: any; reportId: string } | null>(null);
+  const [gateMessage, setGateMessage] = useState("");
+
+  const openFinalRead = async () => {
+    const reviewId =
+      typeof intelResult?.finalreadReviewId === "string" && intelResult.finalreadReviewId
+        ? intelResult.finalreadReviewId
+        : undefined;
+    if (!reviewId) {
+      setFinalreadGate("waiting");
+      return;
+    }
+    setFinalreadGate("loading");
+    try {
+      const res = await fetch(
+        `/api/finalread/reviews/${encodeURIComponent(reviewId)}/report`,
+        { credentials: "include" }
+      );
+      if (res.ok) {
+        const data = await res.json();
+        setPaidReport({ report: data.report, reportId: data.reportId });
+        setFinalreadGate("open");
+      } else if (res.status === 202) {
+        const data = await res.json().catch(() => ({}));
+        setGateMessage(
+          typeof data.message === "string" && data.message
+            ? data.message
+            : "The report is being generated. Please check back shortly."
+        );
+        setFinalreadGate("generating");
+      } else {
+        // 403/404 (no paid report) and any other failure close the gate:
+        // never render the report on an error.
+        setFinalreadGate("waiting");
+      }
+    } catch {
+      setFinalreadGate("waiting");
+    }
+  };
 
   // Tell the app shell when the FinalRead stakeholder view is open, so the
   // credits gate offers the FinalRead price list instead of consumer packs.
   useEffect(() => {
-    window.dispatchEvent(new CustomEvent("codedoc:finalread-mode", { detail: { open: finalreadOpen } }));
+    const open = finalreadGate === "open";
+    window.dispatchEvent(new CustomEvent("codedoc:finalread-mode", { detail: { open } }));
     return () => {
       window.dispatchEvent(new CustomEvent("codedoc:finalread-mode", { detail: { open: false } }));
     };
-  }, [finalreadOpen]);
+  }, [finalreadGate]);
 
   const handleCopyIntelReport = () => {
     if (!intelResult) return;
@@ -108,8 +157,9 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
                   </button>
                   <button
                     type="button"
-                    onClick={() => setFinalreadOpen(true)}
-                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-lg text-xs font-medium border border-indigo-500/30 transition duration-150 cursor-pointer"
+                    onClick={() => void openFinalRead()}
+                    disabled={finalreadGate === "loading"}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 rounded-lg text-xs font-medium border border-indigo-500/30 transition duration-150 cursor-pointer disabled:opacity-50"
                   >
                     <Brain className="w-3.5 h-3.5" />
                     <span className="font-mono text-[10px]">FinalRead stakeholder view</span>
@@ -433,10 +483,20 @@ export default function IntelligenceReport({ intelResult, onAuditFile }: Intelli
 
               </div>
               )}
-      {finalreadOpen && (
+      {finalreadGate === "open" && paidReport && (
         <FinalReadOverlay
-          audit={intelResultToFinalReadInput(intelResult)}
-          onClose={() => setFinalreadOpen(false)}
+          report={paidReport.report}
+          reportId={paidReport.reportId}
+          onClose={() => setFinalreadGate("closed")}
+        />
+      )}
+      {finalreadGate === "waiting" && (
+        <FinalReadWaiting onClose={() => setFinalreadGate("closed")} />
+      )}
+      {finalreadGate === "generating" && (
+        <FinalReadWaiting
+          message={gateMessage}
+          onClose={() => setFinalreadGate("closed")}
         />
       )}
     </>

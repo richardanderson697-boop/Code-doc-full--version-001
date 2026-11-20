@@ -451,7 +451,7 @@ describe("project-intelligence re-scan flow", () => {
       .send({ projectId, finalreadReviewId: reviewId, ...extra });
   }
 
-  it("first FinalRead review freezes the version and returns its id", async () => {
+  it("first FinalRead review returns its id with no version yet; payment creates version 1 + the report (gate spec §5)", async () => {
     const app = buildApp();
     const { userId, cookie } = await signupUser(app);
     const res = await firstReview(app, cookie, CLEAN);
@@ -461,7 +461,10 @@ describe("project-intelligence re-scan flow", () => {
     expect(res.body.codeUnchanged).toBeUndefined();
     // The first review is credit-charged as today (tiny corpus: 1 credit).
     expect(await balanceOf(userId)).toBe(50 - 1);
-    // The response id is the REVIEW id; the version row belongs to it.
+    // The response id is the REVIEW id. No version row exists yet: the
+    // scan stores a pending audit, and version 1 is created at payment
+    // time from it (gate spec §5 — the entry flow matches the project
+    // flow, where the review is also created with no version row).
     const reviews = await getDb().all<any>(
       "SELECT * FROM finalread_reviews WHERE seller_user_id = $1",
       [userId]
@@ -472,8 +475,27 @@ describe("project-intelligence re-scan flow", () => {
       "SELECT * FROM finalread_review_versions WHERE review_id = $1",
       [res.body.finalreadReviewId]
     );
-    expect(versions).toHaveLength(1);
-    expect(versions[0].review_id).toBe(res.body.finalreadReviewId);
+    expect(versions).toHaveLength(0);
+    const pending = await getDb().all<any>(
+      "SELECT * FROM finalread_audit_snapshots WHERE review_id = $1 AND status = $2",
+      [res.body.finalreadReviewId, "pending"]
+    );
+    expect(pending).toHaveLength(1);
+    // The buyer pays the $199 pack (entitlements granted, as the webhook
+    // does): the first paid report fetch generates version 1 + the
+    // report from the pending audit, no second scan.
+    await grantRescanEntitlements(userId, "finalread", "evt_gate_first_review", new Date());
+    const fetched = await request(app)
+      .get(`/api/finalread/reviews/${res.body.finalreadReviewId}/report`)
+      .set("Cookie", cookie);
+    expect(fetched.status).toBe(200);
+    expect(typeof fetched.body.reportId).toBe("string");
+    const versionsAfter = await getDb().all<any>(
+      "SELECT * FROM finalread_review_versions WHERE review_id = $1",
+      [res.body.finalreadReviewId]
+    );
+    expect(versionsAfter).toHaveLength(1);
+    expect(versionsAfter[0].version_number).toBe(1);
   });
 
   // Pay for a project review the way the webhook does, minus Stripe:
