@@ -53,6 +53,41 @@ export interface FinalReadFileLedgerEntry {
   contribution?: string;
 }
 
+/**
+ * The only keys a ledger entry may carry (two-sided flow Rev 3 §7
+ * caveat 2: the buyer never sees source text). Any other key — `content`,
+ * `source`, `code`, or anything a future field adds — is where source
+ * text would hide, so the entry is dropped wholesale rather than
+ * repaired: a ledger row that smuggles source is not trustworthy
+ * enough to keep in any form.
+ */
+export const FINALREAD_LEDGER_ALLOWED_KEYS = [
+  "filePath",
+  "lineCount",
+  "description",
+  "contribution",
+] as const;
+
+/**
+ * Defense in depth for the ledger guard: `sanitizeFileLedger` already
+ * whitelists fields when the report is built, but this runs on the BUILT
+ * report at the storage boundary, so a ledger entry carrying source text
+ * can never reach the stored/served report even if a future change adds
+ * a field to the entry type or spreads raw audit data into it. Returns
+ * the report with any offending entry removed; the report is unchanged
+ * when the ledger is already clean.
+ */
+export function stripLedgerSourceText(report: FinalReadReport): FinalReadReport {
+  if (!report.fileLedger || report.fileLedger.length === 0) return report;
+  const allowed = new Set<string>(FINALREAD_LEDGER_ALLOWED_KEYS);
+  const clean = report.fileLedger.filter((entry) => {
+    if (!entry || typeof entry !== "object") return false;
+    return Object.keys(entry).every((key) => allowed.has(key));
+  });
+  if (clean.length === report.fileLedger.length) return report;
+  return { ...report, fileLedger: clean.length > 0 ? clean : undefined };
+}
+
 /** The intelligence run's structured application map (entrypoint, key
  *  components with their imports, backend endpoints with purposes).
  *  Warehouse detail — carried for the Q&A, never rendered in the UI. */
@@ -592,7 +627,10 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
   const couldNotEstablish = couldNotEstablishFor(input);
   const completenessScore = Math.max(0, Math.min(100, Math.round(Number(input.completenessScore) || 0)));
 
-  return {
+  // Ledger guard (§7 caveat 2): the built report is stripped at the
+  // boundary, so no ledger entry carrying source text can reach storage
+  // even if a future change adds a field upstream.
+  return stripLedgerSourceText({
     projectTitle: (input.projectTitle || "").trim() || "Reviewed project",
     verdict: verdictFor(completenessScore, liabilities.length, needsVerification.length),
     completenessScore,
@@ -615,5 +653,5 @@ export function buildFinalReadReport(input: FinalReadAuditInput): FinalReadRepor
     categoryReasons: deriveCategoryReasons(categories),
     scannerVersion: cleanString(input.scannerVersion),
     metricVersion: cleanString(input.metricVersion),
-  };
+  });
 }

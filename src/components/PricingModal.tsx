@@ -20,9 +20,15 @@ interface Props {
   // movement happens at the page level (footer link into #finalread, entry
   // exit back to the workspace), and the parent owns persistence.
   audience?: "finalread";
+  // A FinalRead review-request code, when the buyer is paying for a
+  // specific review (two-sided flow §4d). The server — never the browser
+  // — resolves it, reserves the request, and carries it in the Stripe
+  // metadata so the webhook can activate it. Without it the webhook
+  // sees a bare purchase and activates nothing.
+  inviteCode?: string;
 }
 
-export default function PricingModal({ open, onClose, notice, audience }: Props) {
+export default function PricingModal({ open, onClose, notice, audience, inviteCode }: Props) {
   const [packs, setPacks] = useState<Pack[]>([]);
   const [buying, setBuying] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -47,7 +53,9 @@ export default function PricingModal({ open, onClose, notice, audience }: Props)
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
-        body: JSON.stringify({ packId }),
+        body: JSON.stringify(
+          inviteCode ? { packId, inviteCode } : { packId }
+        ),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Checkout failed");

@@ -277,7 +277,7 @@ function BucketSection({
               <button
                 type="button"
                 onClick={() => setExpandedItem(isOpen ? null : key)}
-                className="w-full text-left px-3 py-2 text-[13px] font-medium text-slate-700"
+                className="w-full text-left px-3 py-2 text-[13px] font-medium text-slate-700 break-words [overflow-wrap:anywhere]"
               >
                 {item.title}
               </button>
@@ -286,9 +286,9 @@ function BucketSection({
                   with no click required. */}
               <div className={isOpen ? "" : "hidden print:block"}>
                 {renderDetail ? (
-                  <div className="px-3 pb-3 space-y-2">{renderDetail(item)}</div>
+                  <div className="px-3 pb-3 space-y-2 min-w-0 [overflow-wrap:anywhere]">{renderDetail(item)}</div>
                 ) : (
-                  <p className="px-3 pb-3 text-[13px] text-slate-600 leading-relaxed">
+                  <p className="px-3 pb-3 text-[13px] text-slate-600 leading-relaxed break-words [overflow-wrap:anywhere]">
                     {item.businessImplication}
                   </p>
                 )}
@@ -545,18 +545,18 @@ export default function FinalReadOverlay({
   // while printing and leave only this report on the page.
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-950/60 p-4 print:static print:block print:overflow-visible print:bg-white print:p-0">
-      <div className="w-full max-w-3xl my-8 bg-slate-50 rounded-2xl shadow-2xl overflow-hidden print:max-w-none print:my-0 print:rounded-none print:shadow-none print:overflow-visible">
+      <div className="w-full max-w-3xl my-8 bg-slate-50 rounded-2xl shadow-2xl overflow-hidden min-w-0 [overflow-wrap:anywhere] print:max-w-none print:my-0 print:rounded-none print:shadow-none print:overflow-visible">
         {/* Header */}
         <div className="flex items-start justify-between px-6 py-5 bg-white border-b border-slate-200">
-          <div>
+          <div className="min-w-0">
             <p className="text-[11px] font-bold uppercase tracking-widest text-indigo-600">
               FinalRead stakeholder view
             </p>
-            <h2 className="text-xl font-bold text-slate-900 mt-1">
+            <h2 className="text-xl font-bold text-slate-900 mt-1 break-words">
               {report.projectTitle}
             </h2>
             {report.applicationSummary && (
-              <p className="text-sm text-slate-600 mt-1 leading-relaxed">
+              <p className="text-sm text-slate-600 mt-1 leading-relaxed break-words">
                 {report.applicationSummary}
               </p>
             )}
@@ -602,7 +602,7 @@ export default function FinalReadOverlay({
             <p className="text-[11px] font-bold uppercase tracking-widest text-slate-500 mb-1">
               The verdict, in plain English
             </p>
-            <p className="text-[15px] text-slate-800 leading-relaxed">{report.verdict}</p>
+            <p className="text-[15px] text-slate-800 leading-relaxed break-words [overflow-wrap:anywhere]">{report.verdict}</p>
           </div>
 
           {/* Buckets */}
@@ -639,26 +639,26 @@ export default function FinalReadOverlay({
             subtitle={`Flagged by the scan but not established — a developer still needs to confirm or refute each item. Report generated ${new Date(report.generatedAt).toLocaleDateString()}.`}
             renderDetail={(item) => (
               <>
-                <p className="text-[13px] text-slate-600 leading-relaxed">
+                <p className="text-[13px] text-slate-600 leading-relaxed break-words [overflow-wrap:anywhere]">
                   {item.businessImplication}
                 </p>
                 {item.verification && (
                   <dl className="space-y-2 text-[13px] leading-relaxed">
                     <div>
                       <dt className="font-semibold text-slate-700">What we saw</dt>
-                      <dd className="text-slate-600">{item.verification.whatWeSaw}</dd>
+                      <dd className="text-slate-600 break-words [overflow-wrap:anywhere]">{item.verification.whatWeSaw}</dd>
                     </div>
                     <div>
                       <dt className="font-semibold text-slate-700">If real</dt>
-                      <dd className="text-slate-600">{item.verification.ifReal}</dd>
+                      <dd className="text-slate-600 break-words [overflow-wrap:anywhere]">{item.verification.ifReal}</dd>
                     </div>
                     <div>
                       <dt className="font-semibold text-slate-700">How a developer checks it</dt>
-                      <dd className="text-slate-600">{item.verification.howToCheck}</dd>
+                      <dd className="text-slate-600 break-words [overflow-wrap:anywhere]">{item.verification.howToCheck}</dd>
                     </div>
                     <div>
                       <dt className="font-semibold text-slate-700">What each answer means</dt>
-                      <dd className="text-slate-600">{item.verification.whatEachAnswerMeans}</dd>
+                      <dd className="text-slate-600 break-words [overflow-wrap:anywhere]">{item.verification.whatEachAnswerMeans}</dd>
                     </div>
                   </dl>
                 )}
@@ -769,7 +769,7 @@ export default function FinalReadOverlay({
                       {turn.question}
                     </p>
                     <div className="flex items-start justify-between gap-2">
-                      <p className="text-[14px] text-slate-800 leading-relaxed flex-1">
+                      <p className="text-[14px] text-slate-800 leading-relaxed flex-1 min-w-0 break-words [overflow-wrap:anywhere]">
                         {turn.declined && (
                           <span className="font-semibold">Not covered by this review — </span>
                         )}
@@ -844,9 +844,9 @@ export default function FinalReadOverlay({
                       onChange={() => toggleChecked(key)}
                       className="mt-1 accent-indigo-600"
                     />
-                    <span>
+                    <span className="min-w-0 break-words [overflow-wrap:anywhere]">
                       {item.title}
-                      <span className="text-slate-400 font-mono text-xs">
+                      <span className="text-slate-400 font-mono text-xs break-words [overflow-wrap:anywhere]">
                         {" "}
                         {item.file}
                         {item.line != null ? `:${item.line}` : ""}
