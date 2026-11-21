@@ -152,7 +152,6 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
     // Per-host title/meta/favicon (front-door §5): the HTML Googlebot
     // fetches on first crawl must already say FinalRead. index.html is
     // read once at startup; on a FinalRead host the title, meta
@@ -164,7 +163,7 @@ async function startServer() {
     } catch {
       indexHtml = null;
     }
-    app.get("*", (req, res) => {
+    const sendIndex = (req: express.Request, res: express.Response) => {
       if (indexHtml !== null) {
         const html = isFinalReadHost(req.hostname)
           ? finalReadHtml(indexHtml)
@@ -173,7 +172,15 @@ async function startServer() {
         return;
       }
       res.sendFile(path.join(distPath, "index.html"));
-    });
+    };
+    // The homepage must go through the per-host transform too:
+    // express.static answers "/" with the raw file before the catch-all
+    // below ever runs, so without this route getfinalread.com/ served
+    // GradeVibes branding in its raw HTML (2026-11-21). This route only
+    // handles exactly "/"; static assets are unaffected.
+    app.get("/", sendIndex);
+    app.use(express.static(distPath));
+    app.get("*", sendIndex);
   }
 
   app.listen(PORT, "0.0.0.0", () => {
