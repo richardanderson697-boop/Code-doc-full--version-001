@@ -130,7 +130,10 @@ CREATE TABLE IF NOT EXISTS finalread_projects (
 );
 CREATE INDEX IF NOT EXISTS idx_finalread_projects_seller ON finalread_projects(seller_user_id);
 CREATE INDEX IF NOT EXISTS idx_finalread_projects_review ON finalread_projects(finalread_review_id);
-CREATE INDEX IF NOT EXISTS idx_finalread_projects_request ON finalread_projects(request_id);
+-- NOTE: no request_id index here. The SCHEMA runs before
+-- migrateFinalReadProjectColumns adds the column, so on existing
+-- databases the index build threw at startup (2026-11-21 crash on both
+-- Railway services). The index is created in that migration instead.
 -- FinalRead buyer-initiated review requests (two-sided flow spec Rev 3,
 -- §4a): the buyer creates the request and its 8-character code, which the
 -- seller binds a project to at save time. One code flows

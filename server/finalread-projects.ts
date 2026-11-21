@@ -307,6 +307,12 @@ export async function migrateFinalReadProjectColumns(db: Db): Promise<void> {
   if (!columns.has("request_id")) {
     await db.exec("ALTER TABLE finalread_projects ADD COLUMN request_id TEXT");
   }
+  // The request_id index lives here, not in the SCHEMA: the SCHEMA runs
+  // before this migration, so on existing databases the column does not
+  // exist yet when the SCHEMA runs and the index build throws at startup
+  // (2026-11-21 crash on both Railway services). Creating it here, after
+  // the column is ensured, works on fresh and existing databases alike.
+  await db.exec("CREATE INDEX IF NOT EXISTS idx_finalread_projects_request ON finalread_projects(request_id)");
   if (!columns.has("scan_in_progress_at")) {
     await db.exec(
       db.dialect === "postgres"
