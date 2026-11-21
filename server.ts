@@ -1,12 +1,10 @@
 import express from "express";
-import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 
 import { log } from "./server/logger";
-import { isFinalReadHost } from "./src/utils/pricing-audience";
 import { initProjectsStore } from "./server/db";
 import { initStore } from "./server/store";
 import authRouter from "./server/routes/auth";
@@ -99,34 +97,6 @@ app.all("/api/*", (req, res) => {
   res.status(404).json({ error: `API endpoint not found: ${req.method} ${req.path}` });
 });
 
-// Per-host title/meta/favicon for the FinalRead host (front-door §5).
-// The description reuses the greeting's own subcopy verbatim.
-const FINALREAD_TITLE =
-  "FinalRead — Pre-Acquisition Codebase Due Diligence &amp; Risk Audit";
-const FINALREAD_DESCRIPTION =
-  "FinalRead is an independent, standardized first pass over a software codebase. It finds the material risks, the unfinished work, and the questions a buyer should ask — before you commit to full engineering due diligence.";
-
-function finalReadHtml(html: string): string {
-  return html
-    .replace(/<title>[^<]*<\/title>/, `<title>${FINALREAD_TITLE}</title>`)
-    .replace(
-      /(<meta\s+name="description"\s+content=")[^"]*(")/,
-      `$1${FINALREAD_DESCRIPTION}$2`
-    )
-    .replace(
-      /(<meta\s+property="og:title"\s+content=")[^"]*(")/,
-      `$1${FINALREAD_TITLE}$2`
-    )
-    .replace(
-      /(<meta\s+property="og:description"\s+content=")[^"]*(")/,
-      `$1${FINALREAD_DESCRIPTION}$2`
-    )
-    .replace(
-      /<link\s+rel="icon"[^>]*>/,
-      `<link rel="icon" href="/favicon-finalread.svg" />`
-    );
-}
-
 // Vite / static asset serving configuration
 async function startServer() {
   // The PreFlight AST layer self-installs its engine binary in the background
@@ -153,25 +123,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    // Per-host title/meta/favicon (front-door §5): the HTML Googlebot
-    // fetches on first crawl must already say FinalRead. index.html is
-    // read once at startup; on a FinalRead host the title, meta
-    // description, og tags, and favicon are replaced per request.
-    // gradevibes.com responses are byte-identical to the file.
-    let indexHtml: string | null = null;
-    try {
-      indexHtml = fs.readFileSync(path.join(distPath, "index.html"), "utf8");
-    } catch {
-      indexHtml = null;
-    }
     app.get("*", (req, res) => {
-      if (indexHtml !== null) {
-        const html = isFinalReadHost(req.hostname)
-          ? finalReadHtml(indexHtml)
-          : indexHtml;
-        res.type("html").send(html);
-        return;
-      }
       res.sendFile(path.join(distPath, "index.html"));
     });
   }

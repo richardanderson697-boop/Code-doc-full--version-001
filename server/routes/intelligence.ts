@@ -10,6 +10,7 @@ import { chargeForCall } from "../credits";
 import { runIntelligenceScan } from "../intelligence-scan";
 import {
   consumeRescanEntitlement,
+  findLatestFinalReadPurchase,
   findUsableEntitlement,
   getFinalReadReview,
   getLatestReviewVersion,
@@ -20,15 +21,14 @@ import {
 } from "../finalread-rescans";
 import {
   createAuditSnapshot,
+  createEntryReview,
   createProjectReview,
   createVersionReport,
   deletePendingAuditSnapshots,
   getFinalReadProject,
   getPendingAuditSnapshot,
   hasBuyerAccess,
-  releaseScanGuard,
   setProjectReview,
-  tryAcquireScanGuard,
   type AuditSnapshotRow,
   type FinalReadProjectRow,
 } from "../finalread-projects";
@@ -50,17 +50,10 @@ const MAX_INTEL_TOTAL_BYTES = 5 * 1024 * 1024;
 // the resolved files (the content hash) before it can be made. The gate
 // itself is unchanged (min balance 40, same 402 shape) for every
 // credit-charged run. A seller's initial scan of a saved FinalRead project
-// skips the gate too (two-sided flow §2, §4b) — but only when all five
-// conditions hold (draft project, caller is the seller, no review yet,
-// server-loaded saved files, AND the project is bound to a buyer review
-// request); anything else pays the normal gate.
+// skips the gate too (spec §7.1, §10) — but only when all four conditions
+// hold (draft project, caller is the seller, no review yet, server-loaded
+// saved files); anything else pays the normal gate.
 router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
-  // DB-backed scan-in-progress guard (§4c): held while a project scan
-  // runs. Declared here so the catch releases it on scan failure too.
-  let scanGuardHeld = false;
-  // The project this call scans (if any) — declared here so the catch
-  // can release the guard for it.
-  let project: FinalReadProjectRow | undefined;
   try {
     const userId = req.user!.id;
     const body = (req.body as any) ?? {};
@@ -98,6 +91,7 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
     // here: authorization happens in the FinalRead decision below, via
     // the review (the seller or a paid buyer); the seller-only project
     // endpoints in routes/finalread-projects.ts stay owner-scoped.
+    let project: FinalReadProjectRow | undefined;
     const projectId =
       typeof body.projectId === "string" && body.projectId.trim()
         ? body.projectId.trim()
@@ -229,17 +223,6 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
         : undefined;
     const isFinalReadCall =
       body.finalread === true || finalreadReviewId !== undefined || project !== undefined;
-    // Two-sided flow §2: the entry upload flow is RETIRED — no buyer
-    // request, no scan. A `finalread: true` call with no review id and
-    // no project is a NEW entry scan, and it is rejected. Re-runs of a
-    // pre-Rev3 entry review (finalreadReviewId, no project) still work
-    // (gate spec §8); new FinalRead scans start from a seller project
-    // bound to a buyer's review request.
-    if (body.finalread === true && !finalreadReviewId && !project) {
-      return res.status(400).json({
-        error: "Entry scans are retired. A FinalRead review starts when a buyer creates a review request and the seller saves the project against its code.",
-      });
-    }
     let review: FinalReadReviewRow | undefined;
     let latestVersion: ReviewVersionRow | undefined;
     let pendingSnapshot: AuditSnapshotRow | undefined;
@@ -253,15 +236,12 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
     let isInitialScanRerun = false;
     let isRescan = false;
     // The seller's initial scan of a saved project is free — but ONLY when
-    // all five conditions hold (two-sided flow §2, §4b): (a) the request
-    // carries a projectId for a saved FinalRead project in draft, (b) the
-    // caller IS the seller (enforced by the owner-scoped project fetch
-    // above), (c) the scan is the INITIAL scan (the project has no review
-    // yet), (d) the source is the seller's saved project files loaded
-    // server-side (enforced by the projectId path rejecting client files),
-    // (e) the project is BOUND to a buyer review request (request_id set)
-    // — until this build the free scan was ungated by any buyer, which
-    // is the gap this condition closes.
+    // all four conditions hold (spec §7.1, §10): (a) the request carries a
+    // projectId for a saved FinalRead project in draft, (b) the caller IS
+    // the seller (enforced by the owner-scoped project fetch above),
+    // (c) the scan is the INITIAL scan (the project has no review yet),
+    // (d) the source is the seller's saved project files loaded
+    // server-side (enforced by the projectId path rejecting client files).
     let freeSellerScan = false;
 
     if (isFinalReadCall) {
@@ -310,7 +290,7 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
         }
         if (!review) {
           isProjectInitialScan = true;
-          freeSellerScan = project.status === "draft" && !!project.request_id;
+          freeSellerScan = project.status === "draft";
         }
       }
       // Identical code is not a re-scan: no model call, no charge, no
@@ -346,21 +326,6 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
     // citation verification). The route keeps the charging and the
     // frozen-version bookkeeping; the scan lives in intelligence-scan.ts
     // so the server-side re-scan job can run the same scan.
-    //
-    // DB-backed scan-in-progress guard (§4c, §4i case 5): a project scan
-    // claims the guard before the model call; a second scan while one
-    // runs gets a 409 and the first scan's pending audit stays intact.
-    // The guard is released after the bookkeeping (below) and in the
-    // catch on scan failure — a failed scan never leaves the project
-    // locked.
-    if (isFinalReadCall && project) {
-      scanGuardHeld = await tryAcquireScanGuard(project.id);
-      if (!scanGuardHeld) {
-        return res.status(409).json({
-          error: "A scan is already running for this project. Wait for it to finish, then try again.",
-        });
-      }
-    }
     const scan = await runIntelligenceScan(files, { userId, fromWorkspace });
 
     // Payment for the run: an entitlement-covered re-scan consumes one
@@ -439,29 +404,34 @@ router.post("/api/project-intelligence", requireAuth, asyncRoute(async (req: Aut
         parsedIntel.finalreadVersionId = version.id;
         parsedIntel.finalreadReportId = report.id;
         parsedIntel.projectId = review.project_id;
+      } else if (body.finalread === true) {
+        // Entry flow (no project): the review is created with NO version
+        // row, and the scan's audit is stored as a PENDING audit keyed by
+        // this review id (gate spec §5 — the same pending-audit mechanism
+        // as a project initial scan). Version 1 + the report are created
+        // at payment time from the pending audit, so the report can be
+        // generated without a second scan. The caller already holding a
+        // $199 purchase is recorded from creation (as before); a purchase
+        // that lands after the scan is claimed at the first paid report
+        // fetch (generateReportForPaidEntryReview).
+        const purchaseEventId = await findLatestFinalReadPurchase(userId);
+        const newReview = await createEntryReview(userId, purchaseEventId);
+        await createAuditSnapshot({
+          reviewId: newReview.id,
+          versionId: null,
+          audit: parsedIntel,
+          contentHash,
+          status: "pending",
+        });
+        parsedIntel.finalreadReviewId = newReview.id;
       }
-      // (The `body.finalread === true` entry-scan branch is gone: entry
-      // scans are retired by the 400 above. createEntryReview stays
-      // exported for pre-Rev3 entry reviews seeded in tests.)
       parsedIntel.rescanEntitlementUsed = rescanEntitlementUsed;
       if (rescanEntitlementsRemaining !== undefined) {
         parsedIntel.rescanEntitlementsRemaining = rescanEntitlementsRemaining;
       }
     }
-    if (scanGuardHeld && project) {
-      await releaseScanGuard(project.id);
-      scanGuardHeld = false;
-    }
     res.json(parsedIntel);
   } catch (error: any) {
-    if (scanGuardHeld && project) {
-      // A failed scan never leaves the project locked (§4c).
-      try {
-        await releaseScanGuard(project.id);
-      } catch {
-        // The release is best-effort; the original error is the answer.
-      }
-    }
     log.error("Project Intelligence API Error:", error);
     // The deterministic scan runs before the model call, so a model outage
     // still hands the client the findings instead of a bare error (same

@@ -8,12 +8,7 @@ import {
   FINALREAD_RESCAN_PACK_ID,
   grantRescanEntitlements,
 } from "./finalread-rescans";
-import {
-  attemptPendingActivation,
-  findBuyerAccessByStripeEvent,
-  getPendingActivation,
-  processPendingActivationsForUser,
-} from "./finalread-projects";
+import { processPendingActivationsForUser } from "./finalread-projects";
 
 interface ModelRate {
   inputPerMillion: number;
@@ -133,32 +128,6 @@ export async function claimPendingCredits(userId: string, email: string): Promis
   let claimed = 0;
   for (const row of rows) {
     try {
-      // Two-sided flow §4g (claim-path reorder): a parked FinalRead
-      // purchase made with a review-request code attempts its activation
-      // BEFORE the credits + entitlements are claimed. On activation
-      // failure the $199 is refunded, the parked row is deleted, and
-      // NOTHING is claimed — the buyer never keeps the pack for a deal
-      // that did not activate. A parked FinalRead purchase WITHOUT a
-      // pending activation (bare purchase) claims as before.
-      if (row.pack_id === FINALREAD_RESCAN_PACK_ID && row.stripe_event_id) {
-        const pending = await getPendingActivation(row.stripe_event_id);
-        if (pending) {
-          await attemptPendingActivation(pending, userId, cleanEmail);
-          const activated = await findBuyerAccessByStripeEvent(
-            row.stripe_event_id,
-            userId
-          );
-          if (!activated) {
-            // Activation failed (refund issued + recorded): drop the
-            // parked credits and claim nothing for this purchase.
-            await db.run("DELETE FROM pending_credits WHERE id = $1", [row.id]);
-            log.warn(
-              `Parked FinalRead purchase ${row.stripe_event_id} failed activation; refunded, credits not claimed`
-            );
-            continue;
-          }
-        }
-      }
       const ref = `pending:${row.stripe_event_id ?? `row-${row.id}`}`;
       const balance = await addCredits(
         userId,
@@ -189,10 +158,13 @@ export async function claimPendingCredits(userId: string, email: string): Promis
     }
   }
   if (claimed > 0) log.info(`Claimed ${claimed} pending credits for ${cleanEmail}`);
-  // Belt-and-braces: any pending activation WITHOUT a matching park row
-  // (a partially-parked purchase — the activation was parked but the
-  // credit park failed) is still attempted. Activations WITH a park row
-  // were already attempted above, before the credits were claimed.
+  // A parked FinalRead purchase made with an invite code claims its code
+  // activation too (spec §10.5): the buyer gets the report once their
+  // account exists. Runs even when no credits were claimed — a parked
+  // activation can exist without a park row only if the webhook parked
+  // the activation but the credit park failed, which cannot happen (the
+  // activation is created after the park row in the same branch), so this
+  // is belt-and-braces for a partially-parked purchase.
   try {
     await processPendingActivationsForUser(userId, cleanEmail);
   } catch (err) {

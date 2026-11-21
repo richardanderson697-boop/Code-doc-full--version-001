@@ -135,17 +135,17 @@ export function entryViewFor(review: SharedReview | null | undefined): EntryView
   return "continue";
 }
 
-/** Workspace header title: the rename. The FinalRead view keeps "FinalRead". */
-export function workspaceHeaderTitle(finalreadView: boolean): string {
-  return finalreadView ? "FinalRead" : "FinalRead Developer Workspace";
+/** Workspace header title: the rename. The entry side keeps "FinalRead". */
+export function workspaceHeaderTitle(finalreadEntryOpen: boolean): string {
+  return finalreadEntryOpen ? "FinalRead" : "FinalRead Developer Workspace";
 }
 
 /** Footer brand follows the view, as before — the workspace side now reads
  *  "FinalRead Developer Workspace" instead of the "GradeVibes" default.
  *  The footer's FinalRead discovery link hides only for brand "FinalRead",
  *  so it stays visible in the workspace view. */
-export function footerBrandFor(finalreadView: boolean): string {
-  return finalreadView ? "FinalRead" : "FinalRead Developer Workspace";
+export function footerBrandFor(finalreadEntryOpen: boolean): string {
+  return finalreadEntryOpen ? "FinalRead" : "FinalRead Developer Workspace";
 }
 
 /** Owner/repo from a GitHub URL, matching the entry's existing derivation.

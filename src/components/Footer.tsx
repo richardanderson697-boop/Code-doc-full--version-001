@@ -5,52 +5,37 @@ export function openLegal(doc: "privacy" | "terms") {
 }
 
 export default function Footer({ brand = "GradeVibes" }: { brand?: string }) {
-  // Two-sided flow §1 + front-door §4: on the FinalRead host the footer
-  // is light and links back to the developer workspace; on gradevibes.com
-  // the FinalRead discovery link is a REAL anchor to getfinalread.com
-  // (the wrong-host rule: #finalread on gradevibes.com redirects there).
-  const isFinalRead = brand === "FinalRead";
   return (
-    <footer
-      className={
-        isFinalRead
-          ? "shrink-0 border-t border-slate-200 bg-white px-5 py-3"
-          : "shrink-0 border-t border-slate-800/60 bg-slate-950 px-5 py-3"
-      }
-    >
+    <footer className="shrink-0 border-t border-slate-800/60 bg-slate-950 px-5 py-3">
       <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-between max-w-full">
-        <p className={isFinalRead ? "text-[11px] text-slate-500 font-mono" : "text-[11px] text-slate-600 font-mono"}>
+        <p className="text-[11px] text-slate-600 font-mono">
           {brand} · Static analysis — no code was executed
         </p>
         <div className="flex items-center gap-4 text-[11px] font-mono">
-          {isFinalRead ? (
-            <a
-              href="https://gradevibes.com"
-              className="text-slate-500 hover:text-slate-800 transition"
-            >
-              Developer workspace — gradevibes.com
-            </a>
-          ) : (
+          {/* Quiet buyer discovery: the homepage card is audience-gated, so
+              this footer link is the discovery path for cold visitors. Hidden
+              while the FinalRead entry itself is open (redundant there). */}
+          {brand !== "FinalRead" && (
             <>
-              <a
-                href="https://getfinalread.com"
+              <button
+                onClick={() => { window.location.hash = "finalread"; }}
                 className="text-slate-500 hover:text-slate-300 transition"
               >
                 Buying or investing in software? FinalRead
-              </a>
+              </button>
               <span className="text-slate-800">·</span>
             </>
           )}
           <button
             onClick={() => openLegal("privacy")}
-            className={isFinalRead ? "text-slate-500 hover:text-slate-800 transition" : "text-slate-500 hover:text-slate-300 transition"}
+            className="text-slate-500 hover:text-slate-300 transition"
           >
             Privacy Policy
           </button>
-          <span className={isFinalRead ? "text-slate-300" : "text-slate-800"}>·</span>
+          <span className="text-slate-800">·</span>
           <button
             onClick={() => openLegal("terms")}
-            className={isFinalRead ? "text-slate-500 hover:text-slate-800 transition" : "text-slate-500 hover:text-slate-300 transition"}
+            className="text-slate-500 hover:text-slate-300 transition"
           >
             Terms of Service
           </button>

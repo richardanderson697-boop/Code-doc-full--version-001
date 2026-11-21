@@ -1,12 +1,10 @@
-// FinalRead two-sided flow: the project workspace API (spec Revision 3,
-// §2–§4). Seller-owned projects bound to a buyer-created review request,
-// the buyer request endpoints, the paid report, and the Q&A log.
+// FinalRead seller project saving: the project workspace API (spec
+// Revision 2, §7–§9). Seller-owned projects, invite codes, the paid
+// report, and the Q&A log.
 //
-// Access rules (spec §4j, resource-level authorization — one ordinary
+// Access rules (spec §8, resource-level authorization — one ordinary
 // account session, no distinct buyer session type):
 // - A project belongs to its seller: another user gets a 404, never a leak.
-// - A project save requires a valid buyer review-request code (the atomic
-//   bind, §4b); a save without one is rejected.
 // - The full report + Q&A are paid-only. The buyer who paid (an activated
 //   buyer-access record for the review) reads the report and asks Q&A.
 // - The seller sees the developer view (their scan result) until payment;
@@ -21,24 +19,22 @@ import { requireAuth, AuthedRequest } from "../middleware/requireAuth";
 import { log } from "../logger";
 import {
   closeFinalReadProject,
-  createProjectWithRequest,
-  createReviewRequest,
+  createFinalReadProject,
+  createInviteCode,
   generateReportForPaidEntryReview,
   getFinalReadProjectForSeller,
+  getInviteCodesForProject,
   getLatestReportForReview,
   getQaHistoryForReview,
   getReport,
   getReportJobForReview,
   getReportsForReview,
-  getRequestForProject,
   hasBuyerAccess,
   listFinalReadProjects,
-  listReviewRequests,
   parseJson,
   processPendingReportJobs,
-  rebindProjectRequest,
-  ReviewRequestRateLimitedError,
-  validateReviewRequestCode,
+  revokeInviteCode,
+  validateInviteCode,
 } from "../finalread-projects";
 import {
   getFinalReadReview,
@@ -53,21 +49,17 @@ function projectShape(project: any) {
     title: project.title,
     status: project.status,
     finalreadReviewId: project.finalread_review_id,
-    requestId: project.request_id ?? null,
-    scanInProgressAt: project.scan_in_progress_at ?? null,
     createdAt: project.created_at,
     updatedAt: project.updated_at,
   };
 }
 
-/** A review request as the buyer sees it. The code is NEVER returned here — it is shown once, at creation. */
-function reviewRequestShape(row: any) {
+function inviteCodeShape(row: any) {
   return {
     id: row.id,
-    title: row.title,
     status: row.status,
-    projectId: row.project_id,
     expiresAt: row.expires_at,
+    usedAt: row.used_at,
     createdAt: row.created_at,
   };
 }
@@ -82,57 +74,16 @@ async function sellerProject(req: AuthedRequest, res: any) {
   return project;
 }
 
-// ---- Review requests (buyer creates, seller binds) ----
-
-// Create a review request (two-sided flow §4a, §3 step 2): the buyer
-// names the deal and gets the 8-character code ONCE (with a copy button
-// in the client). The buyer shares it with the seller, who saves the
-// project against it. Only the hash is stored — a lost code cannot be
-// recovered; the buyer creates a new request. Rate limits (§4a): max 3
-// unbound requests, max 5 created per day — over either is a 429.
-router.post("/api/finalread/review-requests", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
-  const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
-  if (!title) return res.status(400).json({ error: "Name the deal for this review." });
-  if (title.length > 200) return res.status(400).json({ error: "Title is too long." });
-  try {
-    const { code, row } = await createReviewRequest(req.user!.id, title);
-    res.status(201).json({ code, request: reviewRequestShape(row) });
-  } catch (err: any) {
-    if (err instanceof ReviewRequestRateLimitedError) {
-      return res.status(429).json({ error: err.message });
-    }
-    throw err;
-  }
-}));
-
-// The buyer's own review requests (no codes — the code is shown once,
-// at creation).
-router.get("/api/finalread/review-requests", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
-  const rows = await listReviewRequests(req.user!.id);
-  res.json({ requests: rows.map(reviewRequestShape) });
-}));
-
 // ---- Projects (seller-only) ----
 
-// Save a project in the seller's workspace (spec §2 step 3,
-// save-before-scan: the seller uploads code, saves the project against
-// the buyer's review-request code, then runs the initial scan FROM the
-// saved project). The save BINDS the code atomically (§4b): a save
-// WITHOUT a valid request code is rejected with the same generic
-// message for every failure mode — no enumeration of whether the code
-// exists, is expired, is already bound, or belongs to the seller.
+// Save a project in the seller's workspace (spec §7.1, save-before-scan:
+// the seller uploads code, saves the project, then runs the initial scan
+// FROM the saved project).
 router.post("/api/finalread/projects", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const title = typeof req.body?.title === "string" ? req.body.title.trim() : "";
   if (!title) return res.status(400).json({ error: "A project title is required." });
   if (title.length > 200) return res.status(400).json({ error: "Title is too long." });
-  const requestCode = typeof req.body?.requestCode === "string" ? req.body.requestCode : "";
-  if (!requestCode.trim()) {
-    return res.status(400).json({ error: "A review request code is required. Ask the buyer for the code they created." });
-  }
-  const project = await createProjectWithRequest(req.user!.id, title, requestCode);
-  if (!project) {
-    return res.status(400).json({ error: "That review request code isn't valid. Ask the buyer for the code they created." });
-  }
+  const project = await createFinalReadProject(req.user!.id, title);
   res.status(201).json({ project: projectShape(project) });
 }));
 
@@ -147,9 +98,8 @@ router.get("/api/finalread/projects", requireAuth, asyncRoute(async (req: Authed
   res.json({ projects: visible.map(projectShape) });
 }));
 
-// One project, with its review + version summary and its bound review
-// request. The report CONTENT is not included here — it is fetched
-// separately, paid-only.
+// One project, with its review + version summary. The report CONTENT is
+// not included here — it is fetched separately, paid-only.
 router.get("/api/finalread/projects/:id", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const project = await sellerProject(req, res);
   if (!project) return;
@@ -171,64 +121,59 @@ router.get("/api/finalread/projects/:id", requireAuth, asyncRoute(async (req: Au
       }));
     }
   }
-  const bound = await getRequestForProject(project.id);
-  res.json({
-    project: projectShape(project),
-    review,
-    versions,
-    request: bound ? reviewRequestShape(bound) : null,
-  });
-}));
-
-// Re-bind a DRAFT project to a different review-request code before
-// payment (§4b). Blocked with a 409 while the bound request has an
-// active checkout reservation.
-router.post("/api/finalread/projects/:id/re-bind", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
-  const requestCode = typeof req.body?.requestCode === "string" ? req.body.requestCode : "";
-  if (!requestCode.trim()) {
-    return res.status(400).json({ error: "A review request code is required." });
-  }
-  const result = await rebindProjectRequest(req.params.id, req.user!.id, requestCode);
-  if (result === "not-found") return res.status(404).json({ error: "Project not found." });
-  if (result === "reserved") {
-    return res.status(409).json({ error: "A buyer is checking out on this project right now. Try again after their checkout expires." });
-  }
-  if (result === "invalid-code") {
-    return res.status(400).json({ error: "That review request code isn't valid. Ask the buyer for the code they created." });
-  }
-  const project = await getFinalReadProjectForSeller(req.params.id, req.user!.id);
-  res.json({ project: project ? projectShape(project) : null });
+  res.json({ project: projectShape(project), review, versions });
 }));
 
 // Close (soft-delete) a project (spec §7.2). The paid report, buyer
 // access, Q&A history, audit snapshots, and version rows are retained
-// independently and survive closure; only unactivated review requests
-// are revoked. A hard delete of the code is out of scope. Closing a
-// project with an active checkout reservation is a 409 (§4i case 3).
+// independently and survive closure; only unactivated invite codes are
+// revoked. A hard delete of the code is out of scope.
 router.post("/api/finalread/projects/:id/close", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
-  const result = await closeFinalReadProject(req.params.id, req.user!.id);
-  if (result === "not-found") return res.status(404).json({ error: "Project not found." });
-  if (result === "reserved") {
-    return res.status(409).json({ error: "A buyer is checking out on this project right now. Try again after their checkout expires." });
-  }
+  const closed = await closeFinalReadProject(req.params.id, req.user!.id);
+  if (!closed) return res.status(404).json({ error: "Project not found." });
   res.json({ closed: true });
 }));
 
-// ---- Review-request code validation (buyer enters the code) ----
+// ---- Invite codes (seller issues, buyer enters) ----
 
-// Seller-issued invite-code endpoints are SUPERSEDED by the two-sided
-// flow (§4a): the buyer creates the request and its code, the seller
-// binds a project to it. There is no seller-issued code, no code list,
-// and no standalone revoke endpoint anymore.
+// Issue an invite code for a project. Requires a pending audit (the
+// initial scan must have run) — a code for a project with no audit would
+// let a buyer pay for a report that cannot be generated. The plaintext
+// code is returned ONCE (the seller copies it to the buyer); only the
+// hash is stored.
+router.post("/api/finalread/projects/:id/invite-codes", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
+  const project = await sellerProject(req, res);
+  if (!project) return;
+  try {
+    const { code, row } = await createInviteCode(project.id);
+    res.status(201).json({ code, inviteCode: inviteCodeShape(row) });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || "Could not issue an invite code." });
+  }
+}));
+
+router.get("/api/finalread/projects/:id/invite-codes", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
+  const project = await sellerProject(req, res);
+  if (!project) return;
+  const codes = await getInviteCodesForProject(project.id);
+  res.json({ inviteCodes: codes.map(inviteCodeShape) });
+}));
+
+// Revoke an unactivated code (seller only). An activated code cannot be
+// revoked — the buyer paid for it.
+router.post("/api/finalread/projects/:id/invite-codes/:codeId/revoke", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
+  const revoked = await revokeInviteCode(req.params.codeId, req.user!.id);
+  if (!revoked) return res.status(404).json({ error: "Invite code not found." });
+  res.json({ revoked: true });
+}));
 
 // A buyer enters a code (auth required: the buyer signs in first, then
 // enters the code). Every failure returns the same generic shape — no
 // enumeration of whether a code exists, is expired, or is already used.
-// Valid ONLY when bound to a project WITH a pending audit (§4a).
 router.post("/api/finalread/invite-codes/validate", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const code = typeof req.body?.code === "string" ? req.body.code : "";
   if (!code.trim()) return res.status(400).json({ error: "An invite code is required." });
-  const result = await validateReviewRequestCode(code, req.user!.id);
+  const result = await validateInviteCode(code, req.user!.id);
   if (!result.valid) {
     return res.json({ valid: false });
   }
@@ -237,7 +182,6 @@ router.post("/api/finalread/invite-codes/validate", requireAuth, asyncRoute(asyn
     activatedForCaller: result.activatedForCaller,
     projectTitle: result.project?.title ?? null,
     projectId: result.project?.id ?? null,
-    reviewId: result.project?.finalread_review_id ?? null,
     reportId: result.reportId ?? null,
   });
 }));
@@ -263,12 +207,7 @@ router.get("/api/finalread/reports/:id", requireAuth, asyncRoute(async (req: Aut
   const isSeller = review.seller_user_id === userId;
   const isBuyer = await hasBuyerAccess(userId, review.id);
   const paid = !!review.purchase_stripe_event_id;
-  if (!isSeller && !isBuyer) {
-    // A buyer with access to one review gets a 404 on another review's
-    // report (two-sided flow §9 item 16): existence is hidden.
-    return res.status(404).json({ error: "Report not found." });
-  }
-  if (isSeller && !paid) {
+  if (!isBuyer && !(isSeller && paid)) {
     return res.status(403).json({ error: "This report is only available to the buyer who paid for it." });
   }
   res.json({
@@ -302,12 +241,7 @@ router.get("/api/finalread/reviews/:id/report", requireAuth, asyncRoute(async (r
     }
   }
   const paid = !!review.purchase_stripe_event_id;
-  if (!isSeller && !isBuyer) {
-    // A buyer with access to one review gets a 404 on another review's
-    // report (two-sided flow §9 item 16): existence is hidden.
-    return res.status(404).json({ error: "Report not found." });
-  }
-  if (isSeller && !paid) {
+  if (!isBuyer && !(isSeller && paid)) {
     return res.status(403).json({ error: "This report is only available to the buyer who paid for it." });
   }
   const latest = await getLatestReportForReview(review.id);

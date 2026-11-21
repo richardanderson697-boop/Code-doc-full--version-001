@@ -10,15 +10,14 @@ import {
   grantRescanEntitlements,
 } from "../finalread-rescans";
 import {
-  REVIEW_REQUEST_RESERVATION_MINUTES,
-  activateReviewRequestForUser,
+  INVITE_RESERVATION_MINUTES,
+  activateInviteCodeForUser,
   createPendingActivation,
-  findBuyerAccessByStripeEvent,
-  findReviewRequestByHash,
+  findInviteCodeByHash,
   hashInviteCode,
   projectHasActivatedBuyer,
   refundLosingFinalReadPayment,
-  reserveReviewRequestCode,
+  reserveInviteCode,
 } from "../finalread-projects";
 import { getDb } from "../store";
 import { normalizeEmail, validEmail } from "../auth";
@@ -230,13 +229,13 @@ function appUrl(req: any): string {
 
 // Create a Checkout session for a credit pack. Returns the hosted URL.
 //
-// With a review-request code (FinalRead pack only): the server — never
-// the browser — resolves the code to a request id + project id, reserves
-// the request for this buyer (30 minutes, atomic), and carries both ids
-// in the Stripe session metadata so the webhook can validate and
-// activate them server-side (spec §4d). The Checkout session's
-// expires_at matches the reservation deadline, so a buyer whose
-// reservation expired cannot pay.
+// With an invite code (FinalRead pack only): the server — never the
+// browser — resolves the code to a code id + project id, reserves the code
+// for this buyer (30 minutes, atomic), and carries both ids in the Stripe
+// session metadata so the webhook can validate and activate them
+// server-side (spec §9.6, Blocker 3). The Checkout session's expires_at
+// matches the reservation deadline, so a buyer whose reservation expired
+// cannot pay.
 router.post("/api/billing/checkout", requireAuth, asyncRoute(async (req: AuthedRequest, res) => {
   const { packId, inviteCode } = req.body ?? {};
   const pack = getPacks().find((p) => p.id === packId);
@@ -244,29 +243,29 @@ router.post("/api/billing/checkout", requireAuth, asyncRoute(async (req: AuthedR
   if (!pack.priceId) {
     return res.status(500).json({ error: "This pack is not configured yet. Contact support." });
   }
-  // Review-request codes are only for the FinalRead pack.
-  let requestCodeId: string | undefined;
+  // Invite codes are only for the FinalRead pack.
+  let inviteCodeId: string | undefined;
   let inviteProjectId: string | undefined;
   if (inviteCode !== undefined && inviteCode !== null && String(inviteCode).trim() !== "") {
     if (pack.id !== FINALREAD_RESCAN_PACK_ID) {
       return res.status(400).json({ error: "Invite codes are only for the FinalRead pack." });
     }
-    const requestRow = await findReviewRequestByHash(hashInviteCode(String(inviteCode)));
-    if (!requestRow || !requestRow.project_id) {
+    const codeRow = await findInviteCodeByHash(hashInviteCode(String(inviteCode)));
+    if (!codeRow) {
       return res.status(400).json({ error: "That code isn't valid or has expired." });
     }
-    if (await projectHasActivatedBuyer(requestRow.project_id)) {
+    if (await projectHasActivatedBuyer(codeRow.project_id)) {
       return res.status(400).json({ error: "That code isn't valid or has expired." });
     }
-    const reserved = await reserveReviewRequestCode(requestRow.id, req.user!.id);
+    const reserved = await reserveInviteCode(codeRow.id, req.user!.id);
     if (reserved === "in_use") {
       return res.status(409).json({ error: "That code is already in use by another buyer." });
     }
     if (reserved === "invalid") {
       return res.status(400).json({ error: "That code isn't valid or has expired." });
     }
-    requestCodeId = requestRow.id;
-    inviteProjectId = requestRow.project_id;
+    inviteCodeId = codeRow.id;
+    inviteProjectId = codeRow.project_id;
   }
   const base = appUrl(req);
   try {
@@ -288,15 +287,15 @@ router.post("/api/billing/checkout", requireAuth, asyncRoute(async (req: AuthedR
       "metadata[packId]": pack.id,
       customer_email: req.user!.email,
     };
-    if (requestCodeId && inviteProjectId) {
+    if (inviteCodeId && inviteProjectId) {
       // Identifiers, not grant amounts: the webhook looks up the grant
       // from packId in server code and re-validates these ids against the
       // database. The browser is never trusted to name the project.
-      checkoutParams["metadata[requestCodeId]"] = requestCodeId;
+      checkoutParams["metadata[inviteCodeId]"] = inviteCodeId;
       checkoutParams["metadata[projectId]"] = inviteProjectId;
       // The reservation and the Checkout session expire together.
       checkoutParams["expires_at"] = String(
-        Math.floor(Date.now() / 1000) + REVIEW_REQUEST_RESERVATION_MINUTES * 60
+        Math.floor(Date.now() / 1000) + INVITE_RESERVATION_MINUTES * 60
       );
     }
     const session = await stripeFetch("/v1/checkout/sessions", checkoutParams);
@@ -395,18 +394,18 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
         // A parked $199 purchase claims its 2 re-scan entitlements when
         // the credits are claimed (claimPendingCredits), keyed to the same
         // Stripe event id — the park row carries the pack id for that.
-        // A parked FinalRead purchase made with a review-request code
-        // ALSO defers its request activation: the pending activation is
-        // claimed together with the credits (spec §4g), so the buyer
-        // still gets the report once their account exists.
+        // A parked FinalRead purchase made with an invite code ALSO defers
+        // its code activation: the pending activation is claimed together
+        // with the credits (spec §10.5), so the buyer still gets the
+        // report once their account exists.
         if (
           pack.id === FINALREAD_RESCAN_PACK_ID &&
-          session.metadata?.requestCodeId &&
+          session.metadata?.inviteCodeId &&
           session.metadata?.projectId
         ) {
           await createPendingActivation({
             stripeEventId: eventId,
-            requestCodeId: String(session.metadata.requestCodeId),
+            inviteCodeId: String(session.metadata.inviteCodeId),
             projectId: String(session.metadata.projectId),
             email,
             paymentIntent:
@@ -425,24 +424,30 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
       );
       return res.json({ received: true, skipped: "user_missing_no_email" });
     }
-    // Two-sided flow §4e — activate FIRST, grant SECOND. A $199
-    // purchase made with a review-request code activates that request
-    // for this buyer BEFORE any credits or entitlements are granted: the
-    // request's project + review + report open to the buyer, and the
-    // buyer sees the report (or "report is being generated" when the
-    // pending audit was missing). On activation failure the $199 is
-    // refunded and NOTHING is granted — a losing payment never gives
-    // the product away (the old grants-first order did). A failed refund
-    // is recorded, never silently lost (§9.7). A bare $199 purchase
-    // (no code) grants credits + entitlements and activates nothing.
+    // addCredits is idempotent on the Stripe event id: safe to retry.
+    const balance = await addCredits(userId, credits, `credit pack: ${pack.id}`, `stripe:${eventId}`);
+    // A $199 purchase also grants its 2 re-scan entitlements, separate
+    // from the credit balance. Idempotent on the Stripe event id, so a
+    // webhook retry cannot double-grant.
+    if (pack.id === FINALREAD_RESCAN_PACK_ID) {
+      await grantRescanEntitlements(userId, pack.id, eventId, purchasedAt);
+    }
+    // A $199 purchase made with an invite code activates that code for
+    // this buyer (spec §9.6, §10): the code's project + review + report
+    // open to the buyer, and the buyer sees the report (or "report is
+    // being generated" when the pending audit was missing). The payment
+    // is NEVER silently kept when activation fails: the buyer keeps the
+    // credits + entitlements, the code is NOT activated, and the $199 is
+    // refunded via Stripe (recorded either way, so a failed refund is
+    // never lost — §9.7).
     if (
       pack.id === FINALREAD_RESCAN_PACK_ID &&
-      session.metadata?.requestCodeId &&
+      session.metadata?.inviteCodeId &&
       session.metadata?.projectId
     ) {
-      const activated = await activateFinalReadPurchase({
+      await activateFinalReadPurchase({
         eventId,
-        requestCodeId: String(session.metadata.requestCodeId),
+        inviteCodeId: String(session.metadata.inviteCodeId),
         projectId: String(session.metadata.projectId),
         buyerUserId: userId,
         buyerEmail: normalizeEmail(
@@ -453,23 +458,6 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
             ? session.payment_intent
             : session.payment_intent?.id ?? null,
       });
-      if (!activated.ok) {
-        // The refund is already issued + recorded inside
-        // activateFinalReadPurchase; the credits and entitlements are
-        // NOT granted. The payment is never silently kept.
-        log.warn(
-          `Stripe webhook: FinalRead activation failed for ${eventId}; payment refunded, nothing granted`
-        );
-        return res.json({ received: true, skipped: "finalread_activation_failed_refunded" });
-      }
-    }
-    // addCredits is idempotent on the Stripe event id: safe to retry.
-    const balance = await addCredits(userId, credits, `credit pack: ${pack.id}`, `stripe:${eventId}`);
-    // A $199 purchase also grants its 2 re-scan entitlements, separate
-    // from the credit balance. Idempotent on the Stripe event id, so a
-    // webhook retry cannot double-grant.
-    if (pack.id === FINALREAD_RESCAN_PACK_ID) {
-      await grantRescanEntitlements(userId, pack.id, eventId, purchasedAt);
     }
     log.info(`Credited ${credits} to user ${userId} (Stripe ${eventId}); balance now ${balance}`);
   }
@@ -478,76 +466,64 @@ export async function handleStripeWebhook(req: any, res: any): Promise<void> {
 }
 
 /**
- * Validate + atomically activate a FinalRead review request for the
- * buyer who just paid (two-sided flow §4e). The request is (re-)reserved
- * for this buyer first — the checkout reservation (30 min) may have
- * expired while the webhook was in flight, and a paid buyer is not
- * punished with a refund for a slow delivery. Returns { ok: true } on
- * success — including when a prior success for this Stripe event id +
- * buyer already exists (the idempotency guard: a retried webhook must
- * not re-activate, and must not refund, a payment that already
- * succeeded). On any activation failure the payment is refunded
- * (losing payment, §9.7) and the caller grants NOTHING — the buyer
- * keeps no credits, no entitlements, and the $199 goes back via Stripe.
- * A failed refund is recorded, never silently lost.
+ * Validate + atomically activate a FinalRead invite code for the buyer
+ * who just paid (spec §9.6, §10). The code is (re-)reserved for this
+ * buyer first — the checkout reservation (30 min) may have expired while
+ * the webhook was in flight, and a paid buyer is not punished with a
+ * refund for a slow delivery. On any activation failure the payment is
+ * refunded (losing payment, §9.7): the buyer keeps the 400 credits +
+ * 2 entitlements, the code is NOT activated, and the $199 goes back via
+ * Stripe. A failed refund is recorded, never silently lost.
  */
 export async function activateFinalReadPurchase(opts: {
   eventId: string;
-  requestCodeId: string;
+  inviteCodeId: string;
   projectId: string;
   buyerUserId: string;
   buyerEmail: string;
   paymentIntent: string | null;
-}): Promise<{ ok: boolean; reason?: string }> {
-  const { eventId, requestCodeId, projectId, buyerUserId, buyerEmail, paymentIntent } = opts;
-  const already = await findBuyerAccessByStripeEvent(eventId, buyerUserId);
-  if (already) {
-    log.info(
-      `FinalRead request ${requestCodeId} already activated for buyer ${buyerUserId} (event ${eventId}); webhook retry treated as success`
-    );
-    return { ok: true };
-  }
-  const reserved = await reserveReviewRequestCode(requestCodeId, buyerUserId);
+}): Promise<void> {
+  const { eventId, inviteCodeId, projectId, buyerUserId, buyerEmail, paymentIntent } = opts;
+  const reserved = await reserveInviteCode(inviteCodeId, buyerUserId);
   if (reserved !== "reserved") {
     log.warn(
-      `FinalRead activation could not reserve request ${requestCodeId} (project ${projectId}): ${reserved}`
+      `FinalRead activation could not reserve code ${inviteCodeId} (project ${projectId}): ${reserved}`
     );
     await refundLosingFinalReadPayment({
       eventId,
-      requestCodeId,
+      inviteCodeId,
       projectId,
       buyerUserId,
       buyerEmail,
       paymentIntent,
       reason: reserved === "in_use" ? "code_in_use" : "invalid",
     });
-    return { ok: false, reason: reserved === "in_use" ? "code_in_use" : "invalid" };
+    return;
   }
-  const activated = await activateReviewRequestForUser({
-    requestCodeId,
+  const activated = await activateInviteCodeForUser({
+    inviteCodeId,
     projectId,
     buyerUserId,
     stripeEventId: eventId,
   });
   if (!activated.ok) {
     log.warn(
-      `FinalRead activation failed for request ${requestCodeId} (project ${projectId}): ${activated.reason}`
+      `FinalRead activation failed for code ${inviteCodeId} (project ${projectId}): ${activated.reason}`
     );
     await refundLosingFinalReadPayment({
       eventId,
-      requestCodeId,
+      inviteCodeId,
       projectId,
       buyerUserId,
       buyerEmail,
       paymentIntent,
       reason: activated.reason ?? "activation_failed",
     });
-    return { ok: false, reason: activated.reason ?? "activation_failed" };
+    return;
   }
   log.info(
-    `FinalRead request ${requestCodeId} activated for buyer ${buyerUserId} (project ${projectId}, report ${activated.reportId ?? "generating"})`
+    `FinalRead invite code ${inviteCodeId} activated for buyer ${buyerUserId} (project ${projectId}, report ${activated.reportId ?? "generating"})`
   );
-  return { ok: true };
 }
 
 export default router;

@@ -10,7 +10,6 @@ import AnatomyInspector from "./components/AnatomyInspector";
 import AIDebugger from "./components/AIDebugger";
 import CodeAuditor from "./components/CodeAuditor";
 import FinalReadEntry from "./components/auditor/FinalReadEntry";
-import FinalReadProjects from "./components/auditor/FinalReadProjects";
 import AuthModal from "./components/AuthModal";
 import PricingModal from "./components/PricingModal";
 import Footer from "./components/Footer";
@@ -26,7 +25,7 @@ import {
   workspaceHeaderTitle,
   type SharedReview,
 } from "./utils/sharedReview";
-import { isFinalReadHost, pricingAudienceFor } from "./utils/pricing-audience";
+import { pricingAudienceFor } from "./utils/pricing-audience";
 
 export default function App() {
   const [projects, setProjects] = useState<VibeProject[]>([]);
@@ -144,22 +143,9 @@ export default function App() {
     history.replaceState(null, "", window.location.pathname + window.location.search);
     setLegalDoc(null);
   };
-  // Two-sided flow §1: ONE entrance predicate decides the host.
-  // getfinalread.com (or the staging Railway host) is the buyer greeting
-  // — no workspace, no builder, no upload. gradevibes.com is the
-  // developer workspace. The greeting is the main content on a FinalRead
-  // host regardless of the hash.
-  const finalReadHost = useMemo(
-    () => isFinalReadHost(window.location.hostname),
-    []
-  );
   // Standalone FinalRead entry via URL hash (#finalread) — stable, linkable,
-  // bookmarkable. On gradevibes.com the hash REDIRECTS to getfinalread.com
-  // (the wrong-host rule); on a FinalRead host the greeting is the main
-  // content anyway. Localhost is exempt so the greeting stays testable in
-  // dev. The redirect runs on MOUNT only, so the workspace's FinalRead
-  // button (which opens the seller projects panel, not the hash) is
-  // unaffected.
+  // bookmarkable. The entry view takes over the main content area; the buyer
+  // never sees the GradeVibes workspace UI.
   const [finalreadEntryOpen, setFinalreadEntryOpen] = useState<boolean>(
     () => window.location.hash === "#finalread"
   );
@@ -168,45 +154,25 @@ export default function App() {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-  useEffect(() => {
-    const host = window.location.hostname;
-    if (
-      window.location.hash === "#finalread" &&
-      !isFinalReadHost(host) &&
-      host !== "localhost" &&
-      host !== "127.0.0.1"
-    ) {
-      window.location.replace("https://getfinalread.com");
-    }
-    // Mount only — a later hash change is the user navigating, not an entrance.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  // The seller's FinalRead projects panel (two-sided flow §2 step 3):
-  // save a project against the buyer's code, scan from it, watch the deal.
-  const [finalReadProjectsOpen, setFinalReadProjectsOpen] = useState(false);
-  const finalreadView = finalReadHost || finalreadEntryOpen;
+  const closeFinalReadEntry = () => {
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    setFinalreadEntryOpen(false);
+  };
 
   const [pricingNotice, setPricingNotice] = useState("");
-  // The FinalRead review-request code being paid for, when the buyer
-  // opened checkout from the greeting's payment prompt (two-sided flow
-  // §4d). It rides to the pricing modal so the checkout carries it —
-  // without it the webhook sees a bare purchase and activates nothing.
-  // Cleared whenever the modal closes, so a later bare purchase never
-  // carries a stale code.
-  const [pricingInviteCode, setPricingInviteCode] = useState<string | undefined>(undefined);
   // Pricing audience follows the view you're in — never sticky. The
-  // FinalRead greeting (or a FinalRead host) means FinalRead pricing; the
-  // GradeVibes workspace means consumer pricing. An earlier design
-  // persisted the audience in localStorage so exiting the entry kept $199
-  // pricing, with the modal's switch link as the way back; the switch is
-  // gone, so that persistence became a trap: both views showed $199-only
-  // with no way back to the three consumer packs. Deriving from the view
-  // removes it, and exiting the greeting restores consumer pricing on its
-  // own. Plus the sales-home rule (billing spec §3.3): on getfinalread.com
-  // (or the staging host) the visitor is a FinalRead buyer, so pricing
-  // defaults to the FinalRead list even before the greeting opens — a
-  // buyer there never sees the consumer packs.
-  const pricingAudience = pricingAudienceFor(finalreadView, window.location.hostname);
+  // FinalRead entry open means FinalRead pricing; the GradeVibes workspace
+  // means consumer pricing. An earlier design persisted the audience in
+  // localStorage so exiting the entry kept $199 pricing, with the modal's
+  // switch link as the way back; the switch is gone, so that persistence
+  // became a trap: both views showed $199-only with no way back to the
+  // three consumer packs. Deriving from the entry state removes it, and
+  // exiting the entry restores consumer pricing on its own.
+  // Plus the sales-home rule (billing spec §3.3): on getfinalread.com (or
+  // the staging host) the visitor is a FinalRead buyer, so pricing
+  // defaults to the FinalRead list even before the entry opens — a buyer
+  // there never sees the consumer packs. The homepage itself is unchanged.
+  const pricingAudience = pricingAudienceFor(finalreadEntryOpen, window.location.hostname);
   // One-time cleanup of the pre-view-following sticky flag, so old browsers
   // don't carry a dead key that could confuse a future reader.
   useEffect(() => {
@@ -215,8 +181,7 @@ export default function App() {
     } catch {}
   }, []);
   const finalreadModeRef = useRef(
-    typeof window !== "undefined" &&
-      (isFinalReadHost(window.location.hostname) || window.location.hash === "#finalread")
+    typeof window !== "undefined" && window.location.hash === "#finalread"
   );
 
   useEffect(() => {
@@ -235,19 +200,14 @@ export default function App() {
     }
     const onAuthRequired = () => setAuthOpen(true);
     const onCreditsRequired = (e: Event) => {
-      const { balance, required, inviteCode, projectTitle } = (e as CustomEvent).detail ?? {};
+      const { balance, required } = (e as CustomEvent).detail ?? {};
       // The 402 carries the live balance, so the badge is correct even here.
       if (typeof balance === "number") {
         setUser((prev) => (prev ? { ...prev, credits: balance } : prev));
       }
-      // A review-request code from the greeting's payment prompt rides to
-      // the pricing modal (two-sided flow §4d); any other 402 clears it.
-      setPricingInviteCode(typeof inviteCode === "string" && inviteCode ? inviteCode : undefined);
       setPricingNotice(
         finalreadModeRef.current
-          ? typeof projectTitle === "string" && projectTitle
-            ? `Review: ${projectTitle} — $199 for the complete review. One FinalRead Review pack covers the full report, stakeholder Q&A, and 2 re-scans.`
-            : `This FinalRead review needs credits (balance ${balance ?? 0}). One FinalRead Review pack ($199) covers the complete diligence cycle.`
+          ? `This FinalRead review needs credits (balance ${balance ?? 0}). One FinalRead Review pack ($199) covers the complete diligence cycle.`
           : `You're low on credits (balance ${balance ?? 0}, this action needs ~${required ?? "?"}). Top up to continue — the free PreFlight scan always costs 0.`
       );
       setPricingOpen(true);
@@ -728,97 +688,6 @@ export default function App() {
 
   const hasActiveWorkspace = activeCode || activePurpose || isGenerating;
 
-  // Two-sided flow §1: on the FinalRead view (the FinalRead host, or the
-  // #finalread hash in dev) the greeting IS the page — a slim light
-  // header, the buyer greeting, and the FinalRead footer. No workspace,
-  // no builder, no upload. The auth + pricing modals are shared with the
-  // workspace layout below.
-  if (finalreadView) {
-    return (
-      <div className="min-h-screen bg-white text-slate-900 flex flex-col font-sans antialiased">
-        <a
-          href="#main-content"
-          className="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 focus:z-50 focus:px-3 focus:py-2 focus:bg-slate-800 focus:text-slate-100 focus:rounded-lg"
-        >
-          Skip to content
-        </a>
-
-        {inAppBrowser && !inAppBannerDismissed && (
-          <InAppBrowserBanner app={inAppBrowser} onDismiss={dismissInAppBanner} />
-        )}
-
-        <header className="sticky top-0 z-30 flex items-center justify-between px-5 py-3.5 bg-white border-b border-slate-200">
-          <div className="flex items-center gap-2">
-            <div className="p-1.5 rounded bg-indigo-50 text-indigo-600 border border-indigo-100 select-none">
-              <Sparkles className="w-4 h-4" />
-            </div>
-            <h2 className="font-bold text-xs text-slate-900 uppercase tracking-wider font-sans select-none">
-              FinalRead
-            </h2>
-          </div>
-          <div className="flex items-center gap-2">
-            <a
-              href="https://gradevibes.com"
-              className="hidden sm:inline text-xs text-slate-500 hover:text-slate-800 transition"
-            >
-              Developer workspace — gradevibes.com
-            </a>
-            {user ? (
-              <>
-                <button
-                  onClick={() => { setPricingNotice(""); setPricingOpen(true); }}
-                  className="px-3 py-1.5 rounded-lg bg-amber-50 border border-amber-200 hover:border-amber-300 text-amber-700 text-xs font-medium flex items-center gap-1.5 transition duration-150"
-                  title="Buy more credits"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  <span>{user.credits.toLocaleString()} credits</span>
-                </button>
-                <button
-                  onClick={handleLogout}
-                  className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-100 text-slate-500 hover:text-slate-800 transition duration-150"
-                  title={`Sign out (${user.email})`}
-                  aria-label="Sign out"
-                >
-                  <LogOut className="w-4 h-4" />
-                </button>
-              </>
-            ) : (
-              <button
-                onClick={() => setAuthOpen(true)}
-                className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition duration-150"
-              >
-                Sign up / Sign in
-              </button>
-            )}
-          </div>
-        </header>
-
-        <main id="main-content" className="flex-1 flex flex-col min-h-0 bg-white relative overflow-hidden">
-          <FinalReadEntry />
-        </main>
-
-        <AuthModal
-          open={authOpen}
-          onClose={() => setAuthOpen(false)}
-          onAuthed={(u) => { setUser(u); setAuthOpen(false); }}
-          initialMode={authInitialMode}
-          resetToken={resetToken}
-          onResetComplete={clearResetToken}
-        />
-        <PricingModal
-          open={pricingOpen}
-          notice={pricingNotice}
-          audience={pricingAudience}
-          inviteCode={pricingInviteCode}
-          onClose={() => { setPricingOpen(false); setPricingInviteCode(undefined); void fetchMe().then(setUser); }}
-        />
-        {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
-
-        <Footer brand="FinalRead" />
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased">
       <a
@@ -851,7 +720,7 @@ export default function App() {
             </div>
             <div>
               <h2 className="font-bold text-xs text-slate-100 uppercase tracking-wider font-sans select-none">
-                {workspaceHeaderTitle(finalreadView)}
+                {workspaceHeaderTitle(finalreadEntryOpen)}
               </h2>
               {hasActiveWorkspace && (
                 <div className="flex items-center gap-2">
@@ -871,16 +740,14 @@ export default function App() {
 
         {/* Global Controls */}
         <div className="flex items-center gap-2">
-          {/* FinalRead — opens the seller's projects panel (two-sided
-              flow §2 step 3): save a project against the buyer's code,
-              scan from it, watch the deal. Not a hash anymore: on
-              gradevibes.com the #finalread hash redirects to
-              getfinalread.com, so the button opens the panel by state. */}
-          {!finalreadView && (
+          {/* FinalRead — opens the entry on the current workspace review.
+              Ungated: with no review yet the entry shows its ingest hero,
+              which is also the $199 purchase flow's entry point. */}
+          {!finalreadEntryOpen && (
             <button
-              onClick={() => { setFinalReadProjectsOpen(true); }}
+              onClick={() => { window.location.hash = "finalread"; }}
               className="px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/20 hover:border-indigo-500/40 text-indigo-300 text-xs font-medium flex items-center gap-1.5 transition duration-150"
-              title="Open your FinalRead projects"
+              title="Open the FinalRead review of this workspace"
             >
               FinalRead
             </button>
@@ -957,6 +824,15 @@ export default function App() {
 
       {/* Main Container Workspace */}
       <main id="main-content" className="flex-1 flex flex-col min-h-0 bg-slate-950 relative overflow-hidden">
+        {finalreadEntryOpen ? (
+          <React.Fragment key={user?.id ?? "logged-out"}>
+            <FinalReadEntry
+              onExit={closeFinalReadEntry}
+              sharedReview={sharedReview}
+              onSharedReviewChange={setSharedReview}
+            />
+          </React.Fragment>
+        ) : (
           <>
         {warningMessage && (
           <div className="mx-5 mt-4 p-3.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl flex items-center gap-3 text-xs select-text">
@@ -1295,6 +1171,7 @@ export default function App() {
           </div>
         )}
           </>
+        )}
       </main>
 
       {/* Slide-over registry sidebar */}
@@ -1305,13 +1182,6 @@ export default function App() {
         currentProjectId={currentProject?.id || null}
         onSelectProject={handleSelectProject}
         onDeleteProject={handleDeleteProject}
-      />
-
-      {/* Seller's FinalRead projects (two-sided flow §2 step 3) */}
-      <FinalReadProjects
-        open={finalReadProjectsOpen}
-        onClose={() => setFinalReadProjectsOpen(false)}
-        defaultTitle={currentTitle}
       />
 
       {/* Auth + billing modals */}
@@ -1327,13 +1197,12 @@ export default function App() {
         open={pricingOpen}
         notice={pricingNotice}
         audience={pricingAudience}
-        inviteCode={pricingInviteCode}
-        onClose={() => { setPricingOpen(false); setPricingInviteCode(undefined); void fetchMe().then(setUser); }}
+        onClose={() => { setPricingOpen(false); void fetchMe().then(setUser); }}
       />
       {legalDoc && <LegalModal doc={legalDoc} onClose={closeLegal} />}
 
       {/* Site footer with legal links */}
-      <Footer brand={footerBrandFor(finalreadView)} />
+      <Footer brand={footerBrandFor(finalreadEntryOpen)} />
     </div>
   );
 }

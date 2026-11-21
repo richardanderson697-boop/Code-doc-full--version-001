@@ -1,18 +1,10 @@
-// FinalRead two-sided flow: the versioned transaction model.
+// FinalRead seller project saving: the versioned transaction model.
 //
-// Implements finalread-two-sided-flow-spec.md (Revision 3, APPROVED
-// 2026-11-20; one-code decision CONFIRMED 2026-11-21). The store-level
-// helpers for the eight versioned tables plus the buyer-initiated
-// REVIEW-REQUEST lifecycle, the pending-audit report generation, the
-// atomic activation, the losing-payment refund record, and the
-// missing-audit report job.
-//
-// The flow (spec §2-§4): the buyer creates a review request and its
-// 8-character code; the seller saves a project against that code (the
-// bind); the seller scans (free, only when bound); the buyer enters the
-// SAME code to pay $199; the webhook activates the request FIRST, then
-// grants credits + entitlements. A losing payment (activation fails) is
-// refunded and grants NOTHING.
+// Implements finalread-seller-project-saving-spec.md (Revision 2,
+// APPROVED 2026-11-20). The store-level helpers for the eight versioned
+// tables plus the invite-code lifecycle, the pending-audit report
+// generation, the atomic activation, the losing-payment refund record,
+// and the missing-audit report job.
 //
 // Rules this module enforces (the spec's, not the caller's):
 // - The buyer never receives source code, workspace files, or the project
@@ -28,11 +20,6 @@
 //   the same moment; the audit JSON and content hash never change.
 // - Grant amounts live in server code (getPacks), never in Stripe metadata.
 // - Nothing here commits, pushes, or deploys. It only writes rows.
-//
-// Naming note: the legacy tables/columns keep their `invite_code_id`
-// names (values now hold review-request ids); only the Stripe metadata
-// key was renamed inviteCodeId -> requestCodeId (spec §4d). Renaming the
-// DB columns was rejected as migration risk the spec does not require.
 import crypto from "crypto";
 import { getDb, type Db } from "./store";
 import { log } from "./logger";
@@ -44,7 +31,7 @@ import {
   type FinalReadReviewRow,
   type ReviewVersionRow,
 } from "./finalread-rescans";
-import { buildFinalReadReport, stripLedgerSourceText } from "../shared/finalread-report";
+import { buildFinalReadReport } from "../shared/finalread-report";
 import { listWorkspaceFiles } from "./workspace-store";
 import { createStripeRefund } from "./stripe-client";
 import { sendFinalReadRefundEmail } from "./email";
@@ -57,51 +44,9 @@ export interface FinalReadProjectRow {
   title: string;
   finalread_review_id: string | null;
   purchase_stripe_event_id: string | null;
-  /** Id of the bound buyer review request (two-sided flow §4b). */
-  request_id: string | null;
-  /** ISO timestamp of a scan currently running for this project (§4c). */
-  scan_in_progress_at: string | null;
   status: "draft" | "active" | "closed";
   created_at: string;
   updated_at: string;
-}
-
-/**
- * A buyer-initiated review request (two-sided flow §4a). The buyer
- * creates it and its 8-character code; the seller binds a project to it.
- * One code flows buyer -> seller -> buyer.
- * status: requested -> uploaded -> reserved -> activated / expired /
- * revoked. `code_hash` is the ONLY stored form of the code.
- */
-export interface ReviewRequestRow {
-  id: string;
-  buyer_user_id: string;
-  title: string;
-  code_hash: string;
-  status: "requested" | "uploaded" | "reserved" | "activated" | "expired" | "revoked";
-  project_id: string | null;
-  reserved_by: string | null;
-  reserved_until: string | null;
-  used_at: string | null;
-  expires_at: string;
-  created_at: string;
-  updated_at: string;
-}
-
-/** A buyer may hold at most this many unbound (requested, unexpired) requests. */
-export const MAX_UNBOUND_REVIEW_REQUESTS = 3;
-/** A buyer may create at most this many requests per rolling 24h day. */
-export const MAX_REVIEW_REQUESTS_PER_DAY = 5;
-/** A request's code expires this long after creation (spec §4a). */
-export const REVIEW_REQUEST_TTL_DAYS = 30;
-/** A scan-in-progress marker older than this is stale and may be retaken (§4c). */
-export const SCAN_GUARD_STALE_MINUTES = 30;
-
-export class ReviewRequestRateLimitedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "ReviewRequestRateLimitedError";
-  }
 }
 
 export interface AuditSnapshotRow {
@@ -133,14 +78,6 @@ export interface BuyerAccessRow {
   created_at: string;
 }
 
-/**
- * Legacy seller-issued invite code (Revision 2, SUPERSEDED by the
- * two-sided flow §4a — no route reads or writes this table after the
- * Rev 3 build). Kept because the table still exists in the schema for
- * pre-Rev3 rows. Buyer access / refund / pending-activation rows keep
- * their `invite_code_id` column names; the values now hold
- * review-request ids.
- */
 export interface InviteCodeRow {
   id: string;
   project_id: string;
@@ -283,132 +220,25 @@ export async function migrateFinalReadSchemaAfter(db: Db): Promise<void> {
   }
 }
 
-/**
- * Two-sided flow spec Rev 3 (§4b, §4c): the project row gains the bound
- * request id and the DB-backed scan-in-progress marker. CREATE TABLE IF
- * NOT EXISTS cannot add columns to an existing table, so this runs after
- * the SCHEMA in initSchema and adds them only when missing (idempotent —
- * fresh installs already have them from the SCHEMA).
- */
-export async function migrateFinalReadProjectColumns(db: Db): Promise<void> {
-  let columns: Set<string> | null;
-  if (db.dialect === "postgres") {
-    const rows = await db.all<{ column_name: string }>(
-      "SELECT column_name FROM information_schema.columns WHERE table_name = $1",
-      ["finalread_projects"]
-    );
-    if (rows.length === 0) return; // table does not exist yet
-    columns = new Set(rows.map((r) => r.column_name));
-  } else {
-    const rows = await db.all<{ name: string }>("PRAGMA table_info(finalread_projects)");
-    if (rows.length === 0) return;
-    columns = new Set(rows.map((r) => r.name));
-  }
-  if (!columns.has("request_id")) {
-    await db.exec("ALTER TABLE finalread_projects ADD COLUMN request_id TEXT");
-  }
-  if (!columns.has("scan_in_progress_at")) {
-    await db.exec(
-      db.dialect === "postgres"
-        ? "ALTER TABLE finalread_projects ADD COLUMN scan_in_progress_at TIMESTAMPTZ"
-        : "ALTER TABLE finalread_projects ADD COLUMN scan_in_progress_at TEXT"
-    );
-  }
-}
-
 // ---- Projects (seller-owned, owner-scoped, 404 cross-user) ----
 
-/**
- * Seller save with a request code (two-sided flow §4b): the ATOMIC
- * BIND. One conditional UPDATE claims the request — status requested,
- * unexpired, and the buyer is not the seller (the bind-time identity
- * rule) — and the project row is created bound to it in the same
- * transaction. Exactly one row must change; a second seller racing for
- * the same code loses (0 rows) and gets the generic "isn't valid"
- * answer, so a code can never be claimed twice. A save WITHOUT a valid
- * request code is rejected — there is no codeless project path in the
- * two-sided flow, so createFinalReadProject is gone. Returns null when
- * the code is missing, unknown, expired, already bound, or belongs to
- * the seller.
- */
-export async function createProjectWithRequest(
+export async function createFinalReadProject(
   sellerUserId: string,
-  title: string,
-  requestCode: string
-): Promise<FinalReadProjectRow | null> {
+  title: string
+): Promise<FinalReadProjectRow> {
   const db = getDb();
-  const request = await findReviewRequestByHash(hashInviteCode(requestCode));
-  if (!request) return null;
-  const projectId = `frp_${crypto.randomUUID()}`;
+  const id = `frp_${crypto.randomUUID()}`;
   const now = new Date().toISOString();
-  const bound = await db.transaction(async (tx) => {
-    const res = await tx.run(
-      "UPDATE finalread_review_requests SET status = $1, project_id = $2, updated_at = $3 WHERE id = $4 AND status = $5 AND expires_at > $6 AND buyer_user_id != $7",
-      ["uploaded", projectId, now, request.id, "requested", now, sellerUserId]
-    );
-    if (res.changes !== 1) return false;
-    await tx.run(
-      "INSERT INTO finalread_projects (id, seller_user_id, title, finalread_review_id, purchase_stripe_event_id, request_id, scan_in_progress_at, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-      [projectId, sellerUserId, title, null, null, request.id, null, "draft", now, now]
-    );
-    return true;
-  });
-  if (!bound) return null;
-  const row = await getFinalReadProject(projectId);
+  await db.run(
+    "INSERT INTO finalread_projects (id, seller_user_id, title, finalread_review_id, purchase_stripe_event_id, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    [id, sellerUserId, title, null, null, "draft", now, now]
+  );
+  const row = await db.get<FinalReadProjectRow>(
+    "SELECT * FROM finalread_projects WHERE id = $1",
+    [id]
+  );
   if (!row) throw new Error("Failed to create FinalRead project");
   return row;
-}
-
-/**
- * Re-bind a DRAFT project to a different request code before payment
- * (§4b): the same atomic claim as the bind, and the previously bound
- * request (if any) is revoked and detached. Re-entering the code the
- * project is already bound to is a no-op success. Blocked while the
- * bound request has an active checkout reservation — closing the deal
- * out from under a buyer mid-checkout is the same hazard the
- * close-while-reserved rule (§4i case 3) guards. A paid project is
- * 'active', not 'draft', so it can never be re-bound.
- */
-export async function rebindProjectRequest(
-  projectId: string,
-  sellerUserId: string,
-  requestCode: string
-): Promise<"ok" | "not-found" | "reserved" | "invalid-code"> {
-  const db = getDb();
-  const project = await getFinalReadProjectForSeller(projectId, sellerUserId);
-  if (!project || project.status !== "draft") return "not-found";
-  const request = await findReviewRequestByHash(hashInviteCode(requestCode));
-  if (!request) return "invalid-code";
-  const existing = await getRequestForProject(projectId);
-  if (existing && existing.id === request.id) return "ok";
-  if (
-    existing &&
-    existing.status === "reserved" &&
-    existing.reserved_until &&
-    new Date(existing.reserved_until) > new Date()
-  ) {
-    return "reserved";
-  }
-  const now = new Date().toISOString();
-  const bound = await db.transaction(async (tx) => {
-    const res = await tx.run(
-      "UPDATE finalread_review_requests SET status = $1, project_id = $2, updated_at = $3 WHERE id = $4 AND status = $5 AND expires_at > $6 AND buyer_user_id != $7",
-      ["uploaded", projectId, now, request.id, "requested", now, sellerUserId]
-    );
-    if (res.changes !== 1) return false;
-    if (existing) {
-      await tx.run(
-        "UPDATE finalread_review_requests SET status = $1, project_id = $2, updated_at = $3 WHERE id = $4",
-        ["revoked", null, now, existing.id]
-      );
-    }
-    await tx.run(
-      "UPDATE finalread_projects SET request_id = $1, updated_at = $2 WHERE id = $3",
-      [request.id, now, projectId]
-    );
-    return true;
-  });
-  return bound ? "ok" : "invalid-code";
 }
 
 export async function getFinalReadProject(
@@ -518,84 +348,31 @@ export async function setProjectActive(
   );
 }
 
-// ---- Scan-in-progress guard (two-sided flow §4c, §4i case 5) ----
-
-/**
- * Try to claim the scan guard for a project: a conditional UPDATE sets
- * scan_in_progress_at only when no scan is running or the marker is
- * stale (older than SCAN_GUARD_STALE_MINUTES). Returns true when this
- * caller holds the guard. A second scan while one runs gets false (the
- * route answers 409) and the first scan's pending audit stays intact.
- */
-export async function tryAcquireScanGuard(projectId: string): Promise<boolean> {
-  const db = getDb();
-  const now = new Date();
-  const staleBefore = new Date(now.getTime() - SCAN_GUARD_STALE_MINUTES * 60 * 1000);
-  const result = await db.run(
-    "UPDATE finalread_projects SET scan_in_progress_at = $1 WHERE id = $2 AND (scan_in_progress_at IS NULL OR scan_in_progress_at < $3)",
-    [now.toISOString(), projectId, staleBefore.toISOString()]
-  );
-  return result.changes === 1;
-}
-
-/** Release the scan guard (called on scan completion AND failure). */
-export async function releaseScanGuard(projectId: string): Promise<void> {
-  await getDb().run(
-    "UPDATE finalread_projects SET scan_in_progress_at = $1 WHERE id = $2",
-    [null, projectId]
-  );
-}
-
 /**
  * Close (soft-delete) a project: status -> closed, hidden from the seller's
  * active list. The project row and every paid record survive closure (the
  * buyer keeps the report, the Q&A history, and the audit snapshots). Only
- * unactivated review requests are revoked — they were never paid for.
- *
- * Close-while-reserved (§4i case 3): closing a project with an ACTIVE
- * checkout reservation returns "reserved" (the route answers 409) — the
- * buyer mid-checkout must not lose the deal. Once the reservation
- * expires, close succeeds. Returns "not-found" when the project does
- * not exist or belongs to someone else.
+ * unactivated invite codes are revoked — they were never paid for. Returns
+ * false when the project does not exist or belongs to someone else.
  */
 export async function closeFinalReadProject(
   id: string,
   sellerUserId: string
-): Promise<"closed" | "not-found" | "reserved"> {
+): Promise<boolean> {
   const db = getDb();
   const project = await getFinalReadProjectForSeller(id, sellerUserId);
-  if (!project) return "not-found";
-  const bound = await getRequestForProject(id);
-  if (
-    bound &&
-    bound.status === "reserved" &&
-    bound.reserved_until &&
-    new Date(bound.reserved_until) > new Date()
-  ) {
-    return "reserved";
-  }
+  if (!project) return false;
   await db.transaction(async (tx) => {
     await tx.run(
       "UPDATE finalread_projects SET status = $1, updated_at = $2 WHERE id = $3",
       ["closed", new Date().toISOString(), id]
     );
     await tx.run(
-      "UPDATE finalread_review_requests SET status = $1, updated_at = $2 WHERE project_id = $3 AND status IN ($4, $5)",
-      ["revoked", new Date().toISOString(), id, "uploaded", "reserved"]
+      "UPDATE finalread_invite_codes SET status = $1, updated_at = $2 WHERE project_id = $3 AND status IN ($4, $5)",
+      ["revoked", new Date().toISOString(), id, "issued", "reserved"]
     );
   });
-  return "closed";
-}
-
-/** True when a project has an ACTIVE checkout reservation on its bound request. */
-export async function projectHasActiveReservation(projectId: string): Promise<boolean> {
-  const bound = await getRequestForProject(projectId);
-  return (
-    !!bound &&
-    bound.status === "reserved" &&
-    !!bound.reserved_until &&
-    new Date(bound.reserved_until) > new Date()
-  );
+  return true;
 }
 
 // ---- Audit snapshots + reports (versioned, immutable content) ----
@@ -699,10 +476,12 @@ export async function getLatestReportForReview(
   );
 }
 
-// ---- Review requests (buyer-initiated codes, hash-only storage, 30-day expiry, one buyer per project) ----
+// ---- Invite codes (hash-only storage, 30-day expiry, one buyer per project) ----
 
 /** Checkout reservation length: the Stripe session expires with it. */
-export const REVIEW_REQUEST_RESERVATION_MINUTES = 30;
+export const INVITE_RESERVATION_MINUTES = 30;
+/** Invite-code expiry when never activated. */
+export const INVITE_EXPIRY_DAYS = 30;
 
 // 8 characters, uppercase letters + digits, unambiguous characters
 // excluded (no 0/O, 1/I, L) — the same "8-character" shape the seller
@@ -721,11 +500,11 @@ export function hashInviteCode(code: string): string {
   return crypto.createHash("sha256").update(code.trim().toUpperCase()).digest("hex");
 }
 
-function requestExpired(row: ReviewRequestRow, now: Date = new Date()): boolean {
+function inviteCodeExpired(row: InviteCodeRow, now: Date = new Date()): boolean {
   return new Date(row.expires_at).getTime() <= now.getTime();
 }
 
-function requestReservationActive(row: ReviewRequestRow, now: Date = new Date()): boolean {
+function reservationActive(row: InviteCodeRow, now: Date = new Date()): boolean {
   return (
     row.status === "reserved" &&
     !!row.reserved_until &&
@@ -734,104 +513,68 @@ function requestReservationActive(row: ReviewRequestRow, now: Date = new Date())
 }
 
 /**
- * Create a review request (two-sided flow §4a). The buyer names the
- * deal; the code is shown ONCE to the buyer (the seller gets it from the
- * buyer, off-platform) and only the hash is stored. 30-day expiry.
- *
- * Rate limits (§4a), enforced inside the same transaction as the
- * insert so a concurrent double-create cannot slip past them:
- * - at most MAX_UNBOUND_REVIEW_REQUESTS unbound (requested, unexpired)
- *   requests at a time — an expired request frees its slot;
- * - at most MAX_REVIEW_REQUESTS_PER_DAY created per rolling 24h day.
- * Over either limit throws ReviewRequestRateLimitedError (the route
- * maps it to 429). Returns the plaintext code ONCE.
+ * Issue an invite code for a project. The seller cannot issue a code until
+ * a pending audit exists (the initial scan has run) — a code for a project
+ * with no audit would let a buyer pay for a report that cannot be
+ * generated. Returns the plaintext code ONCE (the seller copies it); only
+ * the hash is stored.
  */
-export async function createReviewRequest(
-  buyerUserId: string,
-  title: string
-): Promise<{ code: string; row: ReviewRequestRow }> {
+export async function createInviteCode(
+  projectId: string
+): Promise<{ code: string; row: InviteCodeRow }> {
   const db = getDb();
-  const now = new Date();
-  const expiresAt = new Date(now.getTime() + REVIEW_REQUEST_TTL_DAYS * 24 * 60 * 60 * 1000);
-  const id = `frrq_${crypto.randomUUID()}`;
+  const project = await getFinalReadProject(projectId);
+  if (!project) throw new Error("Project not found");
+  if (project.status === "closed") throw new Error("Project is closed");
+  if (await projectHasActivatedBuyer(projectId)) {
+    throw new Error("Project already has a buyer");
+  }
+  if (!project.finalread_review_id) throw new Error("Project has no review yet");
+  const pending = await getPendingAuditSnapshot(project.finalread_review_id);
+  if (!pending) throw new Error("Run the initial scan before inviting a buyer");
   const code = generateInviteCode();
-  await db.transaction(async (tx) => {
-    const unbound = await tx.get<{ count: string | number }>(
-      "SELECT COUNT(*) AS count FROM finalread_review_requests WHERE buyer_user_id = $1 AND status = $2 AND expires_at > $3",
-      [buyerUserId, "requested", now.toISOString()]
-    );
-    if (Number(unbound?.count ?? 0) >= MAX_UNBOUND_REVIEW_REQUESTS) {
-      throw new ReviewRequestRateLimitedError(
-        "Too many open review requests — wait for one to be used or expire"
-      );
-    }
-    const today = await tx.get<{ count: string | number }>(
-      "SELECT COUNT(*) AS count FROM finalread_review_requests WHERE buyer_user_id = $1 AND created_at > $2",
-      [buyerUserId, new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString()]
-    );
-    if (Number(today?.count ?? 0) >= MAX_REVIEW_REQUESTS_PER_DAY) {
-      throw new ReviewRequestRateLimitedError("Too many review requests created today");
-    }
-    await tx.run(
-      "INSERT INTO finalread_review_requests (id, buyer_user_id, title, code_hash, status, project_id, reserved_by, reserved_until, used_at, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-      [
-        id,
-        buyerUserId,
-        title,
-        hashInviteCode(code),
-        "requested",
-        null,
-        null,
-        null,
-        null,
-        expiresAt.toISOString(),
-        now.toISOString(),
-        now.toISOString(),
-      ]
-    );
-  });
-  const row = await db.get<ReviewRequestRow>(
-    "SELECT * FROM finalread_review_requests WHERE id = $1",
+  const id = `fric_${crypto.randomUUID()}`;
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + INVITE_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
+  await db.run(
+    "INSERT INTO finalread_invite_codes (id, project_id, code_hash, status, reserved_by, reserved_until, used_at, buyer_user_id, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    [
+      id,
+      projectId,
+      hashInviteCode(code),
+      "issued",
+      null,
+      null,
+      null,
+      null,
+      expiresAt.toISOString(),
+      now.toISOString(),
+      now.toISOString(),
+    ]
+  );
+  const row = await db.get<InviteCodeRow>(
+    "SELECT * FROM finalread_invite_codes WHERE id = $1",
     [id]
   );
-  if (!row) throw new Error("Failed to create review request");
+  if (!row) throw new Error("Failed to create invite code");
   return { code, row };
 }
 
-export async function getReviewRequest(
-  id: string
-): Promise<ReviewRequestRow | undefined> {
-  return getDb().get<ReviewRequestRow>(
-    "SELECT * FROM finalread_review_requests WHERE id = $1",
-    [id]
-  );
-}
-
-export async function listReviewRequests(
-  buyerUserId: string
-): Promise<ReviewRequestRow[]> {
-  return getDb().all<ReviewRequestRow>(
-    "SELECT * FROM finalread_review_requests WHERE buyer_user_id = $1 ORDER BY created_at DESC",
-    [buyerUserId]
-  );
-}
-
-export async function findReviewRequestByHash(
+export async function findInviteCodeByHash(
   codeHash: string
-): Promise<ReviewRequestRow | undefined> {
-  return getDb().get<ReviewRequestRow>(
-    "SELECT * FROM finalread_review_requests WHERE code_hash = $1",
+): Promise<InviteCodeRow | undefined> {
+  return getDb().get<InviteCodeRow>(
+    "SELECT * FROM finalread_invite_codes WHERE code_hash = $1",
     [codeHash]
   );
 }
 
-/** The request currently bound to a project (uploaded / reserved / activated). */
-export async function getRequestForProject(
+export async function getInviteCodesForProject(
   projectId: string
-): Promise<ReviewRequestRow | undefined> {
-  return getDb().get<ReviewRequestRow>(
-    "SELECT * FROM finalread_review_requests WHERE project_id = $1 AND status IN ($2, $3, $4) ORDER BY created_at DESC LIMIT 1",
-    [projectId, "uploaded", "reserved", "activated"]
+): Promise<InviteCodeRow[]> {
+  return getDb().all<InviteCodeRow>(
+    "SELECT * FROM finalread_invite_codes WHERE project_id = $1 ORDER BY created_at DESC",
+    [projectId]
   );
 }
 
@@ -843,42 +586,34 @@ export async function projectHasActivatedBuyer(projectId: string): Promise<boole
   return !!row;
 }
 
-export interface ReviewRequestValidation {
+export interface InviteCodeValidation {
   valid: boolean;
   /** The code is already activated for this caller — they view the report, they do not pay again. */
   activatedForCaller: boolean;
   project?: FinalReadProjectRow;
-  request?: ReviewRequestRow;
+  code?: InviteCodeRow;
   reportId?: string | null;
 }
 
 /**
- * Validate a buyer-entered code (two-sided flow §4a). Every failure
- * returns the same generic shape (valid: false) — no enumeration of
- * whether a code exists, is expired, or is already used. Valid ONLY
- * when bound to a project WITH a pending audit (a code for a project
- * with no audit would let a buyer pay for a report that cannot be
- * generated). A code reserved by ANOTHER buyer whose reservation is
- * still active is not valid here; the "already in use" message is given
- * at checkout time instead (criterion 15).
- *
- * The code is the deal key for an unactivated request: any caller
- * holding it may validate and pay (as the seller-issued codes were).
- * Once activated, only the buyer who paid may resolve it.
+ * Validate a buyer-entered code. Every failure returns the same generic
+ * shape (valid: false) — no enumeration of whether a code exists, is
+ * expired, or is already used. A code reserved by ANOTHER buyer whose
+ * reservation is still active is not valid here; the "already in use"
+ * message is given at checkout time instead (criterion 15).
  */
-export async function validateReviewRequestCode(
+export async function validateInviteCode(
   code: string,
   callerUserId: string
-): Promise<ReviewRequestValidation> {
-  const row = await findReviewRequestByHash(hashInviteCode(code));
+): Promise<InviteCodeValidation> {
+  const row = await findInviteCodeByHash(hashInviteCode(code));
   if (!row) return { valid: false, activatedForCaller: false };
   if (row.status === "revoked") return { valid: false, activatedForCaller: false };
-  if (requestExpired(row)) return { valid: false, activatedForCaller: false };
+  if (inviteCodeExpired(row)) return { valid: false, activatedForCaller: false };
   if (row.status === "activated") {
     if (row.buyer_user_id !== callerUserId) {
       return { valid: false, activatedForCaller: false };
     }
-    if (!row.project_id) return { valid: false, activatedForCaller: false };
     const project = await getFinalReadProject(row.project_id);
     if (!project || !project.finalread_review_id) {
       return { valid: false, activatedForCaller: false };
@@ -888,66 +623,56 @@ export async function validateReviewRequestCode(
       valid: true,
       activatedForCaller: true,
       project,
-      request: row,
+      code: row,
       reportId: report ? report.id : null,
     };
   }
-  if (requestReservationActive(row) && row.reserved_by !== callerUserId) {
+  if (reservationActive(row) && row.reserved_by !== callerUserId) {
     return { valid: false, activatedForCaller: false };
   }
-  if (!row.project_id) return { valid: false, activatedForCaller: false };
   const project = await getFinalReadProject(row.project_id);
   if (!project) return { valid: false, activatedForCaller: false };
   if (await projectHasActivatedBuyer(row.project_id)) {
     return { valid: false, activatedForCaller: false };
   }
-  // No buyer request, no scan — and no payment without a report to
-  // generate: the bound project must have a pending audit.
-  if (!project.finalread_review_id) return { valid: false, activatedForCaller: false };
-  const pending = await getPendingAuditSnapshot(project.finalread_review_id);
-  if (!pending) return { valid: false, activatedForCaller: false };
-  return { valid: true, activatedForCaller: false, project, request: row, reportId: null };
+  return { valid: true, activatedForCaller: false, project, code: row, reportId: null };
 }
 
 export type ReserveResult = "reserved" | "in_use" | "invalid";
 
 /**
- * Reserve a review request for checkout (30 minutes). Atomic: the
- * conditional UPDATE succeeds only when the request is uploaded (bound
- * to a project), or its reservation has expired, or it is already
- * reserved by this buyer. Only one buyer can hold an active
- * reservation. Returns "in_use" when another buyer holds an unexpired
- * reservation (the checkout tells them the code is already in use);
- * "invalid" when the request cannot be used at all.
+ * Reserve an invite code for checkout (30 minutes). Atomic: the conditional
+ * UPDATE succeeds only when the code is issued, or its reservation has
+ * expired, or it is already reserved by this buyer. Only one buyer can
+ * hold an active reservation. Returns "in_use" when another buyer holds an
+ * unexpired reservation (the checkout tells them the code is already in
+ * use); "invalid" when the code cannot be used at all.
  */
-export async function reserveReviewRequestCode(
-  requestId: string,
+export async function reserveInviteCode(
+  codeId: string,
   buyerUserId: string
 ): Promise<ReserveResult> {
   const db = getDb();
-  const row = await db.get<ReviewRequestRow>(
-    "SELECT * FROM finalread_review_requests WHERE id = $1",
-    [requestId]
+  const row = await db.get<InviteCodeRow>(
+    "SELECT * FROM finalread_invite_codes WHERE id = $1",
+    [codeId]
   );
   if (!row) return "invalid";
   if (row.status === "activated" || row.status === "revoked") return "invalid";
-  if (requestExpired(row)) return "invalid";
-  if (requestReservationActive(row) && row.reserved_by !== buyerUserId) return "in_use";
-  if (!row.project_id) return "invalid";
+  if (inviteCodeExpired(row)) return "invalid";
+  if (reservationActive(row) && row.reserved_by !== buyerUserId) return "in_use";
   if (await projectHasActivatedBuyer(row.project_id)) return "invalid";
   const now = new Date();
-  const reservedUntil = new Date(
-    now.getTime() + REVIEW_REQUEST_RESERVATION_MINUTES * 60 * 1000
-  );
+  const reservedUntil = new Date(now.getTime() + INVITE_RESERVATION_MINUTES * 60 * 1000);
   const result = await db.run(
-    "UPDATE finalread_review_requests SET status = $1, reserved_by = $2, reserved_until = $3, updated_at = $4 WHERE id = $5 AND (status = $6 OR (status = $7 AND (reserved_until <= $8 OR reserved_by = $9)))",
+    "UPDATE finalread_invite_codes SET status = $1, reserved_by = $2, reserved_until = $3, updated_at = $4 WHERE id = $5 AND (status = $6 OR (status = $7 AND (reserved_until <= $8 OR reserved_by = $9)))",
     [
       "reserved",
       buyerUserId,
       reservedUntil.toISOString(),
       now.toISOString(),
-      requestId,
-      "uploaded",
+      codeId,
+      "issued",
       "reserved",
       now.toISOString(),
       buyerUserId,
@@ -955,20 +680,37 @@ export async function reserveReviewRequestCode(
   );
   if (result.changes === 1) return "reserved";
   // Lost a race: re-read to tell "in use" apart from "invalid".
-  const after = await db.get<ReviewRequestRow>(
-    "SELECT * FROM finalread_review_requests WHERE id = $1",
-    [requestId]
+  const after = await db.get<InviteCodeRow>(
+    "SELECT * FROM finalread_invite_codes WHERE id = $1",
+    [codeId]
   );
-  if (after && requestReservationActive(after) && after.reserved_by !== buyerUserId) {
-    return "in_use";
-  }
+  if (after && reservationActive(after) && after.reserved_by !== buyerUserId) return "in_use";
   return "invalid";
 }
 
-// Seller-issued invite-code revocation is SUPERSEDED by the two-sided
-// flow: requests are revoked by project closure, by activation of
-// another request for the same project, or by re-binding to a new code.
-// There is no standalone revoke endpoint.
+/**
+ * Revoke an unactivated code (seller only). An activated code cannot be
+ * revoked — the buyer paid for it. Returns false when the code does not
+ * exist, belongs to another seller's project, or is already activated.
+ */
+export async function revokeInviteCode(
+  codeId: string,
+  sellerUserId: string
+): Promise<boolean> {
+  const db = getDb();
+  const row = await db.get<InviteCodeRow>(
+    "SELECT * FROM finalread_invite_codes WHERE id = $1",
+    [codeId]
+  );
+  if (!row || row.status === "activated") return false;
+  const project = await getFinalReadProjectForSeller(row.project_id, sellerUserId);
+  if (!project) return false;
+  const result = await db.run(
+    "UPDATE finalread_invite_codes SET status = $1, updated_at = $2 WHERE id = $3 AND status IN ($4, $5)",
+    ["revoked", new Date().toISOString(), codeId, "issued", "reserved"]
+  );
+  return result.changes === 1;
+}
 
 // ---- Buyer access (resource-level authorization) ----
 
@@ -1117,7 +859,7 @@ export async function createVersionReport(
       now,
     ]
   );
-  const report = stripLedgerSourceText(buildFinalReadReport(opts.audit as any));
+  const report = buildFinalReadReport(opts.audit as any);
   await db.run(
     "INSERT INTO finalread_reports (id, version_id, review_id, report, created_at) VALUES ($1, $2, $3, $4, $5)",
     [reportId, versionId, opts.reviewId, toJson(report), now]
@@ -1209,7 +951,7 @@ export async function generateReportFromPendingAudit(
       now,
     ]
   );
-  const report = stripLedgerSourceText(buildFinalReadReport(parseJson(snapshot.audit) as any));
+  const report = buildFinalReadReport(parseJson(snapshot.audit) as any);
   await db.run(
     "INSERT INTO finalread_reports (id, version_id, review_id, report, created_at) VALUES ($1, $2, $3, $4, $5)",
     [reportId, versionId, opts.reviewId, toJson(report), now]
@@ -1284,41 +1026,21 @@ export interface ActivationResult {
 }
 
 /**
- * Idempotency guard (two-sided flow §4e): a Stripe event id that
- * already produced a buyer-access row for this buyer counts as an
- * already-successful activation. A retried webhook (or a retried claim)
- * must not re-activate — and must not refund — a payment that already
- * succeeded. Checked BEFORE the reserve in both the webhook and claim
- * paths, because a re-reserve of an already-activated request would
- * fail and look like a losing payment.
- */
-export async function findBuyerAccessByStripeEvent(
-  stripeEventId: string,
-  buyerUserId: string
-): Promise<BuyerAccessRow | undefined> {
-  return getDb().get<BuyerAccessRow>(
-    "SELECT * FROM finalread_buyer_access WHERE stripe_event_id = $1 AND buyer_user_id = $2",
-    [stripeEventId, buyerUserId]
-  );
-}
-
-/**
- * Activate a review request for the buyer who paid, atomically:
- * 1. A single conditional UPDATE flips the request reserved ->
- *    activated. It must affect exactly 1 row; 0 rows means the
- *    activation failed (the request was already activated by another
- *    buyer, the reservation expired, or it belongs to another buyer).
- * 2. In one transaction: the buyer-access record is created, every
- *    other unactivated request for the project is revoked (one buyer
- *    per project), and the report is generated from the pending audit.
+ * Activate an invite code for the buyer who paid, atomically:
+ * 1. A single conditional UPDATE flips the code reserved -> activated. It
+ *    must affect exactly 1 row; 0 rows means the activation failed (the
+ *    code was already activated by another buyer, the reservation expired,
+ *    or it belongs to another buyer).
+ * 2. In one transaction: the buyer-access record is created, every other
+ *    unactivated code for the project is revoked (one buyer per project),
+ *    and the report is generated from the pending audit.
  *
- * The caller grants the credits + entitlements ONLY on activation
- * success (spec §4e — activate FIRST, grant SECOND). On failure the
- * caller refunds the $199 and grants NOTHING — a losing payment is
- * never silently ignored and never gives the product away.
+ * On failure the caller grants the credits + entitlements anyway (the
+ * buyer paid for the pack) and refunds the $199 — a losing payment is
+ * never silently ignored.
  */
-export async function activateReviewRequestForUser(opts: {
-  requestCodeId: string;
+export async function activateInviteCodeForUser(opts: {
+  inviteCodeId: string;
   projectId: string;
   buyerUserId: string;
   stripeEventId: string;
@@ -1331,12 +1053,13 @@ export async function activateReviewRequestForUser(opts: {
   const reviewId = project.finalread_review_id;
   const now = new Date();
   const activated = await db.run(
-    "UPDATE finalread_review_requests SET status = $1, used_at = $2, updated_at = $3 WHERE id = $4 AND status = $5 AND reserved_by = $6 AND reserved_until > $7",
+    "UPDATE finalread_invite_codes SET status = $1, used_at = $2, buyer_user_id = $3, updated_at = $4 WHERE id = $5 AND status = $6 AND reserved_by = $7 AND reserved_until > $8",
     [
       "activated",
       now.toISOString(),
+      opts.buyerUserId,
       now.toISOString(),
-      opts.requestCodeId,
+      opts.inviteCodeId,
       "reserved",
       opts.buyerUserId,
       now.toISOString(),
@@ -1354,15 +1077,15 @@ export async function activateReviewRequestForUser(opts: {
         opts.buyerUserId,
         opts.projectId,
         reviewId,
-        opts.requestCodeId,
+        opts.inviteCodeId,
         opts.stripeEventId,
         now.toISOString(),
         now.toISOString(),
       ]
     );
     await tx.run(
-      "UPDATE finalread_review_requests SET status = $1, updated_at = $2 WHERE project_id = $3 AND id != $4 AND status IN ($5, $6)",
-      ["revoked", now.toISOString(), opts.projectId, opts.requestCodeId, "uploaded", "reserved"]
+      "UPDATE finalread_invite_codes SET status = $1, updated_at = $2 WHERE project_id = $3 AND id != $4 AND status IN ($5, $6)",
+      ["revoked", now.toISOString(), opts.projectId, opts.inviteCodeId, "issued", "reserved"]
     );
     const generated = await generateReportFromPendingAudit(tx, {
       reviewId,
@@ -1372,8 +1095,8 @@ export async function activateReviewRequestForUser(opts: {
   });
   if (outcome.reportId === null) {
     // Missing-audit edge case (spec §5.2): the payment is recorded, the
-    // credits + entitlements are granted, and the request IS activated —
-    // the report is generated by an enqueued server-side scan instead of
+    // credits + entitlements are granted, and the code IS activated — the
+    // report is generated by an enqueued server-side scan instead of
     // failing the payment. The buyer sees "report is being generated"
     // until the job completes. Enqueue only: the scan runs when the
     // report is fetched (never a model call inside the webhook).
@@ -1382,12 +1105,11 @@ export async function activateReviewRequestForUser(opts: {
   return { ok: true, buyerAccessId: outcome.accessId, reportId: outcome.reportId };
 }
 
-// ---- Parked purchases: the review-request activation follows the claim ----
+// ---- Parked purchases: the invite-code activation follows the claim ----
 
 export async function createPendingActivation(opts: {
   stripeEventId: string;
-  /** Review-request id (stored in the legacy invite_code_id column). */
-  requestCodeId: string;
+  inviteCodeId: string;
   projectId: string;
   email: string;
   /** Stored so a failed activation at claim time can still refund. */
@@ -1400,7 +1122,7 @@ export async function createPendingActivation(opts: {
       : "INSERT OR IGNORE INTO finalread_pending_activations (stripe_event_id, invite_code_id, project_id, email, payment_intent, created_at) VALUES ($1, $2, $3, $4, $5, $6)";
   await db.run(sql, [
     opts.stripeEventId,
-    opts.requestCodeId,
+    opts.inviteCodeId,
     opts.projectId,
     opts.email,
     opts.paymentIntent ?? null,
@@ -1424,77 +1146,14 @@ export async function deletePendingActivation(stripeEventId: string): Promise<vo
 }
 
 /**
- * Attempt ONE parked activation (two-sided flow §4g): the claim-path
- * reorder — activation is attempted BEFORE the credits + entitlements
- * are claimed (claimPendingCredits calls this first; only on success
- * does it claim the pack). On activation failure the $199 is refunded,
- * the parked row is deleted, and NOTHING is claimed. The idempotency
- * guard runs first: a prior success for this Stripe event id + buyer
- * counts as success, so a retried claim never refunds a payment that
- * already activated. The checkout reservation (30 min) may have
- * expired while the purchase was parked, so the request is re-reserved
- * for the buyer who already paid before activating — a slow claim is
- * not punished with a refund. Processed rows are deleted either way; a
- * failed activation's refund record is the durable trace.
- */
-export async function attemptPendingActivation(
-  row: PendingActivationRow,
-  userId: string,
-  email: string
-): Promise<void> {
-  const already = await findBuyerAccessByStripeEvent(row.stripe_event_id, userId);
-  if (already) {
-    // Idempotent: this payment already activated — nothing left to do,
-    // but the parked row is done and must not linger for a later claim.
-    await deletePendingActivation(row.stripe_event_id);
-    return;
-  }
-  try {
-    const reserved = await reserveReviewRequestCode(row.invite_code_id, userId);
-    if (reserved !== "reserved") {
-      await refundLosingFinalReadPayment({
-        eventId: row.stripe_event_id,
-        requestCodeId: row.invite_code_id,
-        projectId: row.project_id,
-        buyerUserId: userId,
-        buyerEmail: email,
-        paymentIntent: row.payment_intent,
-        reason: reserved === "in_use" ? "code_in_use" : "invalid",
-      });
-    } else {
-      const activated = await activateReviewRequestForUser({
-        requestCodeId: row.invite_code_id,
-        projectId: row.project_id,
-        buyerUserId: userId,
-        stripeEventId: row.stripe_event_id,
-      });
-      if (!activated.ok) {
-        await refundLosingFinalReadPayment({
-          eventId: row.stripe_event_id,
-          requestCodeId: row.invite_code_id,
-          projectId: row.project_id,
-          buyerUserId: userId,
-          buyerEmail: email,
-          paymentIntent: row.payment_intent,
-          reason: activated.reason ?? "activation_failed",
-        });
-      }
-    }
-  } catch (err: any) {
-    log.error(
-      `Failed to process pending FinalRead activation ${row.stripe_event_id}: ${err?.message || err}`
-    );
-  } finally {
-    await deletePendingActivation(row.stripe_event_id);
-  }
-}
-
-/**
- * Claim every pending activation parked against the buyer's email.
- * Called from claimPendingCredits BEFORE the credits + entitlements are
- * claimed (two-sided flow §4g): a parked FinalRead purchase attempts
- * its activation first, and only an activation that succeeds (or was
- * already successful for this event) lets the pack be claimed.
+ * Claim every pending activation parked against the buyer's email (called
+ * from claimPendingCredits, after the credits + entitlements are claimed).
+ * The checkout reservation (30 min) may have expired while the purchase
+ * was parked, so the code is re-reserved for the buyer who already paid
+ * before activating — a slow claim is not punished with a refund. A
+ * failed activation refunds the $199 the same way as the webhook path.
+ * Processed rows are deleted either way; a failed activation's refund
+ * record is the durable trace.
  */
 export async function processPendingActivationsForUser(
   userId: string,
@@ -1505,7 +1164,44 @@ export async function processPendingActivationsForUser(
     [email]
   );
   for (const row of rows) {
-    await attemptPendingActivation(row, userId, email);
+    try {
+      const reserved = await reserveInviteCode(row.invite_code_id, userId);
+      if (reserved !== "reserved") {
+        await refundLosingFinalReadPayment({
+          eventId: row.stripe_event_id,
+          inviteCodeId: row.invite_code_id,
+          projectId: row.project_id,
+          buyerUserId: userId,
+          buyerEmail: email,
+          paymentIntent: row.payment_intent,
+          reason: reserved === "in_use" ? "code_in_use" : "invalid",
+        });
+      } else {
+        const activated = await activateInviteCodeForUser({
+          inviteCodeId: row.invite_code_id,
+          projectId: row.project_id,
+          buyerUserId: userId,
+          stripeEventId: row.stripe_event_id,
+        });
+        if (!activated.ok) {
+          await refundLosingFinalReadPayment({
+            eventId: row.stripe_event_id,
+            inviteCodeId: row.invite_code_id,
+            projectId: row.project_id,
+            buyerUserId: userId,
+            buyerEmail: email,
+            paymentIntent: row.payment_intent,
+            reason: activated.reason ?? "activation_failed",
+          });
+        }
+      }
+    } catch (err: any) {
+      log.error(
+        `Failed to process pending FinalRead activation ${row.stripe_event_id}: ${err?.message || err}`
+      );
+    } finally {
+      await deletePendingActivation(row.stripe_event_id);
+    }
   }
 }
 
@@ -1518,22 +1214,20 @@ export async function processPendingActivationsForUser(
  */
 export async function refundLosingFinalReadPayment(opts: {
   eventId: string;
-  /** Review-request id (stored in the legacy invite_code_id column). */
-  requestCodeId: string;
+  inviteCodeId: string;
   projectId: string;
   buyerUserId: string;
   buyerEmail: string;
   paymentIntent: string | null;
   reason: string;
 }): Promise<void> {
-  const { eventId, requestCodeId, projectId, buyerUserId, buyerEmail, paymentIntent, reason } =
-    opts;
+  const { eventId, inviteCodeId, projectId, buyerUserId, buyerEmail, paymentIntent, reason } = opts;
   if (!paymentIntent) {
     // No payment intent to refund against — record it so the payment is
     // reconciled by hand rather than silently kept.
     await recordRefund({
       stripeEventId: eventId,
-      inviteCodeId: requestCodeId,
+      inviteCodeId,
       projectId,
       buyerUserId,
       paymentIntent: null,
@@ -1542,7 +1236,7 @@ export async function refundLosingFinalReadPayment(opts: {
       error: "No payment intent on the session; manual reconciliation required",
     });
     log.error(
-      `FinalRead losing payment ${eventId} has no payment intent to refund (code ${requestCodeId}); recorded for manual reconciliation`
+      `FinalRead losing payment ${eventId} has no payment intent to refund (code ${inviteCodeId}); recorded for manual reconciliation`
     );
     return;
   }
@@ -1550,7 +1244,7 @@ export async function refundLosingFinalReadPayment(opts: {
     const refund = await createStripeRefund(paymentIntent);
     await recordRefund({
       stripeEventId: eventId,
-      inviteCodeId: requestCodeId,
+      inviteCodeId,
       projectId,
       buyerUserId,
       paymentIntent,
@@ -1559,19 +1253,19 @@ export async function refundLosingFinalReadPayment(opts: {
       error: null,
     });
     log.info(
-      `FinalRead losing payment refunded: ${paymentIntent} (event ${eventId}, code ${requestCodeId}, reason: ${reason})`
+      `FinalRead losing payment refunded: ${paymentIntent} (event ${eventId}, code ${inviteCodeId}, reason: ${reason})`
     );
     if (buyerEmail) {
       await sendFinalReadRefundEmail(buyerEmail, {
         amount: "$199",
         reason,
-        inviteCodeId: requestCodeId,
+        inviteCodeId,
       });
     }
   } catch (err: any) {
     await recordRefund({
       stripeEventId: eventId,
-      inviteCodeId: requestCodeId,
+      inviteCodeId,
       projectId,
       buyerUserId,
       paymentIntent,
@@ -1580,7 +1274,7 @@ export async function refundLosingFinalReadPayment(opts: {
       error: err?.message || String(err),
     });
     log.error(
-      `FinalRead losing-payment refund FAILED for ${paymentIntent} (event ${eventId}, code ${requestCodeId}): ${err?.message || err} — recorded for manual reconciliation`
+      `FinalRead losing-payment refund FAILED for ${paymentIntent} (event ${eventId}, code ${inviteCodeId}): ${err?.message || err} — recorded for manual reconciliation`
     );
   }
 }

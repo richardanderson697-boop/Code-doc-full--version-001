@@ -51,8 +51,8 @@ import billingRouter, { handleStripeWebhook, getPacks } from "../server/routes/b
 import { initStore, getDb } from "../server/store";
 import { clearWorkspaceFiles, saveWorkspaceFile } from "../server/workspace-store";
 import {
-  activateReviewRequestForUser,
-  reserveReviewRequestCode,
+  activateInviteCodeForUser,
+  reserveInviteCode,
 } from "../server/finalread-projects";
 import {
   FINALREAD_RESCAN_COUNT,
@@ -397,68 +397,40 @@ describe("stripe webhook: $199 grants come from server code", () => {
 });
 
 describe("project-intelligence re-scan flow", () => {
-  // Buyer-initiated flow (Rev 3 §2): the buyer creates a review request
-  // and hands the code to the seller, who saves the project against it.
-  async function createRequest(
-    app: any,
-    buyerCookie: string
-  ): Promise<{ code: string; id: string }> {
-    const created = await request(app)
-      .post("/api/finalread/review-requests")
-      .set("Cookie", buyerCookie)
-      .send({ title: "Test Deal" });
-    expect(created.status).toBe(201);
-    expect(typeof created.body.code).toBe("string");
-    expect(created.body.code.length).toBe(8);
-    return { code: created.body.code as string, id: created.body.request.id as string };
+  async function firstReview(app: any, cookie: string, content: string, extra: any = {}) {
+    return request(app)
+      .post("/api/project-intelligence")
+      .set("Cookie", cookie)
+      .send({ codeFiles: [{ path: "server.js", content }], finalread: true, ...extra });
   }
 
   // Project flow (spec §7.1, §11): the seller saves a project, seeds the
   // saved files server-side, and scans FROM the project. A re-scan carries
   // the project id + review id and re-reads the saved files — the client
   // never supplies a path or code for a re-scan.
-  async function createProject(
-    app: any,
-    sellerCookie: string,
-    buyerCookie: string
-  ): Promise<{ projectId: string; code: string; requestId: string }> {
-    const { code, id: requestId } = await createRequest(app, buyerCookie);
+  async function createProject(app: any, cookie: string) {
     const created = await request(app)
       .post("/api/finalread/projects")
-      .set("Cookie", sellerCookie)
-      .send({ title: "Test Project", requestCode: code });
+      .set("Cookie", cookie)
+      .send({ title: "Test Project" });
     expect(created.status).toBe(201);
-    return {
-      projectId: created.body.project.id as string,
-      code,
-      requestId,
-    };
+    return created.body.project.id as string;
   }
 
   async function projectFirstScan(
     app: any,
-    seller: { userId: string; cookie: string },
-    buyer: { userId: string; cookie: string },
+    cookie: string,
+    userId: string,
     content: string
-  ): Promise<{
-    projectId: string;
-    reviewId: string;
-    code: string;
-    requestId: string;
-    res: any;
-  }> {
-    const { projectId, code, requestId } = await createProject(
-      app,
-      seller.cookie,
-      buyer.cookie
-    );
-    await saveWorkspaceFile(seller.userId, "server.js", content);
+  ): Promise<{ projectId: string; reviewId: string; res: any }> {
+    const projectId = await createProject(app, cookie);
+    await saveWorkspaceFile(userId, "server.js", content);
     const res = await request(app)
       .post("/api/project-intelligence")
-      .set("Cookie", seller.cookie)
+      .set("Cookie", cookie)
       .send({ projectId });
     expect(res.status).toBe(200);
-    return { projectId, reviewId: res.body.finalreadReviewId as string, code, requestId, res };
+    return { projectId, reviewId: res.body.finalreadReviewId as string, res };
   }
 
   async function projectRescan(
@@ -481,73 +453,71 @@ describe("project-intelligence re-scan flow", () => {
 
   it("first FinalRead review returns its id with no version yet; payment creates version 1 + the report (gate spec §5)", async () => {
     const app = buildApp();
-    const seller = await signupUser(app);
-    const buyer = await signupUser(app, "finalread-buyer");
-    // The bound initial scan is FREE (Rev 3 §4b — the fifth gate
-    // condition): the seller's balance is untouched by the first scan.
-    const { projectId, reviewId, code, requestId, res } = await projectFirstScan(
-      app,
-      seller,
-      buyer,
-      CLEAN
-    );
+    const { userId, cookie } = await signupUser(app);
+    const res = await firstReview(app, cookie, CLEAN);
     expect(res.status).toBe(200);
-    expect(typeof reviewId).toBe("string");
+    expect(typeof res.body.finalreadReviewId).toBe("string");
     expect(res.body.rescanEntitlementUsed).toBe(false);
     expect(res.body.codeUnchanged).toBeUndefined();
-    expect(await balanceOf(seller.userId)).toBe(50);
+    // The first review is credit-charged as today (tiny corpus: 1 credit).
+    expect(await balanceOf(userId)).toBe(50 - 1);
     // The response id is the REVIEW id. No version row exists yet: the
     // scan stores a pending audit, and version 1 is created at payment
-    // time from it (gate spec §5).
+    // time from it (gate spec §5 — the entry flow matches the project
+    // flow, where the review is also created with no version row).
     const reviews = await getDb().all<any>(
       "SELECT * FROM finalread_reviews WHERE seller_user_id = $1",
-      [seller.userId]
+      [userId]
     );
     expect(reviews).toHaveLength(1);
-    expect(reviews[0].id).toBe(reviewId);
+    expect(reviews[0].id).toBe(res.body.finalreadReviewId);
     const versions = await getDb().all<any>(
       "SELECT * FROM finalread_review_versions WHERE review_id = $1",
-      [reviewId]
+      [res.body.finalreadReviewId]
     );
     expect(versions).toHaveLength(0);
     const pending = await getDb().all<any>(
       "SELECT * FROM finalread_audit_snapshots WHERE review_id = $1 AND status = $2",
-      [reviewId, "pending"]
+      [res.body.finalreadReviewId, "pending"]
     );
     expect(pending).toHaveLength(1);
-    // The buyer pays the $199 pack (request activation + entitlements,
-    // the way the webhook does): the first paid report fetch generates
-    // version 1 + the report from the pending audit, no second scan.
-    await payForReview(app, buyer.userId, requestId, projectId, "evt_gate_first_review");
+    // The buyer pays the $199 pack (entitlements granted, as the webhook
+    // does): the first paid report fetch generates version 1 + the
+    // report from the pending audit, no second scan.
+    await grantRescanEntitlements(userId, "finalread", "evt_gate_first_review", new Date());
     const fetched = await request(app)
-      .get(`/api/finalread/reviews/${reviewId}/report`)
-      .set("Cookie", buyer.cookie);
+      .get(`/api/finalread/reviews/${res.body.finalreadReviewId}/report`)
+      .set("Cookie", cookie);
     expect(fetched.status).toBe(200);
     expect(typeof fetched.body.reportId).toBe("string");
     const versionsAfter = await getDb().all<any>(
       "SELECT * FROM finalread_review_versions WHERE review_id = $1",
-      [reviewId]
+      [res.body.finalreadReviewId]
     );
     expect(versionsAfter).toHaveLength(1);
     expect(versionsAfter[0].version_number).toBe(1);
-    expect(code).toBeTruthy();
-    await clearWorkspaceFiles(seller.userId);
   });
 
   // Pay for a project review the way the webhook does, minus Stripe:
-  // reserve + activate the buyer's request for the project, then grant
+  // issue + reserve + activate an invite code for the buyer, then grant
   // the bundle's 2 entitlements. After this the review is paid (version
   // 1 + report exist) and the buyer can re-scan against entitlements.
   async function payForReview(
     app: any,
+    sellerCookie: string,
     buyerId: string,
-    requestId: string,
     projectId: string,
     eventId: string
   ): Promise<void> {
-    expect(await reserveReviewRequestCode(requestId, buyerId)).toBe("reserved");
-    const activated = await activateReviewRequestForUser({
-      requestCodeId: requestId,
+    const issued = await request(app)
+      .post(`/api/finalread/projects/${projectId}/invite-codes`)
+      .set("Cookie", sellerCookie)
+      .send({});
+    expect(issued.status).toBe(201);
+    const codeId = issued.body.inviteCode.id as string;
+    expect(await reserveInviteCode(codeId, buyerId)).toBe("reserved");
+    const activated = await activateInviteCodeForUser({
+      inviteCodeId: codeId,
       projectId,
       buyerUserId: buyerId,
       stripeEventId: eventId,
@@ -559,78 +529,78 @@ describe("project-intelligence re-scan flow", () => {
 
   it("identical code is free and consumes nothing; changed code consumes one entitlement without charging", async () => {
     const app = buildApp();
-    const seller = await signupUser(app);
-    const buyer = await signupUser(app, "finalread-buyer");
-    const { projectId, reviewId, requestId } = await projectFirstScan(app, seller, buyer, CLEAN);
+    const { userId: sellerId, cookie: sellerCookie } = await signupUser(app);
+    const { userId: buyerId, cookie: buyerCookie } = await signupUser(app, "finalread-buyer");
+    const { projectId, reviewId } = await projectFirstScan(app, sellerCookie, sellerId, CLEAN);
     // The seller's initial project scan is free (spec §7.1, §10).
-    expect(await balanceOf(seller.userId)).toBe(50);
-    // The buyer pays (request activation + entitlements).
-    await payForReview(app, buyer.userId, requestId, projectId, "evt_route_1");
-    const balanceAfterFirst = await balanceOf(buyer.userId);
+    expect(await balanceOf(sellerId)).toBe(50);
+    // The buyer pays (invite-code activation + entitlements).
+    await payForReview(app, sellerCookie, buyerId, projectId, "evt_route_1");
+    const balanceAfterFirst = await balanceOf(buyerId);
 
     // Identical code: no charge, no consumption, buyer is told.
-    const same = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CLEAN);
+    const same = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CLEAN);
     expect(same.status).toBe(200);
     expect(same.body.codeUnchanged).toBe(true);
     expect(same.body.finalreadReviewId).toBe(reviewId);
-    expect(await balanceOf(buyer.userId)).toBe(balanceAfterFirst);
-    expect(await countRemainingEntitlements(buyer.userId)).toBe(2);
+    expect(await balanceOf(buyerId)).toBe(balanceAfterFirst);
+    expect(await countRemainingEntitlements(buyerId)).toBe(2);
 
     // Drain the balance below the 40-credit gate: an entitlement-covered
     // re-scan must still go through.
-    await setBalance(buyer.userId, 10);
-    const rescan = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CHANGED);
+    await setBalance(buyerId, 10);
+    const rescan = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CHANGED);
     expect(rescan.status).toBe(200);
     expect(rescan.body.rescanEntitlementUsed).toBe(true);
     expect(rescan.body.rescanEntitlementsRemaining).toBe(1);
     expect(rescan.body.finalreadReviewId).toBe(reviewId);
-    expect(await balanceOf(buyer.userId)).toBe(10);
-    expect(await countRemainingEntitlements(buyer.userId)).toBe(1);
+    expect(await balanceOf(buyerId)).toBe(10);
+    expect(await countRemainingEntitlements(buyerId)).toBe(1);
 
     // The new code is now the frozen version: re-running it is identical.
-    const sameAgain = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CHANGED);
+    const sameAgain = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CHANGED);
     expect(sameAgain.status).toBe(200);
     expect(sameAgain.body.codeUnchanged).toBe(true);
-    expect(await countRemainingEntitlements(buyer.userId)).toBe(1);
+    expect(await countRemainingEntitlements(buyerId)).toBe(1);
 
     // Second re-scan spends the last entitlement.
-    const rescan2 = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CHANGED2);
+    const rescan2 = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CHANGED2);
     expect(rescan2.status).toBe(200);
     expect(rescan2.body.rescanEntitlementUsed).toBe(true);
     expect(rescan2.body.rescanEntitlementsRemaining).toBe(0);
-    expect(await countRemainingEntitlements(buyer.userId)).toBe(0);
+    expect(await countRemainingEntitlements(buyerId)).toBe(0);
 
     // No entitlements left and 10 credits: the gate applies (402).
-    const broke = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CLEAN);
+    const broke = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CLEAN);
     expect(broke.status).toBe(402);
     expect(broke.body.code).toBe("INSUFFICIENT_CREDITS");
 
     // Topped up, the same changed code is credit-charged normally.
-    await setBalance(buyer.userId, 100);
-    const paid = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CLEAN);
+    await setBalance(buyerId, 100);
+    const paid = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CLEAN);
     expect(paid.status).toBe(200);
     expect(paid.body.rescanEntitlementUsed).toBe(false);
-    expect(await balanceOf(buyer.userId)).toBe(100 - 1);
-    await clearWorkspaceFiles(seller.userId);
+    expect(await balanceOf(buyerId)).toBe(100 - 1);
+    await clearWorkspaceFiles(sellerId);
   });
 
   it("expired entitlements fall back to the credit charge", async () => {
     const app = buildApp();
-    const seller = await signupUser(app);
-    const buyer = await signupUser(app, "finalread-buyer");
-    const { projectId, reviewId, requestId } = await projectFirstScan(app, seller, buyer, CLEAN);
-    await payForReview(app, buyer.userId, requestId, projectId, "evt_route_expired_paid");
+    const { userId: sellerId, cookie: sellerCookie } = await signupUser(app);
+    const { userId: buyerId, cookie: buyerCookie } = await signupUser(app, "finalread-buyer");
+    const { projectId, reviewId } = await projectFirstScan(app, sellerCookie, sellerId, CLEAN);
+    await payForReview(app, sellerCookie, buyerId, projectId, "evt_route_expired_paid");
     // Replace the live grant with an expired one: the entitlement lookup
     // must not find it, so the re-scan falls back to the credit charge.
-    await getDb().run("DELETE FROM finalread_rescan_entitlements WHERE user_id = $1", [buyer.userId]);
+    await getDb().run("DELETE FROM finalread_rescan_entitlements WHERE user_id = $1", [buyerId]);
     const old = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
-    await grantRescanEntitlements(buyer.userId, "finalread", "evt_route_expired", old);
-    const before = await balanceOf(buyer.userId);
-    const res = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CHANGED);
+    await grantRescanEntitlements(buyerId, "finalread", "evt_route_expired", old);
+    const before = await balanceOf(buyerId);
+    const res = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CHANGED);
     expect(res.status).toBe(200);
     expect(res.body.rescanEntitlementUsed).toBe(false);
-    expect(await balanceOf(buyer.userId)).toBe(before - 1);
-    await clearWorkspaceFiles(seller.userId);
+    expect(await balanceOf(buyerId)).toBe(before - 1);
+    await clearWorkspaceFiles(sellerId);
   });
 
   it("a workspace scan never touches entitlements or freezes a version", async () => {
@@ -655,49 +625,45 @@ describe("project-intelligence re-scan flow", () => {
 
   it("a failed re-scan consumes nothing and does not advance the frozen version", async () => {
     const app = buildApp();
-    const seller = await signupUser(app);
-    const buyer = await signupUser(app, "finalread-buyer");
-    const { projectId, reviewId, requestId } = await projectFirstScan(app, seller, buyer, CLEAN);
-    await payForReview(app, buyer.userId, requestId, projectId, "evt_route_fail_paid");
+    const { userId: sellerId, cookie: sellerCookie } = await signupUser(app);
+    const { userId: buyerId, cookie: buyerCookie } = await signupUser(app, "finalread-buyer");
+    const { projectId, reviewId } = await projectFirstScan(app, sellerCookie, sellerId, CLEAN);
+    await payForReview(app, sellerCookie, buyerId, projectId, "evt_route_fail_paid");
     mockedFallback.mockImplementationOnce(async () => {
       throw new Error("429 RESOURCE_EXHAUSTED: Quota exceeded");
     });
-    const failed = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CHANGED);
+    const failed = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CHANGED);
     expect(failed.status).toBe(500);
-    expect(await countRemainingEntitlements(buyer.userId)).toBe(2);
+    expect(await countRemainingEntitlements(buyerId)).toBe(2);
     // The frozen version is still the original: re-running the changed
     // code is still a change, not identical.
-    const retry = await projectRescan(app, buyer.cookie, seller.userId, projectId, reviewId, CHANGED);
+    const retry = await projectRescan(app, buyerCookie, sellerId, projectId, reviewId, CHANGED);
     expect(retry.status).toBe(200);
     expect(retry.body.codeUnchanged).toBeUndefined();
     expect(retry.body.rescanEntitlementUsed).toBe(true);
-    await clearWorkspaceFiles(seller.userId);
+    await clearWorkspaceFiles(sellerId);
   });
 
   it("an unknown or foreign review id is a 404, never a first review", async () => {
     const app = buildApp();
-    const seller = await signupUser(app);
-    const buyer = await signupUser(app, "finalread-buyer");
-    const { projectId, reviewId } = await projectFirstScan(app, seller, buyer, CLEAN);
+    const { userId: sellerId, cookie: sellerCookie } = await signupUser(app);
+    const { userId: buyerId, cookie: buyerCookie } = await signupUser(app, "finalread-buyer");
+    const { projectId, reviewId } = await projectFirstScan(app, sellerCookie, sellerId, CLEAN);
     // Unknown id, with a valid project.
-    const unknown = await projectRescan(app, buyer.cookie, seller.userId, projectId, "frv_nope", CHANGED);
+    const unknown = await projectRescan(app, buyerCookie, sellerId, projectId, "frv_nope", CHANGED);
     expect(unknown.status).toBe(404);
     // A review id without its project id.
     const noProject = await request(app)
       .post("/api/project-intelligence")
-      .set("Cookie", buyer.cookie)
+      .set("Cookie", buyerCookie)
       .send({ finalreadReviewId: reviewId });
     expect(noProject.status).toBe(400);
     // A review id with the WRONG project (the seller's second project):
     // the review does not belong to this project.
-    const { projectId: otherProjectId } = await createProject(
-      app,
-      seller.cookie,
-      buyer.cookie
-    );
+    const otherProjectId = await createProject(app, sellerCookie);
     const wrongProject = await request(app)
       .post("/api/project-intelligence")
-      .set("Cookie", seller.cookie)
+      .set("Cookie", sellerCookie)
       .send({ projectId: otherProjectId, finalreadReviewId: reviewId });
     expect(wrongProject.status).toBe(400);
     // A stranger (neither seller nor buyer) cannot even name the project.
@@ -707,7 +673,7 @@ describe("project-intelligence re-scan flow", () => {
       .set("Cookie", strangerCookie)
       .send({ projectId, finalreadReviewId: reviewId });
     expect(stranger.status).toBe(404);
-    await clearWorkspaceFiles(seller.userId);
+    await clearWorkspaceFiles(sellerId);
   });
 });
 
