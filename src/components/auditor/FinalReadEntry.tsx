@@ -1,9 +1,9 @@
 // FinalRead buyer greeting: the buyer front door on getfinalread.com
-// (two-sided flow §3 step 1). One code input + submit, and a "start a
-// new review request" path. No workspace, no builder, no upload — the
+// (two-sided flow §3). A "start a new review request" path, and one code
+// input + submit. No workspace, no builder, no upload — the
 // entry's direct-upload flow is RETIRED (a `finalread: true` scan now
-// 400s server-side). The buyer enters the code the seller was given;
-// the report opens only from a stored paid report (gate spec §5), never
+// 400s server-side). The buyer enters the code they created and sent the
+// seller; the report opens only from a stored paid report (gate spec §5), never
 // from a scan. Light theme: this screen only ever renders on the
 // FinalRead host.
 import React, { useEffect, useState } from "react";
@@ -44,7 +44,11 @@ const DELIVERABLES = [
   },
 ];
 
-export default function FinalReadEntry() {
+export default function FinalReadEntry({
+  onEntryStateChange,
+}: {
+  onEntryStateChange?: (insidePaidReview: boolean) => void;
+}) {
   // Buyer-facing tab title while the greeting is open; the server also
   // injects the FinalRead title per host, so this only re-asserts it.
   useEffect(() => {
@@ -85,6 +89,14 @@ export default function FinalReadEntry() {
   // paid report. Paid → the stored report; unpaid → the payment prompt.
   type GateState = "idle" | "loading" | "paid" | "waiting" | "payment" | "generating";
   const [gate, setGate] = useState<GateState>("idle");
+
+  // The header credits pill only appears once the buyer is inside a paid
+  // review (2026-11-21): the client has no "has paid" flag on the user
+  // object, so inside-a-review is the signal. On the greeting the pill
+  // is meaningless — and confusing next to a one-time $199 price.
+  useEffect(() => {
+    onEntryStateChange?.(gate === "paid" || gate === "generating");
+  }, [gate, onEntryStateChange]);
   const [paidReport, setPaidReport] = useState<{ report: any; reportId: string } | null>(null);
   const [gateMessage, setGateMessage] = useState("");
   const [gateReviewId, setGateReviewId] = useState<string | null>(null);
@@ -176,7 +188,7 @@ export default function FinalReadEntry() {
         // Generic on purpose — no enumeration of whether the code exists,
         // is expired, is already used, or has no scan yet.
         setCodeError(
-          "That code isn't valid. Check it with the seller — the code they were given is the one that opens this review."
+          "That code isn't valid. Check the code you created for this deal — it's the one that opens this review."
         );
         return;
       }
@@ -355,15 +367,11 @@ export default function FinalReadEntry() {
   return (
     <div className="flex-1 overflow-y-auto bg-white">
       <div className="max-w-3xl mx-auto px-4 py-8 md:py-12 select-text">
-        {/* Top bar: no Back button on the FinalRead host (front-door §2) —
-            the way back to the workspace is the link, not a back step. */}
-        <div className="flex items-center justify-between mb-8">
-          <a
-            href="https://gradevibes.com"
-            className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-800 transition"
-          >
-            Developer workspace — gradevibes.com
-          </a>
+        {/* Top bar: no Back button on the FinalRead host (front-door §2),
+            and no link into the developer workspace — the buyer front door
+            must not invite the buyer into the code side (2026-11-21:
+            sellers reach the workspace at gradevibes.com directly). */}
+        <div className="flex items-center justify-end mb-8">
           <span className="text-[11px] font-bold uppercase tracking-widest text-indigo-600">
             FinalRead
           </span>
@@ -415,51 +423,8 @@ export default function FinalReadEntry() {
           </p>
         </div>
 
-        {/* Code entry (§3 step 1): one code input + submit. */}
+        {/* New review request (§3 step 1): name the deal, get the code once. */}
         <div className="bg-white border border-slate-200 rounded-2xl p-5 md:p-6 shadow-sm space-y-4 mb-6">
-          <h2 className="text-sm font-bold text-slate-900 text-center">
-            Have a review code? Enter it
-          </h2>
-          <p className="text-xs text-slate-600 text-center leading-relaxed">
-            The seller sends you the code for your deal. Enter it here and
-            the review opens once the $199 is paid.
-          </p>
-          <div className="flex gap-2">
-            <div className="relative flex-1 min-w-0">
-              <KeyRound className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={code}
-                onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8))}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void submitCode();
-                }}
-                placeholder="8-character code"
-                autoCapitalize="characters"
-                autoCorrect="off"
-                spellCheck={false}
-                disabled={codeBusy}
-                className="w-full bg-white border border-slate-300 rounded-xl pl-9 pr-3 py-2.5 text-sm font-mono tracking-[0.2em] text-slate-900 placeholder:text-slate-400 placeholder:tracking-normal focus:outline-none focus:border-indigo-500 disabled:opacity-50"
-              />
-            </div>
-            <button
-              type="button"
-              onClick={() => void submitCode()}
-              disabled={codeBusy || !code.trim()}
-              className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {codeBusy ? "Checking…" : "Enter code"}
-            </button>
-          </div>
-          {codeError && (
-            <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
-              {codeError}
-            </p>
-          )}
-        </div>
-
-        {/* New review request (§3 step 2): name the deal, get the code once. */}
-        <div className="bg-white border border-slate-200 rounded-2xl p-5 md:p-6 shadow-sm space-y-4">
           <h2 className="text-sm font-bold text-slate-900 text-center">
             Starting a new deal? Create a review request
           </h2>
@@ -469,7 +434,7 @@ export default function FinalReadEntry() {
                 Send this code to the seller for{" "}
                 <span className="font-semibold text-slate-900 break-words">{createdTitle}</span>.
                 They save the project against it — then you enter the same
-                code above to pay and open the report.
+                code below to pay and open the report.
               </p>
               <div className="flex items-center justify-center gap-2">
                 <code className="text-xl font-mono font-bold tracking-[0.3em] text-slate-900 bg-slate-100 border border-slate-300 rounded-xl px-4 py-2.5 break-all">
@@ -510,7 +475,7 @@ export default function FinalReadEntry() {
                   onKeyDown={(e) => {
                     if (e.key === "Enter") void submitRequest();
                   }}
-                  placeholder="e.g. Acme CRM — $24,000 deal"
+                  placeholder="e.g. Acme CRM"
                   disabled={requestBusy}
                   className="flex-1 min-w-0 bg-white border border-slate-300 rounded-xl px-3 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:border-indigo-500 disabled:opacity-50"
                 />
@@ -531,6 +496,55 @@ export default function FinalReadEntry() {
             </>
           )}
         </div>
+
+        {/* Code entry (§3 step 2): one code input + submit. */}
+        <div className="bg-white border border-slate-200 rounded-2xl p-5 md:p-6 shadow-sm space-y-4 mb-6">
+          <h2 className="text-sm font-bold text-slate-900 text-center">
+            Have a review code? Enter it
+          </h2>
+          <p className="text-xs text-slate-600 text-center leading-relaxed">
+            Enter the code you created for your deal. It opens the $199
+            checkout — or reopens your review if you&apos;ve already paid.
+          </p>
+          <div className="flex gap-2">
+            <div className="relative flex-1 min-w-0">
+              <KeyRound className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={code}
+                onChange={(e) => setCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 8))}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void submitCode();
+                }}
+                placeholder="8-character code"
+                autoCapitalize="characters"
+                autoCorrect="off"
+                spellCheck={false}
+                disabled={codeBusy}
+                className="w-full bg-white border border-slate-300 rounded-xl pl-9 pr-3 py-2.5 text-sm font-mono tracking-[0.2em] text-slate-900 placeholder:text-slate-400 placeholder:tracking-normal focus:outline-none focus:border-indigo-500 disabled:opacity-50"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => void submitCode()}
+              disabled={codeBusy || !code.trim()}
+              className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition whitespace-nowrap disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {codeBusy ? "Checking…" : "Enter code"}
+            </button>
+          </div>
+          {codeError && (
+            <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+              {codeError}
+            </p>
+          )}
+        </div>
+
+        <p className="text-[11px] text-slate-500 text-center leading-relaxed">
+          How it works: you create a code and send it to the seller · the
+          seller uploads at gradevibes.com · you pay $199 · the report opens
+          for you both.
+        </p>
 
         <p className="text-[11px] text-slate-500 text-center leading-relaxed pt-6">
           FinalRead doesn&apos;t replace engineering due diligence. It tells you

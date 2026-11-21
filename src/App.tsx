@@ -185,6 +185,9 @@ export default function App() {
   // save a project against the buyer's code, scan from it, watch the deal.
   const [finalReadProjectsOpen, setFinalReadProjectsOpen] = useState(false);
   const finalreadView = finalReadHost || finalreadEntryOpen;
+  // True once the FinalRead entry is inside a paid review; drives the
+  // header credits pill (hidden on the greeting — see FinalReadEntry).
+  const [finalReadInsideReview, setFinalReadInsideReview] = useState(false);
 
   const [pricingNotice, setPricingNotice] = useState("");
   // The FinalRead review-request code being paid for, when the buyer
@@ -757,22 +760,21 @@ export default function App() {
             </h2>
           </div>
           <div className="flex items-center gap-2">
-            <a
-              href="https://gradevibes.com"
-              className="hidden sm:inline text-xs text-slate-500 hover:text-slate-800 transition"
-            >
-              Developer workspace — gradevibes.com
-            </a>
             {user ? (
               <>
-                <button
-                  onClick={() => { setPricingNotice(""); setPricingOpen(true); }}
-                  className="px-3 py-1.5 rounded-lg bg-amber-50 border border-amber-200 hover:border-amber-300 text-amber-700 text-xs font-medium flex items-center gap-1.5 transition duration-150"
-                  title="Buy more credits"
-                >
-                  <Zap className="w-3.5 h-3.5" />
-                  <span>{user.credits.toLocaleString()} credits</span>
-                </button>
+                {/* Credits pill only once inside a paid review (2026-11-21):
+                    on the greeting it reads like a balance the buyer must
+                    feed, next to a one-time $199 price. */}
+                {finalReadInsideReview && (
+                  <button
+                    onClick={() => { setPricingNotice(""); setPricingOpen(true); }}
+                    className="px-3 py-1.5 rounded-lg bg-amber-50 border border-amber-200 hover:border-amber-300 text-amber-700 text-xs font-medium flex items-center gap-1.5 transition duration-150"
+                    title="Buy more credits"
+                  >
+                    <Zap className="w-3.5 h-3.5" />
+                    <span>{user.credits.toLocaleString()} credits</span>
+                  </button>
+                )}
                 <button
                   onClick={handleLogout}
                   className="p-1.5 rounded-lg border border-slate-200 hover:bg-slate-100 text-slate-500 hover:text-slate-800 transition duration-150"
@@ -794,7 +796,7 @@ export default function App() {
         </header>
 
         <main id="main-content" className="flex-1 flex flex-col min-h-0 bg-white relative overflow-hidden">
-          <FinalReadEntry />
+          <FinalReadEntry onEntryStateChange={setFinalReadInsideReview} />
         </main>
 
         <AuthModal
