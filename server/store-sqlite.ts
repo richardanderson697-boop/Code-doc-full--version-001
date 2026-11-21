@@ -8,6 +8,7 @@ import type { Db, Dialect } from "./store";
 import { dataDir } from "./db";
 import { log } from "./logger";
 import {
+  migrateFinalReadProjectColumns,
   migrateFinalReadSchemaAfter,
   migrateFinalReadSchemaBefore,
 } from "./finalread-projects";
@@ -118,12 +119,38 @@ CREATE TABLE IF NOT EXISTS finalread_projects (
   title TEXT NOT NULL,
   finalread_review_id TEXT,
   purchase_stripe_event_id TEXT,
+  request_id TEXT,
+  scan_in_progress_at TEXT,
   status TEXT NOT NULL DEFAULT 'draft',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_finalread_projects_seller ON finalread_projects(seller_user_id);
 CREATE INDEX IF NOT EXISTS idx_finalread_projects_review ON finalread_projects(finalread_review_id);
+CREATE INDEX IF NOT EXISTS idx_finalread_projects_request ON finalread_projects(request_id);
+-- FinalRead buyer-initiated review requests (two-sided flow spec Rev 3,
+-- §4a): the buyer creates the request and its 8-character code, which the
+-- seller binds a project to at save time. One code flows
+-- buyer -> seller -> buyer (one-code decision, CONFIRMED 2026-11-21).
+-- status: requested (unbound) -> uploaded (bound to a project) ->
+-- reserved (buyer in checkout) -> activated (paid) / expired / revoked.
+CREATE TABLE IF NOT EXISTS finalread_review_requests (
+  id TEXT PRIMARY KEY,
+  buyer_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  code_hash TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'requested',
+  project_id TEXT,
+  reserved_by TEXT,
+  reserved_until TEXT,
+  used_at TEXT,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_finalread_requests_buyer ON finalread_review_requests(buyer_user_id);
+CREATE INDEX IF NOT EXISTS idx_finalread_requests_project ON finalread_review_requests(project_id);
+CREATE INDEX IF NOT EXISTS idx_finalread_requests_code_hash ON finalread_review_requests(code_hash);
 CREATE TABLE IF NOT EXISTS finalread_audit_snapshots (
   id TEXT PRIMARY KEY,
   version_id TEXT,
@@ -269,6 +296,9 @@ class SqliteDb implements Db {
     this.db.exec(SCHEMA);
     // Version-1 rows for the migrated reviews (idempotent).
     await migrateFinalReadSchemaAfter(this);
+    // Rev 3 project columns (request_id, scan_in_progress_at) for
+    // databases created before this build.
+    await migrateFinalReadProjectColumns(this);
     log.info("Auth store ready (sqlite)");
   }
 
