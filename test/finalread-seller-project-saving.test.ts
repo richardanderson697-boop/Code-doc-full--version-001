@@ -1,10 +1,11 @@
-// FinalRead seller project saving (spec Revision 2, §13): the versioned
+// FinalRead two-sided flow (spec Revision 3, §2–§4, §9): the versioned
 // transaction model exercised end-to-end against the real SQLite store —
-// projects, invite codes, checkout reservation, webhook activation,
-// losing-payment refund, the missing-audit report job, Q&A re-gating,
-// version history, and closure retention. Gemini is mocked (canned
-// intelligence); Stripe is mocked at the stripe-client boundary (no live
-// calls); the webhook signature is real.
+// buyer review requests, the atomic bind, checkout reservation, webhook
+// activation (activate-first, grant-second), the losing-payment refund,
+// the missing-audit report job, Q&A re-gating, version history, and
+// closure retention. Gemini is mocked (canned intelligence); Stripe is
+// mocked at the stripe-client boundary (no live calls); the webhook
+// signature is real.
 import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import express from "express";
 import request from "supertest";
@@ -191,16 +192,37 @@ function buildApp() {
   return app;
 }
 
-/** Seller saves a project, seeds its files, and runs the initial scan. */
+/** Buyer creates a review request and gets its 8-character code ONCE. */
+async function createRequest(
+  app: any,
+  buyerCookie: string,
+  title = "Test Deal"
+): Promise<{ code: string; id: string }> {
+  const created = await request(app)
+    .post("/api/finalread/review-requests")
+    .set("Cookie", buyerCookie)
+    .send({ title });
+  expect(created.status).toBe(201);
+  expect(typeof created.body.code).toBe("string");
+  expect(created.body.code.length).toBe(8);
+  return { code: created.body.code as string, id: created.body.request.id as string };
+}
+
+/**
+ * Seller saves a project against the buyer's request code (the atomic
+ * bind), seeds its files, and runs the initial scan (free when bound).
+ */
 async function seedProject(
   app: any,
   seller: { userId: string; cookie: string },
+  buyer: { userId: string; cookie: string },
   content: string = CLEAN
-): Promise<{ projectId: string; reviewId: string; scanScore: number }> {
+): Promise<{ projectId: string; reviewId: string; scanScore: number; code: string; requestId: string }> {
+  const { code, id: requestId } = await createRequest(app, buyer.cookie);
   const created = await request(app)
     .post("/api/finalread/projects")
     .set("Cookie", seller.cookie)
-    .send({ title: "Test Project" });
+    .send({ title: "Test Project", requestCode: code });
   expect(created.status).toBe(201);
   const projectId = created.body.project.id as string;
   await saveWorkspaceFile(seller.userId, "server.js", content);
@@ -218,20 +240,9 @@ async function seedProject(
     projectId,
     reviewId: scan.body.finalreadReviewId as string,
     scanScore: scan.body.completenessScore as number,
+    code,
+    requestId,
   };
-}
-
-async function issueCode(
-  app: any,
-  sellerCookie: string,
-  projectId: string
-): Promise<{ code: string; id: string }> {
-  const issued = await request(app)
-    .post(`/api/finalread/projects/${projectId}/invite-codes`)
-    .set("Cookie", sellerCookie)
-    .send({});
-  expect(issued.status).toBe(201);
-  return { code: issued.body.code as string, id: issued.body.inviteCode.id as string };
 }
 
 /** Buyer checks out with a code (mocked Stripe) then the webhook delivers. */
@@ -240,7 +251,7 @@ async function checkoutAndPay(
   buyer: { userId: string; cookie: string; email: string },
   code: string,
   projectId: string,
-  codeId: string
+  requestId: string
 ): Promise<{ eventId: string; paymentIntent: string }> {
   const checkout = await request(app)
     .post("/api/billing/checkout")
@@ -254,7 +265,7 @@ async function checkoutAndPay(
     metadata: {
       userId: buyer.userId,
       packId: "finalread",
-      inviteCodeId: codeId,
+      requestCodeId: requestId,
       projectId,
     },
   });
@@ -270,22 +281,47 @@ async function qaTurns(reviewId: string): Promise<any[]> {
   );
 }
 
-describe("seller projects: save, list, and seller-only access (§7, §8)", () => {
-  it("saves a project in the seller's workspace and lists it", async () => {
+describe("seller projects: save, list, and seller-only access (§2, §4b, §4j)", () => {
+  it("saves a project against the buyer's request code and lists it", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
+    const buyer = await signupUser(app, "seller-saving-buyer");
+    const { code } = await createRequest(app, buyer.cookie);
     const created = await request(app)
       .post("/api/finalread/projects")
       .set("Cookie", seller.cookie)
-      .send({ title: "Whistle Stop" });
+      .send({ title: "Whistle Stop", requestCode: code });
     expect(created.status).toBe(201);
     expect(created.body.project.title).toBe("Whistle Stop");
     expect(created.body.project.status).toBe("draft");
+    expect(created.body.project.requestId).toBeTruthy();
     const list = await request(app)
       .get("/api/finalread/projects")
       .set("Cookie", seller.cookie);
     expect(list.status).toBe(200);
     expect(list.body.projects.map((p: any) => p.id)).toContain(created.body.project.id);
+  });
+
+  it("a save without a valid request code is rejected (§4b)", async () => {
+    const app = buildApp();
+    const seller = await signupUser(app);
+    const noCode = await request(app)
+      .post("/api/finalread/projects")
+      .set("Cookie", seller.cookie)
+      .send({ title: "No code" });
+    expect(noCode.status).toBe(400);
+    const badCode = await request(app)
+      .post("/api/finalread/projects")
+      .set("Cookie", seller.cookie)
+      .send({ title: "Bad code", requestCode: "ZZZZZZZZ" });
+    expect(badCode.status).toBe(400);
+    // The seller cannot bind their OWN request (bind-time identity rule).
+    const own = await createRequest(app, seller.cookie);
+    const selfBind = await request(app)
+      .post("/api/finalread/projects")
+      .set("Cookie", seller.cookie)
+      .send({ title: "Self deal", requestCode: own.code });
+    expect(selfBind.status).toBe(400);
   });
 
   it("requires a title", async () => {
@@ -301,19 +337,23 @@ describe("seller projects: save, list, and seller-only access (§7, §8)", () =>
   it("another seller gets a 404, never a leak", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
+    const buyer = await signupUser(app, "seller-saving-buyer");
     const stranger = await signupUser(app, "seller-saving-stranger");
+    const { code } = await createRequest(app, buyer.cookie);
     const created = await request(app)
       .post("/api/finalread/projects")
       .set("Cookie", seller.cookie)
-      .send({ title: "Private" });
+      .send({ title: "Private", requestCode: code });
     const projectId = created.body.project.id as string;
-    for (const path of [
-      `/api/finalread/projects/${projectId}`,
-      `/api/finalread/projects/${projectId}/invite-codes`,
-    ]) {
-      const res = await request(app).get(path).set("Cookie", stranger.cookie);
-      expect(res.status).toBe(404);
-    }
+    const fetched = await request(app)
+      .get(`/api/finalread/projects/${projectId}`)
+      .set("Cookie", stranger.cookie);
+    expect(fetched.status).toBe(404);
+    const rebind = await request(app)
+      .post(`/api/finalread/projects/${projectId}/re-bind`)
+      .set("Cookie", stranger.cookie)
+      .send({ requestCode: code });
+    expect(rebind.status).toBe(404);
     const close = await request(app)
       .post(`/api/finalread/projects/${projectId}/close`)
       .set("Cookie", stranger.cookie);
@@ -326,45 +366,68 @@ describe("seller projects: save, list, and seller-only access (§7, §8)", () =>
   });
 });
 
-describe("invite codes: hash-only storage, expiry, and one buyer (§9)", () => {
-  it("issues a code whose hash — never the plaintext — is stored", async () => {
+describe("review requests: hash-only storage, expiry, and the pending-audit rule (§4a)", () => {
+  it("creates a request whose hash — never the plaintext — is stored", async () => {
     const app = buildApp();
-    const seller = await signupUser(app);
-    const { projectId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const buyer = await signupUser(app, "seller-saving-buyer");
+    const { code, id } = await createRequest(app, buyer.cookie);
     expect(typeof code).toBe("string");
     expect(code.length).toBe(8);
     const row = await getDb().get<any>(
-      "SELECT * FROM finalread_invite_codes WHERE id = $1",
+      "SELECT * FROM finalread_review_requests WHERE id = $1",
       [id]
     );
     expect(row).toBeTruthy();
     expect(row.code_hash).toBe(hashInviteCode(code));
     expect(row.code_hash).not.toBe(code);
-    expect(row.status).toBe("issued");
-    await clearWorkspaceFiles(seller.userId);
+    expect(row.status).toBe("requested");
+    expect(row.buyer_user_id).toBe(buyer.userId);
   });
 
-  it("refuses to issue a code before the initial scan", async () => {
+  it("a code validates only when bound to a project WITH a pending audit", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
+    const buyer = await signupUser(app, "seller-saving-buyer");
+    const { code } = await createRequest(app, buyer.cookie);
+    // Unbound: the seller has not saved a project against it yet.
+    const unbound = await request(app)
+      .post("/api/finalread/invite-codes/validate")
+      .set("Cookie", buyer.cookie)
+      .send({ code });
+    expect(unbound.body.valid).toBe(false);
+    // Bound but not yet scanned: no pending audit, so no payment.
     const created = await request(app)
       .post("/api/finalread/projects")
       .set("Cookie", seller.cookie)
-      .send({ title: "No scan yet" });
-    const res = await request(app)
-      .post(`/api/finalread/projects/${created.body.project.id}/invite-codes`)
+      .send({ title: "Test Project", requestCode: code });
+    expect(created.status).toBe(201);
+    const noAudit = await request(app)
+      .post("/api/finalread/invite-codes/validate")
+      .set("Cookie", buyer.cookie)
+      .send({ code });
+    expect(noAudit.body.valid).toBe(false);
+    // After the initial scan the code validates, with the title shown.
+    await saveWorkspaceFile(seller.userId, "server.js", CLEAN);
+    const scan = await request(app)
+      .post("/api/project-intelligence")
       .set("Cookie", seller.cookie)
-      .send({});
-    expect(res.status).toBe(400);
+      .send({ projectId: created.body.project.id });
+    expect(scan.status).toBe(200);
+    const good = await request(app)
+      .post("/api/finalread/invite-codes/validate")
+      .set("Cookie", buyer.cookie)
+      .send({ code });
+    expect(good.body.valid).toBe(true);
+    expect(good.body.activatedForCaller).toBe(false);
+    expect(good.body.projectTitle).toBe("Test Project");
+    await clearWorkspaceFiles(seller.userId);
   });
 
   it("validates a good code, rejects a bad one, and rejects an expired one", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { code, requestId } = await seedProject(app, seller, buyer);
 
     const good = await request(app)
       .post("/api/finalread/invite-codes/validate")
@@ -381,12 +444,12 @@ describe("invite codes: hash-only storage, expiry, and one buyer (§9)", () => {
       .send({ code: "ZZZZZZZZ" });
     expect(bad.body.valid).toBe(false);
 
-    // Expire the code (30-day expiry if never activated).
+    // Expire the request (30-day expiry if never activated).
     const past = new Date(Date.now() - 1000).toISOString();
-    await getDb().run("UPDATE finalread_invite_codes SET expires_at = $1 WHERE id = $2", [
-      past,
-      id,
-    ]);
+    await getDb().run(
+      "UPDATE finalread_review_requests SET expires_at = $1 WHERE id = $2",
+      [past, requestId]
+    );
     const expired = await request(app)
       .post("/api/finalread/invite-codes/validate")
       .set("Cookie", buyer.cookie)
@@ -395,46 +458,49 @@ describe("invite codes: hash-only storage, expiry, and one buyer (§9)", () => {
     await clearWorkspaceFiles(seller.userId);
   });
 
-  it("revokes an unactivated code on seller request; an activated code cannot be revoked", async () => {
+  it("re-binding a draft project to a new code revokes the old request (§4b)", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId } = await seedProject(app, seller);
-    const first = await issueCode(app, seller.cookie, projectId);
-    const second = await issueCode(app, seller.cookie, projectId);
+    const { projectId, code: firstCode, requestId: firstId } = await seedProject(app, seller, buyer);
+    const second = await createRequest(app, buyer.cookie, "Second deal");
 
-    const revoked = await request(app)
-      .post(`/api/finalread/projects/${projectId}/invite-codes/${first.id}/revoke`)
-      .set("Cookie", seller.cookie);
-    expect(revoked.status).toBe(200);
-    const row = await getDb().get<any>(
-      "SELECT status FROM finalread_invite_codes WHERE id = $1",
-      [first.id]
+    const rebound = await request(app)
+      .post(`/api/finalread/projects/${projectId}/re-bind`)
+      .set("Cookie", seller.cookie)
+      .send({ requestCode: second.code });
+    expect(rebound.status).toBe(200);
+    const oldRow = await getDb().get<any>(
+      "SELECT status FROM finalread_review_requests WHERE id = $1",
+      [firstId]
     );
-    expect(row.status).toBe("revoked");
-    const validate = await request(app)
+    expect(oldRow.status).toBe("revoked");
+    const oldValid = await request(app)
       .post("/api/finalread/invite-codes/validate")
       .set("Cookie", buyer.cookie)
-      .send({ code: first.code });
-    expect(validate.body.valid).toBe(false);
-
-    // Pay with the second code, then it cannot be revoked.
-    await checkoutAndPay(app, buyer, second.code, projectId, second.id);
-    const revokePaid = await request(app)
-      .post(`/api/finalread/projects/${projectId}/invite-codes/${second.id}/revoke`)
-      .set("Cookie", seller.cookie);
-    expect(revokePaid.status).toBe(404);
+      .send({ code: firstCode });
+    expect(oldValid.body.valid).toBe(false);
+    const newValid = await request(app)
+      .post("/api/finalread/invite-codes/validate")
+      .set("Cookie", buyer.cookie)
+      .send({ code: second.code });
+    expect(newValid.body.valid).toBe(true);
+    // Re-entering the code the project is already bound to is a no-op success.
+    const same = await request(app)
+      .post(`/api/finalread/projects/${projectId}/re-bind`)
+      .set("Cookie", seller.cookie)
+      .send({ requestCode: second.code });
+    expect(same.status).toBe(200);
     await clearWorkspaceFiles(seller.userId);
   });
 });
 
-describe("checkout reservation: one buyer, 30 minutes, server metadata (§9.6)", () => {
-  it("carries the code + project ids in Stripe metadata and reserves the code", async () => {
+describe("checkout reservation: one buyer, 30 minutes, server metadata (§4d)", () => {
+  it("carries the request + project ids in Stripe metadata and reserves the request", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, code, requestId } = await seedProject(app, seller, buyer);
 
     mockedStripeFetch.mockClear();
     const checkout = await request(app)
@@ -443,7 +509,8 @@ describe("checkout reservation: one buyer, 30 minutes, server metadata (§9.6)",
       .send({ packId: "finalread", inviteCode: code });
     expect(checkout.status).toBe(200);
     const params = mockedStripeFetch.mock.calls[0][1] as Record<string, string>;
-    expect(params["metadata[inviteCodeId]"]).toBe(id);
+    expect(params["metadata[requestCodeId]"]).toBe(requestId);
+    expect(params["metadata[inviteCodeId]"]).toBeUndefined();
     expect(params["metadata[projectId]"]).toBe(projectId);
     expect(params["metadata[userId]"]).toBe(buyer.userId);
     expect(params["metadata[packId]"]).toBe("finalread");
@@ -453,21 +520,20 @@ describe("checkout reservation: one buyer, 30 minutes, server metadata (§9.6)",
     expect(expiresAt).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 1800);
 
     const row = await getDb().get<any>(
-      "SELECT * FROM finalread_invite_codes WHERE id = $1",
-      [id]
+      "SELECT * FROM finalread_review_requests WHERE id = $1",
+      [requestId]
     );
     expect(row.status).toBe("reserved");
     expect(row.reserved_by).toBe(buyer.userId);
     await clearWorkspaceFiles(seller.userId);
   });
 
-  it("a second buyer gets 409 while the code is reserved; expiry frees it", async () => {
+  it("a second buyer gets 409 while the request is reserved; expiry frees it", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyerA = await signupUser(app, "seller-saving-buyer-a");
     const buyerB = await signupUser(app, "seller-saving-buyer-b");
-    const { projectId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, code, requestId } = await seedProject(app, seller, buyerA);
 
     const first = await request(app)
       .post("/api/billing/checkout")
@@ -488,10 +554,10 @@ describe("checkout reservation: one buyer, 30 minutes, server metadata (§9.6)",
 
     // The reservation lapses: the second buyer can now reserve it.
     const past = new Date(Date.now() - 1000).toISOString();
-    await getDb().run("UPDATE finalread_invite_codes SET reserved_until = $1 WHERE id = $2", [
-      past,
-      id,
-    ]);
+    await getDb().run(
+      "UPDATE finalread_review_requests SET reserved_until = $1 WHERE id = $2",
+      [past, requestId]
+    );
     const retry = await request(app)
       .post("/api/billing/checkout")
       .set("Cookie", buyerB.cookie)
@@ -504,8 +570,7 @@ describe("checkout reservation: one buyer, 30 minutes, server metadata (§9.6)",
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId } = await seedProject(app, seller);
-    const { code } = await issueCode(app, seller.cookie, projectId);
+    const { code } = await seedProject(app, seller, buyer);
     const res = await request(app)
       .post("/api/billing/checkout")
       .set("Cookie", buyer.cookie)
@@ -515,28 +580,27 @@ describe("checkout reservation: one buyer, 30 minutes, server metadata (§9.6)",
   });
 });
 
-describe("webhook activation from the pending audit (§5.2, §10; criterion 5)", () => {
-  it("activates the code, grants credits + entitlements, and generates the report", async () => {
+describe("webhook activation from the pending audit (§4e, §5.2; criterion 5)", () => {
+  it("activates the request, grants credits + entitlements, and generates the report", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId, reviewId, scanScore } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, scanScore, code, requestId } = await seedProject(app, seller, buyer);
     const balanceBefore = await balanceOf(buyer.userId);
 
-    const { eventId } = await checkoutAndPay(app, buyer, code, projectId, id);
+    const { eventId } = await checkoutAndPay(app, buyer, code, projectId, requestId);
 
     // Credits + entitlements granted from server code, never metadata.
     expect(await balanceOf(buyer.userId)).toBe(balanceBefore + 400);
     expect(await countRemainingEntitlements(buyer.userId)).toBe(2);
-    // The code is activated for this buyer; the project is active.
-    const codeRow = await getDb().get<any>(
-      "SELECT * FROM finalread_invite_codes WHERE id = $1",
-      [id]
+    // The request is activated for this buyer; the project is active.
+    const requestRow = await getDb().get<any>(
+      "SELECT * FROM finalread_review_requests WHERE id = $1",
+      [requestId]
     );
-    expect(codeRow.status).toBe("activated");
-    expect(codeRow.buyer_user_id).toBe(buyer.userId);
-    expect(codeRow.used_at).toBeTruthy();
+    expect(requestRow.status).toBe("activated");
+    expect(requestRow.buyer_user_id).toBe(buyer.userId);
+    expect(requestRow.used_at).toBeTruthy();
     const access = await getDb().get<any>(
       "SELECT * FROM finalread_buyer_access WHERE review_id = $1",
       [reviewId]
@@ -544,6 +608,7 @@ describe("webhook activation from the pending audit (§5.2, §10; criterion 5)",
     expect(access).toBeTruthy();
     expect(access.buyer_user_id).toBe(buyer.userId);
     expect(access.stripe_event_id).toBe(eventId);
+    expect(access.invite_code_id).toBe(requestId);
     const project = await getDb().get<any>(
       "SELECT * FROM finalread_projects WHERE id = $1",
       [projectId]
@@ -581,26 +646,26 @@ describe("webhook activation from the pending audit (§5.2, §10; criterion 5)",
     await clearWorkspaceFiles(seller.userId);
   });
 
-  it("revokes every other unactivated code for the project on activation", async () => {
+  it("one buyer per project: after activation no other buyer can pay for it", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId } = await seedProject(app, seller);
-    const first = await issueCode(app, seller.cookie, projectId);
-    const second = await issueCode(app, seller.cookie, projectId);
-    await checkoutAndPay(app, buyer, first.code, projectId, first.id);
-    const row = await getDb().get<any>(
-      "SELECT status FROM finalread_invite_codes WHERE id = $1",
-      [second.id]
-    );
-    expect(row.status).toBe("revoked");
-    // A second buyer cannot pay for this project anymore.
+    const { projectId, code, requestId } = await seedProject(app, seller, buyer);
+    await checkoutAndPay(app, buyer, code, projectId, requestId);
+    // A second buyer's own request is unbound — it cannot pay for this
+    // project, and the paid project cannot be re-bound to it.
     const other = await signupUser(app, "seller-saving-buyer-2");
+    const otherRequest = await createRequest(app, other.cookie, "Other deal");
     const blocked = await request(app)
       .post("/api/billing/checkout")
       .set("Cookie", other.cookie)
-      .send({ packId: "finalread", inviteCode: second.code });
+      .send({ packId: "finalread", inviteCode: otherRequest.code });
     expect(blocked.status).toBe(400);
+    const rebind = await request(app)
+      .post(`/api/finalread/projects/${projectId}/re-bind`)
+      .set("Cookie", seller.cookie)
+      .send({ requestCode: otherRequest.code });
+    expect(rebind.status).toBe(404);
     await clearWorkspaceFiles(seller.userId);
   });
 
@@ -608,8 +673,7 @@ describe("webhook activation from the pending audit (§5.2, §10; criterion 5)",
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, code, requestId } = await seedProject(app, seller, buyer);
     const checkout = await request(app)
       .post("/api/billing/checkout")
       .set("Cookie", buyer.cookie)
@@ -621,7 +685,7 @@ describe("webhook activation from the pending audit (§5.2, §10; criterion 5)",
       metadata: {
         userId: buyer.userId,
         packId: "finalread",
-        inviteCodeId: id,
+        requestCodeId: requestId,
         projectId,
       },
     });
@@ -642,18 +706,19 @@ describe("webhook activation from the pending audit (§5.2, §10; criterion 5)",
       [reviewId]
     );
     expect(reports).toHaveLength(1);
+    // The retry did not refund a payment that already succeeded.
+    expect(mockedRefund).not.toHaveBeenCalled();
     await clearWorkspaceFiles(seller.userId);
   });
 });
 
-describe("losing payment: activation fails, buyer keeps the pack, $199 is refunded (§9.7; criteria 15–16)", () => {
-  it("refunds the losing buyer and records it; the winner keeps the report", async () => {
+describe("losing payment: activation fails, $199 is refunded, NOTHING is granted (§4e; criteria 15–16)", () => {
+  it("refunds the losing buyer and records it; the loser keeps no credits and no entitlements", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyerA = await signupUser(app, "seller-saving-buyer-a");
     const buyerB = await signupUser(app, "seller-saving-buyer-b");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, code, requestId } = await seedProject(app, seller, buyerA);
 
     // A checks out first and holds the reservation.
     const checkoutA = await request(app)
@@ -663,16 +728,16 @@ describe("losing payment: activation fails, buyer keeps the pack, $199 is refund
     expect(checkoutA.status).toBe(200);
     // A's reservation lapses before A's webhook arrives; B reserves and pays.
     const past = new Date(Date.now() - 1000).toISOString();
-    await getDb().run("UPDATE finalread_invite_codes SET reserved_until = $1 WHERE id = $2", [
-      past,
-      id,
-    ]);
+    await getDb().run(
+      "UPDATE finalread_review_requests SET reserved_until = $1 WHERE id = $2",
+      [past, requestId]
+    );
     const { eventId: eventB, paymentIntent: piB } = await checkoutAndPay(
       app,
       buyerB,
       code,
       projectId,
-      id
+      requestId
     );
     expect(piB).toBeTruthy();
     // B has the report.
@@ -681,7 +746,7 @@ describe("losing payment: activation fails, buyer keeps the pack, $199 is refund
       .set("Cookie", buyerB.cookie);
     expect(reportB.status).toBe(200);
 
-    // A's webhook now arrives: the code is already activated, so A loses.
+    // A's webhook now arrives: the request is already activated, so A loses.
     mockedRefund.mockClear();
     const balanceBefore = await balanceOf(buyerA.userId);
     const eventA = webhookEvent({
@@ -690,15 +755,16 @@ describe("losing payment: activation fails, buyer keeps the pack, $199 is refund
       metadata: {
         userId: buyerA.userId,
         packId: "finalread",
-        inviteCodeId: id,
+        requestCodeId: requestId,
         projectId,
       },
     });
     const delivered = await deliverWebhook(eventA);
     expect(delivered.status).toBe(200);
-    // A keeps the pack (credits + entitlements) — only the report access is lost.
-    expect(await balanceOf(buyerA.userId)).toBe(balanceBefore + 400);
-    expect(await countRemainingEntitlements(buyerA.userId)).toBe(2);
+    // Activate-first, grant-second: A gets NOTHING — no credits, no
+    // entitlements. The old grants-first order gave the pack away.
+    expect(await balanceOf(buyerA.userId)).toBe(balanceBefore);
+    expect(await countRemainingEntitlements(buyerA.userId)).toBe(0);
     const accessA = await getDb().get<any>(
       "SELECT * FROM finalread_buyer_access WHERE buyer_user_id = $1",
       [buyerA.userId]
@@ -714,12 +780,12 @@ describe("losing payment: activation fails, buyer keeps the pack, $199 is refund
     expect(refund).toBeTruthy();
     expect(refund.status).toBe("refunded");
     expect(refund.buyer_user_id).toBe(buyerA.userId);
-    expect(refund.invite_code_id).toBe(id);
+    expect(refund.invite_code_id).toBe(requestId);
     // A still cannot read the report.
     const reportA = await request(app)
       .get(`/api/finalread/reviews/${reviewId}/report`)
       .set("Cookie", buyerA.cookie);
-    expect(reportA.status).toBe(403);
+    expect(reportA.status).toBe(404);
     expect(eventB).toBeTruthy();
     await clearWorkspaceFiles(seller.userId);
   });
@@ -729,18 +795,17 @@ describe("losing payment: activation fails, buyer keeps the pack, $199 is refund
     const seller = await signupUser(app);
     const buyerA = await signupUser(app, "seller-saving-buyer-a");
     const buyerB = await signupUser(app, "seller-saving-buyer-b");
-    const { projectId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, code, requestId } = await seedProject(app, seller, buyerA);
     await request(app)
       .post("/api/billing/checkout")
       .set("Cookie", buyerA.cookie)
       .send({ packId: "finalread", inviteCode: code });
     const past = new Date(Date.now() - 1000).toISOString();
-    await getDb().run("UPDATE finalread_invite_codes SET reserved_until = $1 WHERE id = $2", [
-      past,
-      id,
-    ]);
-    await checkoutAndPay(app, buyerB, code, projectId, id);
+    await getDb().run(
+      "UPDATE finalread_review_requests SET reserved_until = $1 WHERE id = $2",
+      [past, requestId]
+    );
+    await checkoutAndPay(app, buyerB, code, projectId, requestId);
     mockedRefund.mockRejectedValueOnce(new Error("stripe down"));
     const eventA = webhookEvent({
       client_reference_id: buyerA.userId,
@@ -748,7 +813,7 @@ describe("losing payment: activation fails, buyer keeps the pack, $199 is refund
       metadata: {
         userId: buyerA.userId,
         packId: "finalread",
-        inviteCodeId: id,
+        requestCodeId: requestId,
         projectId,
       },
     });
@@ -769,15 +834,14 @@ describe("missing audit: payment stands, report generates by server-side scan (�
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId, reviewId, scanScore } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, scanScore, code, requestId } = await seedProject(app, seller, buyer);
     // The pending audit is gone (the edge case): the payment must still
     // stand, and the report is generated by a server-side scan.
     await getDb().run(
       "DELETE FROM finalread_audit_snapshots WHERE review_id = $1 AND status = $2",
       [reviewId, "pending"]
     );
-    await checkoutAndPay(app, buyer, code, projectId, id);
+    await checkoutAndPay(app, buyer, code, projectId, requestId);
     const access = await getDb().get<any>(
       "SELECT * FROM finalread_buyer_access WHERE review_id = $1",
       [reviewId]
@@ -809,13 +873,12 @@ describe("missing audit: payment stands, report generates by server-side scan (�
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, code, requestId } = await seedProject(app, seller, buyer);
     await getDb().run(
       "DELETE FROM finalread_audit_snapshots WHERE review_id = $1 AND status = $2",
       [reviewId, "pending"]
     );
-    await checkoutAndPay(app, buyer, code, projectId, id);
+    await checkoutAndPay(app, buyer, code, projectId, requestId);
     // The scan fails once: the fetch answers 202, the job is failed.
     const { generateWithFallback } = await import("../server/gemini");
     vi.mocked(generateWithFallback).mockRejectedValueOnce(new Error("model down"));
@@ -842,9 +905,8 @@ describe("Q&A re-gating: paid buyer first, client audit ignored (§5.4, §8, §1
   async function paidSetup(app: any) {
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
-    await checkoutAndPay(app, buyer, code, projectId, id);
+    const { projectId, reviewId, code, requestId } = await seedProject(app, seller, buyer);
+    await checkoutAndPay(app, buyer, code, projectId, requestId);
     const fetched = await request(app)
       .get(`/api/finalread/reviews/${reviewId}/report`)
       .set("Cookie", buyer.cookie);
@@ -945,7 +1007,8 @@ describe("Q&A re-gating: paid buyer first, client audit ignored (§5.4, §8, §1
   it("the seller cannot fetch the report before payment (developer view only)", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
-    const { reviewId } = await seedProject(app, seller);
+    const buyer = await signupUser(app, "seller-saving-buyer");
+    const { reviewId } = await seedProject(app, seller, buyer);
     const before = await request(app)
       .get(`/api/finalread/reviews/${reviewId}/report`)
       .set("Cookie", seller.cookie);
@@ -959,9 +1022,8 @@ describe("version history is preserved, never overwritten (§12.1; criterion 20)
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
-    await checkoutAndPay(app, buyer, code, projectId, id);
+    const { projectId, reviewId, code, requestId } = await seedProject(app, seller, buyer);
+    await checkoutAndPay(app, buyer, code, projectId, requestId);
     const first = await request(app)
       .get(`/api/finalread/reviews/${reviewId}/report`)
       .set("Cookie", buyer.cookie);
@@ -1002,13 +1064,12 @@ describe("version history is preserved, never overwritten (§12.1; criterion 20)
 });
 
 describe("project closure retains the paid records (§7.2; criterion 21)", () => {
-  it("closing hides the project but keeps the report, access, and Q&A; unactivated codes are revoked", async () => {
+  it("closing hides the project but keeps the report, access, and Q&A; unactivated requests are revoked", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id } = await issueCode(app, seller.cookie, projectId);
-    await checkoutAndPay(app, buyer, code, projectId, id);
+    const { projectId, reviewId, code, requestId } = await seedProject(app, seller, buyer);
+    await checkoutAndPay(app, buyer, code, projectId, requestId);
     const fetched = await request(app)
       .get(`/api/finalread/reviews/${reviewId}/report`)
       .set("Cookie", buyer.cookie);
@@ -1017,9 +1078,13 @@ describe("project closure retains the paid records (§7.2; criterion 21)", () =>
       .set("Cookie", buyer.cookie)
       .send({ question: "What's the biggest risk?", reportId: fetched.body.reportId });
 
-    // A second, still-unpaid project with an unactivated code.
-    const { projectId: project2 } = await seedProject(app, seller);
-    const { code: code2, id: code2Id } = await issueCode(app, seller.cookie, project2);
+    // A second, still-unpaid project with an unactivated request.
+    const buyer2 = await signupUser(app, "seller-saving-buyer-2");
+    const { projectId: project2, code: code2, requestId: request2Id } = await seedProject(
+      app,
+      seller,
+      buyer2
+    );
 
     const closed = await request(app)
       .post(`/api/finalread/projects/${projectId}/close`)
@@ -1049,15 +1114,15 @@ describe("project closure retains the paid records (§7.2; criterion 21)", () =>
       .set("Cookie", buyer.cookie);
     expect(log.status).toBe(200);
     expect(log.body.turns).toHaveLength(1);
-    // The activated code and buyer access survive; the unactivated code is revoked.
+    // The activated request and buyer access survive; the unactivated request is revoked.
     const activated = await getDb().get<any>(
-      "SELECT status FROM finalread_invite_codes WHERE id = $1",
-      [id]
+      "SELECT status FROM finalread_review_requests WHERE id = $1",
+      [requestId]
     );
     expect(activated.status).toBe("activated");
     const revoked = await getDb().get<any>(
-      "SELECT status FROM finalread_invite_codes WHERE id = $1",
-      [code2Id]
+      "SELECT status FROM finalread_review_requests WHERE id = $1",
+      [request2Id]
     );
     expect(revoked.status).toBe("revoked");
     const validate = await request(app)
@@ -1069,20 +1134,49 @@ describe("project closure retains the paid records (§7.2; criterion 21)", () =>
   });
 });
 
-describe("free seller scan boundary: all four conditions, or the gate applies (§7.1, §10)", () => {
-  it("the initial scan of a draft project is free", async () => {
+describe("free seller scan boundary: all five conditions, or the gate applies (§2, §4b)", () => {
+  it("the initial scan of a draft project bound to a buyer request is free", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
+    const buyer = await signupUser(app, "seller-saving-buyer");
     expect(await balanceOf(seller.userId)).toBe(50);
-    await seedProject(app, seller);
+    const { projectId } = await seedProject(app, seller, buyer);
     expect(await balanceOf(seller.userId)).toBe(50);
+    // The project is bound — the fifth gate condition holds.
+    const project = await getDb().get<any>(
+      "SELECT request_id FROM finalread_projects WHERE id = $1",
+      [projectId]
+    );
+    expect(project.request_id).toBeTruthy();
+    await clearWorkspaceFiles(seller.userId);
+  });
+
+  it("an unbound project is NOT free: the fifth condition closes the ungated gap", async () => {
+    const app = buildApp();
+    const seller = await signupUser(app);
+    // A legacy project row with no bound request (pre-Rev3 shape): the
+    // free scan must not apply — the seller pays the credit gate.
+    const projectId = `frp_legacy_${Date.now()}`;
+    const now = new Date().toISOString();
+    await getDb().run(
+      "INSERT INTO finalread_projects (id, seller_user_id, title, finalread_review_id, purchase_stripe_event_id, request_id, scan_in_progress_at, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+      [projectId, seller.userId, "Legacy", null, null, null, null, "draft", now, now]
+    );
+    await saveWorkspaceFile(seller.userId, "server.js", CLEAN);
+    const scan = await request(app)
+      .post("/api/project-intelligence")
+      .set("Cookie", seller.cookie)
+      .send({ projectId });
+    expect(scan.status).toBe(200);
+    expect(await balanceOf(seller.userId)).toBe(50 - 1);
     await clearWorkspaceFiles(seller.userId);
   });
 
   it("a re-run of the initial scan with changed code is gated and charged", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
-    const { projectId } = await seedProject(app, seller);
+    const buyer = await signupUser(app, "seller-saving-buyer");
+    const { projectId } = await seedProject(app, seller, buyer);
     await saveWorkspaceFile(seller.userId, "server.js", CHANGED);
     const rerun = await request(app)
       .post("/api/project-intelligence")
@@ -1096,7 +1190,8 @@ describe("free seller scan boundary: all four conditions, or the gate applies (�
   it("a broke seller cannot re-run the initial scan (402)", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
-    const { projectId } = await seedProject(app, seller);
+    const buyer = await signupUser(app, "seller-saving-buyer");
+    const { projectId } = await seedProject(app, seller, buyer);
     await setBalance(seller.userId, 10);
     await saveWorkspaceFile(seller.userId, "server.js", CHANGED);
     const rerun = await request(app)
@@ -1111,7 +1206,8 @@ describe("free seller scan boundary: all four conditions, or the gate applies (�
   it("client-supplied codeFiles or paths with a projectId are rejected (criterion 12)", async () => {
     const app = buildApp();
     const seller = await signupUser(app);
-    const { projectId } = await seedProject(app, seller);
+    const buyer = await signupUser(app, "seller-saving-buyer");
+    const { projectId } = await seedProject(app, seller, buyer);
     const withFiles = await request(app)
       .post("/api/project-intelligence")
       .set("Cookie", seller.cookie)
@@ -1129,7 +1225,7 @@ describe("free seller scan boundary: all four conditions, or the gate applies (�
     const app = buildApp();
     const seller = await signupUser(app);
     const buyer = await signupUser(app, "seller-saving-buyer");
-    const { projectId } = await seedProject(app, seller);
+    const { projectId } = await seedProject(app, seller, buyer);
     const res = await request(app)
       .post("/api/project-intelligence")
       .set("Cookie", buyer.cookie)

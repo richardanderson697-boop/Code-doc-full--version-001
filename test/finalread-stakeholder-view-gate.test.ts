@@ -1,8 +1,10 @@
-// FinalRead stakeholder-view gate (gate spec §9): the stakeholder view
-// renders ONLY from a stored paid report — never from a raw scan audit.
-// Exercised end-to-end against the real SQLite store: the workspace scan
-// (developer view only), the entry flow (payment prompt before payment,
-// stored report after), post-payment parity, re-scan version gating, the
+// FinalRead stakeholder-view gate (gate spec §9, two-sided flow Rev 3):
+// the stakeholder view renders ONLY from a stored paid report — never
+// from a raw scan audit. Exercised end-to-end against the real SQLite
+// store: the workspace scan (developer view only), the retired entry flow
+// (new entry scans are a 400; legacy entry re-runs still work), the
+// buyer-initiated project flow (payment prompt before payment, stored
+// report after), post-payment parity, re-scan version gating, the
 // re-gated Q&A, and the static check that no raw-audit overlay path
 // remains. Gemini is mocked (canned intelligence); Stripe is mocked at
 // the stripe-client boundary (no live calls); the webhook signature is
@@ -69,6 +71,8 @@ import finalreadProjectsRouter from "../server/routes/finalread-projects";
 import billingRouter, { handleStripeWebhook } from "../server/routes/billing";
 import { initStore, getDb } from "../server/store";
 import { saveWorkspaceFile } from "../server/workspace-store";
+import { createEntryReview } from "../server/finalread-projects";
+import { hashReviewContent, countRemainingEntitlements } from "../server/finalread-rescans";
 
 const SECRET = ["whsec", "test", "stakeholder", "gate"].join("_");
 const CLEAN = `export function add(a: number, b: number): number {\n  return a + b;\n}\n`;
@@ -160,6 +164,11 @@ async function setBalance(userId: string, balance: number): Promise<void> {
   await getDb().run("UPDATE users SET credits_balance = $1 WHERE id = $2", [balance, userId]);
 }
 
+async function balanceOf(userId: string): Promise<number> {
+  const row = await getDb().get<any>("SELECT credits_balance FROM users WHERE id = $1", [userId]);
+  return row.credits_balance as number;
+}
+
 function buildApp() {
   const app = express();
   app.use(express.json({ limit: "10mb" }));
@@ -174,37 +183,66 @@ function buildApp() {
   return app;
 }
 
-/** The entry-flow first scan (the buyer uploading their own code). */
-async function seedEntryReview(
+/** A legacy entry review (pre-Rev3), seeded directly: the entry upload
+ *  flow is retired, so no route can create one any more. */
+async function seedLegacyEntryReview(
   app: any,
   user: { userId: string; cookie: string },
   content: string = CLEAN
-): Promise<{ reviewId: string; scanScore: number }> {
+): Promise<{ reviewId: string }> {
   await saveWorkspaceFile(user.userId, "server.js", content);
   await setBalance(user.userId, 500);
-  const scan = await request(app)
-    .post("/api/project-intelligence")
-    .set("Cookie", user.cookie)
-    .send({ finalread: true });
-  expect(scan.status).toBe(200);
-  expect(typeof scan.body.finalreadReviewId).toBe("string");
-  expect(typeof scan.body.completenessScore).toBe("number");
-  return {
-    reviewId: scan.body.finalreadReviewId as string,
-    scanScore: scan.body.completenessScore as number,
-  };
+  const review = await createEntryReview(user.userId);
+  const hash = hashReviewContent([{ path: "server.js", content }]);
+  await getDb().run(
+    "INSERT INTO finalread_audit_snapshots (id, version_id, review_id, audit, content_hash, status, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    [
+      `fas_${crypto.randomUUID()}`,
+      null,
+      review.id,
+      JSON.stringify({ ...CANNED_INTEL, completenessScore: 50 }),
+      hash,
+      "pending",
+      new Date().toISOString(),
+    ]
+  );
+  return { reviewId: review.id };
+}
+
+/** Buyer creates a review request; the seller saves a project against it
+ *  and runs the initial scan from it. */
+async function createRequest(
+  app: any,
+  buyer: { userId: string; cookie: string }
+): Promise<{ code: string; id: string }> {
+  const created = await request(app)
+    .post("/api/finalread/review-requests")
+    .set("Cookie", buyer.cookie)
+    .send({ title: "Test Project" });
+  expect(created.status).toBe(201);
+  expect(typeof created.body.code).toBe("string");
+  expect(created.body.code.length).toBe(8);
+  return { code: created.body.code as string, id: created.body.request.id as string };
 }
 
 /** Seller saves a project and runs the initial scan from it. */
 async function seedProject(
   app: any,
   seller: { userId: string; cookie: string },
+  buyer: { userId: string; cookie: string },
   content: string = CLEAN
-): Promise<{ projectId: string; reviewId: string; scanScore: number }> {
+): Promise<{
+  projectId: string;
+  reviewId: string;
+  scanScore: number;
+  code: string;
+  requestId: string;
+}> {
+  const { code, id: requestId } = await createRequest(app, buyer);
   const created = await request(app)
     .post("/api/finalread/projects")
     .set("Cookie", seller.cookie)
-    .send({ title: "Test Project" });
+    .send({ title: "Test Project", requestCode: code });
   expect(created.status).toBe(201);
   const projectId = created.body.project.id as string;
   await saveWorkspaceFile(seller.userId, "server.js", content);
@@ -218,20 +256,9 @@ async function seedProject(
     projectId,
     reviewId: scan.body.finalreadReviewId as string,
     scanScore: scan.body.completenessScore as number,
+    code,
+    requestId,
   };
-}
-
-async function issueCode(
-  app: any,
-  sellerCookie: string,
-  projectId: string
-): Promise<{ code: string; id: string }> {
-  const issued = await request(app)
-    .post(`/api/finalread/projects/${projectId}/invite-codes`)
-    .set("Cookie", sellerCookie)
-    .send({});
-  expect(issued.status).toBe(201);
-  return { code: issued.body.code as string, id: issued.body.inviteCode.id as string };
 }
 
 /** Buyer checks out with a code (mocked Stripe) then the webhook delivers. */
@@ -253,7 +280,7 @@ async function checkoutAndPay(
     metadata: {
       userId: buyer.userId,
       packId: "finalread",
-      inviteCodeId: codeId,
+      requestCodeId: codeId,
       projectId,
     },
   });
@@ -325,48 +352,45 @@ describe("workspace scan: developer view only, no stakeholder view (§9.1, §9.8
   });
 });
 
-describe("entry flow: payment prompt before payment, stored report after (§9.3)", () => {
-  it("the scan stores a pending audit, the report fetch is 403 before payment, and 200 from the stored report after the $199 payment", async () => {
+describe("entry flow retired (§11, §8): new entry scans are a 400; legacy entry re-runs still work", () => {
+  it("a new entry scan (finalread: true, no review id, no project) is retired with a 400", async () => {
     const app = buildApp();
     const buyer = await signupUser(app, "gate-entry");
-    const { reviewId, scanScore } = await seedEntryReview(app, buyer);
-    // The scan result is held as a pending audit keyed by review id, so
-    // the report can be generated at payment without a second scan.
-    const pending = await pendingAuditFor(reviewId);
-    expect(pending.length).toBe(1);
-    expect(pending[0].content_hash).toBeTruthy();
-    // Before payment there is no report to fetch: the entry shows the
-    // payment prompt, not the stakeholder view.
-    const before = await request(app)
-      .get(`/api/finalread/reviews/${reviewId}/report`)
-      .set("Cookie", buyer.cookie);
-    expect(before.status).toBe(403);
-    expect(before.body.report).toBeUndefined();
-    // The buyer pays the $199 pack directly (entry flow: no invite code).
-    await payFinalReadPack(app, buyer);
-    // After payment the same fetch opens the stored report — generated
-    // from the pending audit, with the scan's score, no second scan.
-    const after = await request(app)
-      .get(`/api/finalread/reviews/${reviewId}/report`)
-      .set("Cookie", buyer.cookie);
-    expect(after.status).toBe(200);
-    expect(typeof after.body.reportId).toBe("string");
-    expect(typeof after.body.versionId).toBe("string");
-    expect(after.body.report.completenessScore).toBe(scanScore);
-    // The pending audit is now the active snapshot behind version 1.
-    expect(await pendingAuditFor(reviewId)).toHaveLength(0);
-    const versions = await getDb().all<any>(
-      "SELECT * FROM finalread_review_versions WHERE review_id = $1",
-      [reviewId]
+    await saveWorkspaceFile(buyer.userId, "server.js", CLEAN);
+    await setBalance(buyer.userId, 500);
+    const scan = await request(app)
+      .post("/api/project-intelligence")
+      .set("Cookie", buyer.cookie)
+      .send({ finalread: true });
+    expect(scan.status).toBe(400);
+    expect(scan.body.error).toMatch(/retired/i);
+    // No review was created: there is nothing for a stakeholder view to
+    // open from an entry scan any more.
+    const reviews = await getDb().all<any>(
+      "SELECT * FROM finalread_reviews WHERE seller_user_id = $1",
+      [buyer.userId]
     );
-    expect(versions).toHaveLength(1);
-    expect(versions[0].version_number).toBe(1);
+    expect(reviews).toHaveLength(0);
   });
 
-  it("an entry re-run without a project id no longer 400s (build decision: the project-id requirement binds project re-scans only)", async () => {
+  it("a bare $199 purchase without a code grants the pack but activates no code and opens no report", async () => {
+    const app = buildApp();
+    const buyer = await signupUser(app, "gate-entry-bare");
+    const before = await balanceOf(buyer.userId);
+    await payFinalReadPack(app, buyer);
+    expect(await balanceOf(buyer.userId)).toBe(before + 400);
+    expect(await countRemainingEntitlements(buyer.userId)).toBe(2);
+    const access = await getDb().all<any>(
+      "SELECT * FROM finalread_buyer_access WHERE buyer_user_id = $1",
+      [buyer.userId]
+    );
+    expect(access).toHaveLength(0);
+  });
+
+  it("a legacy entry re-run without a project id still works (gate spec §8)", async () => {
     const app = buildApp();
     const buyer = await signupUser(app, "gate-entry-rerun");
-    const { reviewId } = await seedEntryReview(app, buyer);
+    const { reviewId } = await seedLegacyEntryReview(app, buyer);
     // Unchanged code is not a re-scan: free, no new version.
     const rerun = await request(app)
       .post("/api/project-intelligence")
@@ -390,7 +414,8 @@ describe("entry flow: payment prompt before payment, stored report after (§9.3)
   it("a project review re-run without a project id still 400s", async () => {
     const app = buildApp();
     const seller = await signupUser(app, "gate-project-rerun");
-    const { reviewId } = await seedProject(app, seller);
+    const buyer = await signupUser(app, "gate-project-rerun-buyer");
+    const { reviewId } = await seedProject(app, seller, buyer);
     const res = await request(app)
       .post("/api/project-intelligence")
       .set("Cookie", seller.cookie)
@@ -405,8 +430,11 @@ describe("seller adopted mode + post-payment parity (§9.4, §9.5)", () => {
     const app = buildApp();
     const seller = await signupUser(app, "gate-seller");
     const buyer = await signupUser(app, "gate-buyer");
-    const { projectId, reviewId, scanScore } = await seedProject(app, seller);
-    const { code, id: codeId } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, scanScore, code, requestId: codeId } = await seedProject(
+      app,
+      seller,
+      buyer
+    );
     // Before payment the seller cannot fetch the report: the waiting
     // state, not the stakeholder view.
     const before = await request(app)
@@ -434,8 +462,7 @@ describe("direct fetch: not-found before payment, stored report after (§9.6)", 
     const app = buildApp();
     const seller = await signupUser(app, "gate-direct-seller");
     const buyer = await signupUser(app, "gate-direct-buyer");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id: codeId } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, code, requestId: codeId } = await seedProject(app, seller, buyer);
     const missing = await request(app)
       .get("/api/finalread/reports/frr_does_not_exist")
       .set("Cookie", buyer.cookie);
@@ -455,7 +482,7 @@ describe("direct fetch: not-found before payment, stored report after (§9.6)", 
     const denied = await request(app)
       .get(`/api/finalread/reports/${fetched.body.reportId}`)
       .set("Cookie", stranger.cookie);
-    expect(denied.status).toBe(403);
+    expect(denied.status).toBe(404);
   });
 });
 
@@ -464,8 +491,11 @@ describe("re-scan version gating (§9.7)", () => {
     const app = buildApp();
     const seller = await signupUser(app, "gate-rescan-seller");
     const buyer = await signupUser(app, "gate-rescan-buyer");
-    const { projectId, reviewId, scanScore } = await seedProject(app, seller);
-    const { code, id: codeId } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, scanScore, code, requestId: codeId } = await seedProject(
+      app,
+      seller,
+      buyer
+    );
     await checkoutAndPay(app, buyer, code, projectId, codeId);
     const before = await request(app)
       .get(`/api/finalread/reviews/${reviewId}`)
@@ -508,8 +538,7 @@ describe("Q&A stays re-gated (§9.9)", () => {
     const app = buildApp();
     const seller = await signupUser(app, "gate-qa-seller");
     const buyer = await signupUser(app, "gate-qa-buyer");
-    const { projectId, reviewId } = await seedProject(app, seller);
-    const { code, id: codeId } = await issueCode(app, seller.cookie, projectId);
+    const { projectId, reviewId, code, requestId: codeId } = await seedProject(app, seller, buyer);
     // No report exists yet: nothing to ask about.
     const unpaid = await request(app)
       .post("/api/finalread/ask")
