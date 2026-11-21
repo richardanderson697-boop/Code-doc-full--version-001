@@ -11,7 +11,10 @@
 // Everything here is pure so it can be unit-tested without a DOM.
 
 /** Exact hostnames that always serve the FinalRead buyer entrance. */
-export const FINALREAD_PRICING_HOSTS: readonly string[] = ["getfinalread.com"];
+export const FINALREAD_PRICING_HOSTS: readonly string[] = [
+  "getfinalread.com",
+  "www.getfinalread.com",
+];
 
 /**
  * The entrance predicate (two-sided flow §1): true for a FinalRead host

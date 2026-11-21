@@ -684,6 +684,7 @@ describe("identity matrix (§4j): access is per-deal, never per-account", () => 
 describe("host entrance predicate (§1)", () => {
   it("isFinalReadHost is true for getfinalread.com and Railway hosts, false elsewhere", () => {
     expect(isFinalReadHost("getfinalread.com")).toBe(true);
+    expect(isFinalReadHost("www.getfinalread.com")).toBe(true);
     expect(isFinalReadHost("accomplished-consideration-production-18ca.up.railway.app")).toBe(
       true
     );
