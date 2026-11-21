@@ -355,15 +355,11 @@ export default function FinalReadEntry() {
   return (
     <div className="flex-1 overflow-y-auto bg-white">
       <div className="max-w-3xl mx-auto px-4 py-8 md:py-12 select-text">
-        {/* Top bar: no Back button on the FinalRead host (front-door §2) —
-            the way back to the workspace is the link, not a back step. */}
-        <div className="flex items-center justify-between mb-8">
-          <a
-            href="https://gradevibes.com"
-            className="flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-800 transition"
-          >
-            Developer workspace — gradevibes.com
-          </a>
+        {/* Top bar: no Back button on the FinalRead host (front-door §2),
+            and no link into the developer workspace — the buyer front door
+            must not invite the buyer into the code side (2026-11-21:
+            sellers reach the workspace at gradevibes.com directly). */}
+        <div className="flex items-center justify-end mb-8">
           <span className="text-[11px] font-bold uppercase tracking-widest text-indigo-600">
             FinalRead
           </span>

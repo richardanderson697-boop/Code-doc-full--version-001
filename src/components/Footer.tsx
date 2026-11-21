@@ -6,9 +6,12 @@ export function openLegal(doc: "privacy" | "terms") {
 
 export default function Footer({ brand = "GradeVibes" }: { brand?: string }) {
   // Two-sided flow §1 + front-door §4: on the FinalRead host the footer
-  // is light and links back to the developer workspace; on gradevibes.com
-  // the FinalRead discovery link is a REAL anchor to getfinalread.com
-  // (the wrong-host rule: #finalread on gradevibes.com redirects there).
+  // is light and carries only the legal links — NO link into the developer
+  // workspace (2026-11-21: the buyer front door must not invite the buyer
+  // into the code side; sellers reach the workspace at gradevibes.com
+  // directly). On gradevibes.com the FinalRead discovery link is a REAL
+  // anchor to getfinalread.com (the wrong-host rule: #finalread on
+  // gradevibes.com redirects there).
   const isFinalRead = brand === "FinalRead";
   return (
     <footer
@@ -23,14 +26,7 @@ export default function Footer({ brand = "GradeVibes" }: { brand?: string }) {
           {brand} · Static analysis — no code was executed
         </p>
         <div className="flex items-center gap-4 text-[11px] font-mono">
-          {isFinalRead ? (
-            <a
-              href="https://gradevibes.com"
-              className="text-slate-500 hover:text-slate-800 transition"
-            >
-              Developer workspace — gradevibes.com
-            </a>
-          ) : (
+          {!isFinalRead && (
             <>
               <a
                 href="https://getfinalread.com"

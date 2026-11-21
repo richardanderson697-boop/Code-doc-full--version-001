@@ -757,12 +757,6 @@ export default function App() {
             </h2>
           </div>
           <div className="flex items-center gap-2">
-            <a
-              href="https://gradevibes.com"
-              className="hidden sm:inline text-xs text-slate-500 hover:text-slate-800 transition"
-            >
-              Developer workspace — gradevibes.com
-            </a>
             {user ? (
               <>
                 <button
