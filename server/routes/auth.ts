@@ -23,18 +23,29 @@ const router = Router();
 const WELCOME_CREDITS = Number(process.env.WELCOME_CREDITS ?? 50);
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-// Tiny in-memory throttle for the forgot-password endpoint: max 5 requests
-// per email per hour and 30 per IP per hour. Prevents email bombing via the
-// endpoint. Resets on restart, which is fine for abuse throttling.
-const resetAttempts = new Map<string, number[]>();
+// Tiny in-memory throttle for the auth endpoints (finalread-self-scan-
+// fixes-spec.md Part B): max 5 signup requests per email per hour and 10
+// per IP, 10 logins per email per hour and 30 per IP, 30 password resets
+// per IP per hour; forgot-password keeps 5 per email and 30 per IP.
+// Prevents credential stuffing and email bombing via the endpoints.
+// Resets on restart, which is fine for abuse throttling.
+const authAttempts = new Map<string, number[]>();
 function throttleOk(key: string, limit: number): boolean {
   const now = Date.now();
   const windowStart = now - 60 * 60 * 1000;
-  const times = (resetAttempts.get(key) ?? []).filter((t) => t > windowStart);
+  const times = (authAttempts.get(key) ?? []).filter((t) => t > windowStart);
   if (times.length >= limit) return false;
   times.push(now);
-  resetAttempts.set(key, times);
+  authAttempts.set(key, times);
   return true;
+}
+
+/** Test-only: clear the in-memory auth throttle map so each test starts
+ * fresh. The suite creates dozens of users from one IP, which would trip
+ * the per-IP limits across tests; the global setup calls this before each
+ * test. Production never calls it. */
+export function _resetAuthThrottlesForTests(): void {
+  authAttempts.clear();
 }
 
 function appBaseUrl(req: any): string {
@@ -61,6 +72,11 @@ router.post("/api/auth/signup", asyncRoute(async (req, res) => {
   }
   if (String(password).length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
+  }
+
+  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+  if (!throttleOk(`signup-email:${cleanEmail}`, 5) || !throttleOk(`signup-ip:${ip}`, 10)) {
+    return res.status(429).json({ error: "Too many requests. Try again later." });
   }
 
   const db = getDb();
@@ -99,6 +115,10 @@ router.post("/api/auth/login", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Email and password are required." });
   }
   const cleanEmail = normalizeEmail(String(email));
+  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+  if (!throttleOk(`login-email:${cleanEmail}`, 10) || !throttleOk(`login-ip:${ip}`, 30)) {
+    return res.status(429).json({ error: "Too many requests. Try again later." });
+  }
   const db = getDb();
   const row = await db.get<UserRow>(
     "SELECT id, email, password_hash, password_salt, credits_balance FROM users WHERE email = $1",
@@ -183,6 +203,10 @@ router.post("/api/auth/reset-password", asyncRoute(async (req, res) => {
   }
   if (String(password).length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
+  }
+  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+  if (!throttleOk(`reset-ip:${ip}`, 30)) {
+    return res.status(429).json({ error: "Too many requests. Try again later." });
   }
   const tokenHash = hashResetToken(String(token));
   const db = getDb();

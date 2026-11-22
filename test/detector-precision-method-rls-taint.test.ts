@@ -24,6 +24,7 @@ import { describe, it, expect } from "vitest";
 import { probeAPIRouteAuth } from "../server/preflight/vendor/lib/probes/auth.js";
 import { probeSupabaseRLS } from "../server/preflight/vendor/lib/probes/database.js";
 import { probeTaintFlow } from "../server/preflight/vendor/lib/probes/taint-engine.js";
+import { probeSSRFOpenRedirect } from "../server/preflight/vendor/lib/probes/transport.js";
 import {
   calibrateDestructiveHandlerFindings,
   DESTRUCTIVE_METHOD_QUESTION,
@@ -35,6 +36,7 @@ import {
 import {
   calibrateSsrfTaintFindings,
   SSRF_PROVENANCE_QUESTION,
+  SSRF_CALLEE_QUESTION,
 } from "../server/preflight/ssrf-taint-filter";
 import { runPreFlightScan } from "../server/preflight-scan";
 import { scan } from "../server/preflight/vendor/lib/cockpit-scan.js";
@@ -499,6 +501,54 @@ function calibratedSsrf(files: { path: string; content: string }[]) {
   return calibrateSsrfTaintFindings(ssrfFindings(files), contentsOf(files));
 }
 
+// Transport-probe SSRF (finalread-self-scan-fixes-spec.md A2): the vendored
+// line regex matches ANY identifier containing "request", so a database
+// rebind call reads as a fetch. The calibration must resolve the callee.
+function transportSsrfFindings(files: { path: string; content: string }[]) {
+  return (probeSSRFOpenRedirect(files) as any[]).filter((x) => x.probe === "SSRF");
+}
+
+function calibratedTransportSsrf(files: { path: string; content: string }[]) {
+  return calibrateSsrfTaintFindings(transportSsrfFindings(files), contentsOf(files));
+}
+
+// The self-scan shape: a route calls a DB-only helper whose name contains
+// "request", with request-derived arguments.
+const REBIND_ROUTE = `import { rebindProjectRequest } from '../finalread-projects'
+
+export async function POST(req: Request) {
+  const requestCode = 'abc'
+  const result = await rebindProjectRequest(req.params.id, req.user.id, requestCode)
+  return Response.json({ ok: result === 'ok' })
+}
+`;
+
+const REBIND_IMPL = `import { getDb } from '../db'
+
+export async function rebindProjectRequest(projectId: string, sellerUserId: string, requestCode: string) {
+  const db = getDb()
+  const project = await db.get('SELECT * FROM finalread_projects WHERE id = $1', [projectId])
+  if (!project) return 'not-found'
+  await db.run('UPDATE finalread_projects SET request_id = $1 WHERE id = $2', [requestCode, projectId])
+  return 'ok'
+}
+`;
+
+// A real outbound fetch with a request-derived URL (positive control).
+const FETCH_REQ_URL = `export async function GET(req: Request) {
+  const res = await fetch(req.query.url)
+  return Response.json({ ok: true })
+}
+`;
+
+// A *Request helper the scanner cannot resolve anywhere: verification,
+// never a hard high.
+const UNRESOLVABLE_REQUEST_HELPER = `export async function POST(req: Request) {
+  const result = await lookupProjectRequest(req.params.id, req.user.id)
+  return Response.json({ ok: result === 'ok' })
+}
+`;
+
 describe("Item 3 — SSRF/taint provenance", () => {
   it("drops the Reelhouse audio-route SSRF: stored URL, validated by isSafeRemoteUrl", () => {
     const files = [f("app/api/segments/[id]/audio/route.ts", REEL_AUDIO)];
@@ -550,6 +600,45 @@ describe("Item 3 — SSRF/taint provenance", () => {
     expect(out).toHaveLength(1);
     expect(out[0].unverified).toBe(true);
     expect(out[0].remediation).toBe(SSRF_PROVENANCE_QUESTION);
+  });
+
+  it("drops the transport-probe SSRF on a DB-only callee (self-scan fix A2)", () => {
+    const files = [
+      f("server/routes/finalread-projects.ts", REBIND_ROUTE),
+      f("server/finalread-projects.ts", REBIND_IMPL),
+    ];
+    const raw = transportSsrfFindings(files);
+    expect(raw).toHaveLength(1);
+    expect(raw[0].probe).toBe("SSRF");
+    expect(raw[0].severity).toBe("high");
+    expect(calibratedTransportSsrf(files)).toHaveLength(0);
+  });
+
+  it("keeps a real fetch with a request-derived URL (self-scan fix A2 positive control)", () => {
+    const files = [f("app/api/fetch/route.ts", FETCH_REQ_URL)];
+    expect(transportSsrfFindings(files)).toHaveLength(1);
+    const out = calibratedTransportSsrf(files);
+    expect(out).toHaveLength(1);
+    expect(out[0].unverified).toBeUndefined();
+    expect(out[0].title).toBe("Server-side fetch with user-controlled URL");
+  });
+
+  it("routes an unresolvable *Request callee to verification (self-scan fix A2)", () => {
+    const files = [f("server/routes/lookup.ts", UNRESOLVABLE_REQUEST_HELPER)];
+    expect(transportSsrfFindings(files)).toHaveLength(1);
+    const out = calibratedTransportSsrf(files);
+    expect(out).toHaveLength(1);
+    expect(out[0].unverified).toBe(true);
+    expect(out[0].remediation).toBe(SSRF_CALLEE_QUESTION);
+  });
+
+  it("wiring: a full scan no longer carries the rebind SSRF as a liability", () => {
+    const files = [
+      f("server/routes/finalread-projects.ts", REBIND_ROUTE),
+      f("server/finalread-projects.ts", REBIND_IMPL),
+    ];
+    const report = runPreFlightScan(files);
+    expect(report.findings.filter((x) => x.probe === "SSRF")).toEqual([]);
   });
 
   it("wiring: a full scan no longer carries the audio-route SSRF as a liability", () => {

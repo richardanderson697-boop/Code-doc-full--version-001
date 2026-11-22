@@ -314,6 +314,13 @@ export interface CollectedRoute {
   // fallback: the handler body cannot be inspected, so a probe must not
   // assert a missing in-handler guard from it — it routes to verification.
   parsed: boolean;
+  // True when the last route argument is a wrapper call (e.g.
+  // asyncRoute(async (req, res) => {...})) that could not be unwrapped to
+  // a handler: the handler body cannot be inspected, so a probe must not
+  // assert a missing in-handler guard from it — it routes to verification.
+  // Absent (undefined) when the handler was established or the route came
+  // from the regex fallback (which already carries parsed: false).
+  handlerUnresolved?: boolean;
 }
 
 const HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
@@ -378,6 +385,32 @@ function regexFallbackRoutes(content: string, file: string): CollectedRoute[] {
   return routes;
 }
 
+// Unwrap a single-argument wrapper call (the asyncRoute(fn) shape, and any
+// equivalent single-function wrapper): when the last route argument is a
+// CallExpression whose first argument is a function, an identifier, or a
+// member expression, that inner argument IS the handler. Returns the handler
+// as { name, node } (exactly one set), or null when the wrapper cannot be
+// unwrapped — the caller marks the route unresolved instead of guessing at
+// a handler it cannot see.
+function unwrapWrapperHandler(
+  call: AstNode
+): { name: string | null; node: AstNode | null } | null {
+  let inner: AstNode | null = call;
+  while (inner?.type === "CallExpression") {
+    const firstArg = (inner.arguments || [])[0];
+    if (!firstArg) return null;
+    if (FUNCTION_TYPES.has(firstArg.type)) return { name: null, node: firstArg };
+    if (firstArg.type === "Identifier") return { name: firstArg.name, node: null };
+    if (firstArg.type === "MemberExpression") {
+      return { name: readDottedName(firstArg), node: null };
+    }
+    // A nested wrapper call: unwrap one more level. Anything else (a
+    // literal, an object, ...) is not a handler shape: unresolved.
+    inner = firstArg;
+  }
+  return null;
+}
+
 // Collect the HTTP routes in one file. AST-first (so the handler function
 // node and middleware identifiers are available); a regex fallback when
 // the file does not parse. Returns [] for non-code files.
@@ -411,10 +444,24 @@ export function collectRoutes(content: string, file: string): CollectedRoute[] {
       const last = args[args.length - 1];
       let handlerName: string | null = null;
       let handlerNode: AstNode | null = null;
+      let handlerUnresolved = false;
       if (last) {
         if (FUNCTION_TYPES.has(last.type)) handlerNode = last;
         else if (last.type === "Identifier") handlerName = last.name;
         else if (last.type === "MemberExpression") handlerName = readDottedName(last);
+        else if (last.type === "CallExpression") {
+          // Wrapper call (asyncRoute(async (req, res) => {...})): unwrap to
+          // the inner function so the probe reads the real handler body.
+          // Un-unwrappable: mark unresolved — the probe routes the route to
+          // verification, never asserts a missing guard it cannot see.
+          const unwrapped = unwrapWrapperHandler(last);
+          if (unwrapped) {
+            handlerName = unwrapped.name;
+            handlerNode = unwrapped.node;
+          } else {
+            handlerUnresolved = true;
+          }
+        }
       }
       routes.push({
         method: m[2].toUpperCase(),
@@ -425,6 +472,7 @@ export function collectRoutes(content: string, file: string): CollectedRoute[] {
         handlerName,
         handlerNode,
         parsed: true,
+        ...(handlerUnresolved ? { handlerUnresolved: true } : {}),
       });
       return;
     }
@@ -578,6 +626,10 @@ export function resolveRouteHandler(
 ): RouteHandlerInfo {
   const content = files.get(route.file);
   if (content === undefined) return { bodyText: null, resolved: false };
+  // A wrapper call that could not be unwrapped: the handler body cannot be
+  // inspected, so the route is unresolved — the probe routes it to
+  // verification rather than asserting a missing guard it cannot see.
+  if (route.handlerUnresolved) return { bodyText: null, resolved: false };
   // Inline handler: the function node is on the route.
   if (route.handlerNode) {
     return { bodyText: sourceTextOf(route.handlerNode, content), resolved: true };
