@@ -10,6 +10,8 @@
 // runPreFlightScan and the deterministic score / report builder, and
 // assert the five PROBE_CATEGORY_MAP entries.
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   probeRateLimit,
   RATE_LIMIT_PROBE,
@@ -120,6 +122,54 @@ app.post('/api/auth/login', checkLimit, (req, res) => {
 export default app
 `;
 
+// asyncRoute-wrapped handlers (finalread-self-scan-fixes-spec.md A3): the
+// wrapper must be unwrapped so the probe reads the real handler body.
+const FORGOT_WRAPPED_GUARDED = `import express from 'express'
+const app = express()
+const attempts = new Map()
+function throttleOk(key, limit) {
+  const now = Date.now()
+  const times = (attempts.get(key) ?? []).filter((t) => t > now - 3600000)
+  if (times.length >= limit) return false
+  times.push(now)
+  attempts.set(key, times)
+  return true
+}
+app.post('/api/auth/forgot-password', asyncRoute(async (req, res) => {
+  const email = req.body.email
+  if (!throttleOk('email:' + email, 5) || !throttleOk('ip:' + req.ip, 30)) return res.status(429).json({ error: 'Too many requests. Try again later.' })
+  return res.json({ ok: true })
+}))
+export default app
+`;
+
+const LOGIN_WRAPPED_NO_GUARD = `import express from 'express'
+const app = express()
+app.post('/api/auth/login', asyncRoute(async (req, res) => {
+  return res.json({ ok: true })
+}))
+export default app
+`;
+
+// The claim/ingest shape: an unauthenticated public mutation, wrapped, no guard.
+const CLAIM_WRAPPED_NO_GUARD = `import express from 'express'
+const app = express()
+app.post('/api/claim', asyncRoute(async (req, res) => {
+  return res.json({ ok: true })
+}))
+export default app
+`;
+
+// A wrapper whose handler is NOT the first argument: it cannot be
+// unwrapped, so the route is unknown — never an asserted missing guard.
+const LOGIN_WRAPPED_UNWRAPPABLE = `import express from 'express'
+const app = express()
+app.post('/api/auth/login', wrapWithMetrics('login', async (req, res) => {
+  return res.json({ ok: true })
+}))
+export default app
+`;
+
 const PUBLIC_MUTATION = `import express from 'express'
 const app = express()
 app.post('/api/contact', (req, res) => {
@@ -188,6 +238,38 @@ describe("Item 1 — Rate limiting", () => {
     expect(out).toHaveLength(1);
     expect(out[0].unverified).toBe(true);
     expect(out[0].remediation).toBe(RATE_LIMIT_QUESTION);
+  });
+
+  it("does NOT flag a forgot-password route whose asyncRoute-wrapped handler throttles (A3)", () => {
+    expect(probeRateLimit([f("server/routes/auth.ts", FORGOT_WRAPPED_GUARDED)])).toHaveLength(0);
+  });
+
+  it("still flags an asyncRoute-wrapped login route with no guard (A3: the probe reads the body)", () => {
+    const out = probeRateLimit([f("server/routes/auth.ts", LOGIN_WRAPPED_NO_GUARD)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].title).toBe("POST /api/auth/login has no rate-limit guard");
+    expect(out[0].unverified).toBeUndefined();
+  });
+
+  it("still flags an asyncRoute-wrapped public mutation with no guard (A3: claim/ingest shape)", () => {
+    const out = probeRateLimit([f("server/routes/claim.ts", CLAIM_WRAPPED_NO_GUARD)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].title).toBe("POST /api/claim has no rate-limit guard");
+    expect(out[0].unverified).toBeUndefined();
+  });
+
+  it("routes to verification when the wrapper cannot be unwrapped (A3: unknown, never unguarded)", () => {
+    const out = probeRateLimit([f("server/routes/auth.ts", LOGIN_WRAPPED_UNWRAPPABLE)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].unverified).toBe(true);
+    expect(out[0].remediation).toBe(RATE_LIMIT_QUESTION);
+  });
+
+  it("the real auth.ts now yields only the logout finding (Part B throttles)", () => {
+    const content = readFileSync(join(process.cwd(), "server/routes/auth.ts"), "utf8");
+    const out = probeRateLimit([f("server/routes/auth.ts", content)]);
+    expect(out.map((x) => x.title)).toEqual(["POST /api/auth/logout has no rate-limit guard"]);
+    expect(out[0].unverified).toBeUndefined();
   });
 });
 

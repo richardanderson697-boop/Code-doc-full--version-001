@@ -33,6 +33,10 @@ import {
   readDottedName,
   walkAst,
   findEnclosingFunction,
+  findNamedFunction,
+  importSpecForName,
+  resolveRelativeImport,
+  stripComments,
   patternNames,
   sourceTextOf,
   FUNCTION_TYPES,
@@ -456,15 +460,153 @@ function findSinkCall(ast: AstNode, line: number): AstNode | null {
   return found;
 }
 
+// ---------------------------------------------------------------------------
+// Transport-probe SSRF findings (finalread-self-scan-fixes-spec.md A2)
+// ---------------------------------------------------------------------------
+
+// The vendored transport probe (probes/transport.js probeSSRFOpenRedirect)
+// fires a line regex: an HTTP-client token followed by `(` and user input.
+// The token `request` matches ANY identifier containing it, so a database
+// call such as rebindProjectRequest with a request id reads as a fetch. Its
+// findings carry id `ssrf-<file>-<line>` (probe "SSRF") and never reach the
+// taint calibration above, which only handles `taint-ssrf-outbound-` ids —
+// that is why the self-scan showed it as a hard high. This branch verifies
+// the flagged call actually touches the network: resolve the callee; a
+// callee whose body performs no outbound request is dropped; a callee
+// that cannot be resolved routes to verification, never a hard high.
+const TRANSPORT_SSRF_ID_PREFIX = "ssrf-";
+
+export const SSRF_CALLEE_QUESTION =
+  "Does this call perform an outbound network request, or is it a local/database helper? Point at the call that settles it.";
+
+// An outbound-request call inside a function body: fetch, the HTTP client
+// packages, or node:http(s). Generous on purpose — a match KEEPS the
+// finding (fail-closed); only a body with no such call is dropped. Comments
+// are stripped first so a commented-out fetch cannot keep a finding.
+const NETWORK_CALL_RE =
+  /\bfetch\s*\(|axios\s*(?:\.\s*[A-Za-z_$][\w$]*)?\s*\(|got\s*(?:\.\s*[A-Za-z_$][\w$]*)?\s*\(|undici\s*\.\s*(?:fetch|request)\s*\(|https?\s*\.\s*(?:get|request)\s*\(|superagent\s*(?:\.\s*[A-Za-z_$][\w$]*)?\s*\(|ky\s*(?:\.\s*[A-Za-z_$][\w$]*)?\s*\(|phin\s*\(|node-fetch|\brequest\s*\(/;
+
+function bodyTouchesNetwork(bodyText: string): boolean {
+  return NETWORK_CALL_RE.test(stripComments(bodyText));
+}
+
+// HTTP-client packages called by their package name (axios(url), got(url),
+// request(url)). With no local definition shadowing the name, the call is
+// the client itself.
+const NETWORK_CALLEE_IDENTIFIERS = new Set([
+  "axios",
+  "got",
+  "ky",
+  "superagent",
+  "phin",
+  "request",
+  "undici",
+]);
+
+// Resolve a bare callee identifier to its function body text: same-file
+// definition first, then a relative import (mirrors resolveRouteHandler).
+// Null when it cannot be resolved — a package import is not a local
+// definition, so it resolves to null here and the caller decides by name.
+function resolveCalleeBody(
+  name: string,
+  file: string,
+  content: string,
+  files: Map<string, string>
+): string | null {
+  const ext = file.match(/\.[jt]sx?$/)?.[0] || ".js";
+  const ast = parseFile(content, ext);
+  if (!ast) return null;
+  const local = findNamedFunction(ast, name);
+  if (local) return sourceTextOf(local, content);
+  const spec = importSpecForName(content, name);
+  if (!spec) return null;
+  const knownPaths = new Set(files.keys());
+  const resolvedPath = resolveRelativeImport(file, spec, knownPaths);
+  if (!resolvedPath) return null;
+  const target = files.get(resolvedPath);
+  if (target === undefined) return null;
+  const targetAst = parseFile(target, resolvedPath);
+  if (!targetAst) return null;
+  const fn = findNamedFunction(targetAst, name);
+  if (!fn) return null;
+  return sourceTextOf(fn, target);
+}
+
+// The HTTP-client token family the vendored transport probe matches on
+// (transport.js HTTP_CLIENT): prefer the call whose callee carries one of
+// these tokens, since that is the call the regex flagged; otherwise the
+// first call on the line.
+const TRANSPORT_TOKEN_RE =
+  /fetch|axios|got|request|ky|phin|undici|superagent|node-fetch|https?/i;
+
+function findCallAtLine(ast: AstNode, line: number): AstNode | null {
+  const calls: AstNode[] = [];
+  walkAst(ast, (node) => {
+    if (node?.type === "CallExpression" && node.loc?.start?.line === line) {
+      calls.push(node);
+    }
+  });
+  if (calls.length === 0) return null;
+  for (const c of calls) {
+    const callee = c.callee;
+    const name =
+      callee?.type === "Identifier"
+        ? callee.name
+        : callee?.type === "MemberExpression"
+          ? readDottedName(callee)
+          : null;
+    if (name && TRANSPORT_TOKEN_RE.test(name)) return c;
+  }
+  return calls[0];
+}
+
+// Verify a transport-probe SSRF finding: "keep" (a real outbound sink),
+// "drop" (the callee is a local/database helper that never networks), or
+// "verify" (the callee cannot be established).
+function transportSsrfVerdict(
+  f: SsrfFindingLike,
+  content: string,
+  files: Map<string, string>
+): "keep" | "drop" | "verify" {
+  const file = typeof f.file === "string" ? f.file : "";
+  const line = typeof f.line === "number" ? f.line : null;
+  const ext = file.match(/\.[jt]sx?$/)?.[0] || ".js";
+  const ast = parseFile(content, ext);
+  if (!ast || line === null) return "verify";
+  const call = findCallAtLine(ast, line);
+  if (!call) return "verify";
+  const callee = call.callee;
+  // A member call that IS a network client (axios.get, https.get,
+  // undici.fetch) is a real sink. Any other member call cannot be
+  // resolved through its receiver: verification, not a drop.
+  if (callee?.type === "MemberExpression") {
+    const name = readDottedName(callee);
+    if (name && FETCH_MEMBER_RE.test(name)) return "keep";
+    return "verify";
+  }
+  if (callee?.type !== "Identifier") return "verify";
+  const name = callee.name;
+  // The global fetch is a network sink.
+  if (name === "fetch") return "keep";
+  const body = resolveCalleeBody(name, file, content, files);
+  if (body !== null) {
+    return bodyTouchesNetwork(body) ? "keep" : "drop";
+  }
+  // No local definition: a known HTTP-client package name is the client.
+  if (NETWORK_CALLEE_IDENTIFIERS.has(name)) return "keep";
+  return "verify";
+}
+
 export function calibrateSsrfTaintFindings<T extends SsrfFindingLike>(
   findings: T[],
   files: Map<string, string>
 ): T[] {
   const out: T[] = [];
   for (const f of findings) {
-    const isSsrf =
-      typeof f.id === "string" && f.id.startsWith(SSRF_ID_PREFIX);
-    if (!isSsrf) {
+    const id = typeof f.id === "string" ? f.id : "";
+    const isTaintSsrf = id.startsWith(SSRF_ID_PREFIX);
+    const isTransportSsrf = id.startsWith(TRANSPORT_SSRF_ID_PREFIX);
+    if (!isTaintSsrf && !isTransportSsrf) {
       out.push(f);
       continue;
     }
@@ -472,6 +614,21 @@ export function calibrateSsrfTaintFindings<T extends SsrfFindingLike>(
     const content = files.get(file);
     // No source to re-examine: keep the finding. Fail-closed.
     if (content === undefined) {
+      out.push(f);
+      continue;
+    }
+    // Transport-probe finding: verify the flagged call touches the network.
+    if (isTransportSsrf) {
+      const verdict = transportSsrfVerdict(f, content, files);
+      if (verdict === "drop") continue; // DROP
+      if (verdict === "verify") {
+        out.push({
+          ...f,
+          unverified: true,
+          remediation: SSRF_CALLEE_QUESTION,
+        });
+        continue;
+      }
       out.push(f);
       continue;
     }

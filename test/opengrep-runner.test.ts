@@ -28,6 +28,24 @@ const CLEAN = `export function add(a: number, b: number): number {
 }
 `;
 
+// A hardcoded-secret pattern that only appears in comments (a doc comment
+// quoting an example credential) — finalread-self-scan-fixes-spec.md A1.
+// The gv-hardcoded-secret rule is a raw-text regex, so it matches comment
+// text; the runner must not turn a comment match into a finding.
+const SECRET_IN_COMMENT = `// Example from the docs: console.log("password:", password) passes the
+// password as a value. A redacted value is not a finding.
+// password = "hunter2" in a comment is still a comment.
+export function greet(name: string): string {
+  return "hello " + name;
+}
+`;
+
+const SECRET_IN_CODE = `const API_KEY = 'sk-live-abc123';
+export function callApi(): void {
+  console.log(API_KEY);
+}
+`;
+
 const BINARY = resolveOpengrepBinary();
 const RULES = resolveRulesDir();
 const HAVE_ENGINE = Boolean(BINARY && RULES);
@@ -64,6 +82,21 @@ describe.runIf(HAVE_ENGINE)("opengrep runner: detection", () => {
     expect(secret.cwe).toMatch(/CWE-798/);
     expect(secret.owasp?.length).toBeGreaterThan(0);
     expect(secret.remediation).toMatch(/environment variable/i);
+  });
+
+  it("does NOT flag a hardcoded-secret pattern that only appears in comments (self-scan fix A1)", () => {
+    const r = runOpengrepScan([{ path: "src/docs.ts", content: SECRET_IN_COMMENT }]);
+    expect(r.failure).toBeNull();
+    expect(r.findings.filter((f) => f.probe === "opengrep:gv-hardcoded-secret")).toEqual([]);
+  });
+
+  it("still flags a real hardcoded secret in code (self-scan fix A1 positive control)", () => {
+    const r = runOpengrepScan([{ path: "src/config.ts", content: SECRET_IN_CODE }]);
+    expect(r.failure).toBeNull();
+    const secret = r.findings.find((f) => f.probe === "opengrep:gv-hardcoded-secret");
+    expect(secret).toBeDefined();
+    expect(secret!.severity).toBe("critical");
+    expect(secret!.line).toBe(1);
   });
 
   it("reports project-relative paths, never the temp staging dir", () => {

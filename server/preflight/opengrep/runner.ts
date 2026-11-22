@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, normalize, relative, sep } from "node:path";
 import { log } from "../../logger";
 import { SEVERITY_ORDER, type PreFlightFinding, type ProbeFailure, type Severity } from "../../../shared/preflight-types";
+import { stripComments } from "../ast-util";
 
 export interface OpengrepInputFile {
   path: string;
@@ -301,11 +302,39 @@ function parseResults(stdout: string, rootDir: string): PreFlightFinding[] {
   const parsed = JSON.parse(stdout);
   const results = Array.isArray(parsed?.results) ? parsed.results : [];
   const findings: PreFlightFinding[] = [];
+  // Comment-only matches of the raw-text secret rule (finalread-self-scan-
+  // fixes-spec.md A1): the staged file is still on disk here, so the
+  // matched line can be checked against the comment-masked source. One
+  // read per file, cached. A match whose line is entirely a comment is a
+  // doc example, not a hardcoded secret in code.
+  const strippedByFile = new Map<string, string[]>();
   for (const r of results) {
     const f = toFinding(r, rootDir);
-    if (f) findings.push(f);
+    if (!f) continue;
+    if (f.probe === "opengrep:gv-hardcoded-secret" && isCommentOnlyMatch(r, strippedByFile)) continue;
+    findings.push(f);
   }
   return findings;
+}
+
+// True when the opengrep match starts on a line that is entirely a comment
+// in the comment-masked source. Fail-closed: any read problem keeps the
+// finding (a dropped finding must be provably a comment, never a guess).
+function isCommentOnlyMatch(r: any, cache: Map<string, string[]>): boolean {
+  const file = typeof r?.path === "string" ? r.path : "";
+  const line = typeof r?.start?.line === "number" ? r.start.line : null;
+  if (!file || line === null || line < 1) return false;
+  let lines = cache.get(file);
+  if (!lines) {
+    try {
+      lines = stripComments(readFileSync(file, "utf8")).split("\n");
+    } catch {
+      return false;
+    }
+    cache.set(file, lines);
+  }
+  const text = lines[line - 1];
+  return text !== undefined && text.trim() === "";
 }
 
 export function runOpengrepScan(files: OpengrepInputFile[]): OpengrepResult {
