@@ -48,6 +48,23 @@ export function _resetAuthThrottlesForTests(): void {
   authAttempts.clear();
 }
 
+// Client IP for the throttle keys (finalread-xff-throttle-fix-spec.md).
+// Reads the LAST X-Forwarded-For value — the one appended by Railway,
+// the trusted last hop — instead of the first, caller-controlled value.
+// The caller can invent every value before Railway's, but cannot remove
+// or alter the one Railway appends. The req.ip fallback covers direct
+// (non-proxied) requests. Do not "fix" this by trusting req.ip alone:
+// behind Railway the socket peer is Railway's proxy, so that would put
+// every user in one bucket. Exported for the unit test.
+export function clientIp(req: any): string {
+  const forwarded = req.headers["x-forwarded-for"] as string | undefined;
+  if (forwarded) {
+    const parts = forwarded.split(",").map((p) => p.trim()).filter(Boolean);
+    if (parts.length) return parts[parts.length - 1];
+  }
+  return req.ip || "unknown";
+}
+
 function appBaseUrl(req: any): string {
   if (process.env.APP_URL) return process.env.APP_URL.replace(/\/$/, "");
   const proto =
@@ -74,7 +91,7 @@ router.post("/api/auth/signup", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
   }
 
-  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+  const ip = clientIp(req);
   if (!throttleOk(`signup-email:${cleanEmail}`, 5) || !throttleOk(`signup-ip:${ip}`, 10)) {
     return res.status(429).json({ error: "Too many requests. Try again later." });
   }
@@ -115,7 +132,7 @@ router.post("/api/auth/login", asyncRoute(async (req, res) => {
     return res.status(400).json({ error: "Email and password are required." });
   }
   const cleanEmail = normalizeEmail(String(email));
-  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+  const ip = clientIp(req);
   if (!throttleOk(`login-email:${cleanEmail}`, 10) || !throttleOk(`login-ip:${ip}`, 30)) {
     return res.status(429).json({ error: "Too many requests. Try again later." });
   }
@@ -161,7 +178,7 @@ router.post("/api/auth/forgot-password", asyncRoute(async (req, res) => {
   if (!validEmail(cleanEmail)) {
     return res.status(400).json({ error: "Enter a valid email address." });
   }
-  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+  const ip = clientIp(req);
   if (!throttleOk(`email:${cleanEmail}`, 5) || !throttleOk(`ip:${ip}`, 30)) {
     return res.status(429).json({ error: "Too many requests. Try again later." });
   }
@@ -204,7 +221,7 @@ router.post("/api/auth/reset-password", asyncRoute(async (req, res) => {
   if (String(password).length < 8) {
     return res.status(400).json({ error: "Password must be at least 8 characters." });
   }
-  const ip = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.ip || "unknown";
+  const ip = clientIp(req);
   if (!throttleOk(`reset-ip:${ip}`, 30)) {
     return res.status(429).json({ error: "Too many requests. Try again later." });
   }
