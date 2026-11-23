@@ -101,10 +101,32 @@ describe("auth throttles", () => {
     expect(statuses.slice(0, 30)).toEqual(Array(30).fill(400));
     expect(statuses[30]).toBe(429);
   });
+
+  it("reset-password: rotating the spoofed first XFF value does not defeat the IP limit behind Cloudflare", async () => {
+    // CF fix (finalread-cf-connecting-ip-spec.md): behind Cloudflare the
+    // throttle keys on CF-Connecting-IP — trusted only because the last
+    // XFF value is a Cloudflare edge IP — so requests that rotate a
+    // spoofed first value but share the CF-Connecting-IP land in one
+    // bucket.
+    const statuses: number[] = [];
+    for (let i = 0; i < 31; i++) {
+      const res = await request(app)
+        .post("/api/auth/reset-password")
+        .set("X-Forwarded-For", `198.51.100.${i}, 173.245.48.1`)
+        .set("CF-Connecting-IP", "203.0.113.55")
+        .send({ token: "not-a-real-token", password: "supersecret1" });
+      statuses.push(res.status);
+    }
+    expect(statuses.slice(0, 30)).toEqual(Array(30).fill(400));
+    expect(statuses[30]).toBe(429);
+  });
 });
 
 // clientIp unit tests (finalread-xff-throttle-fix-spec.md): the helper
 // returns the last X-Forwarded-For value, falling back to req.ip.
+// (finalread-cf-connecting-ip-spec.md): CF-Connecting-IP is trusted only
+// when the last X-Forwarded-For value falls inside Cloudflare's published
+// ranges; otherwise a faked CF-Connecting-IP is ignored.
 describe("clientIp", () => {
   it("returns the last X-Forwarded-For value (the trusted proxy's)", () => {
     const req = {
@@ -138,5 +160,74 @@ describe("clientIp", () => {
   it("falls back to 'unknown' with neither", () => {
     const req = { headers: {} } as any;
     expect(clientIp(req)).toBe("unknown");
+  });
+
+  it("returns CF-Connecting-IP when the last XFF value is a Cloudflare IP", () => {
+    const req = {
+      headers: {
+        "x-forwarded-for": "1.2.3.4, 5.6.7.8, 173.245.48.1",
+        "cf-connecting-ip": "203.0.113.55",
+      },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("203.0.113.55");
+  });
+
+  it("falls back to the last XFF value when CF-Connecting-IP is empty", () => {
+    const req = {
+      headers: {
+        "x-forwarded-for": "1.2.3.4, 173.245.48.1",
+        "cf-connecting-ip": "   ",
+      },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("173.245.48.1");
+  });
+
+  it("ignores a faked CF-Connecting-IP when the last XFF value is not a Cloudflare IP", () => {
+    // Key security test (finalread-cf-connecting-ip-spec.md): on the
+    // direct Railway path the last XFF value is the visitor's own IP,
+    // so a faked CF-Connecting-IP must be ignored. (This fires the
+    // rate-limited mismatch log once; expected and harmless.)
+    const req = {
+      headers: {
+        "x-forwarded-for": "1.2.3.4, 203.0.113.1",
+        "cf-connecting-ip": "203.0.113.99",
+      },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("203.0.113.1");
+  });
+
+  it("falls back to req.ip when CF-Connecting-IP is set but there is no XFF header", () => {
+    // Without a last XFF value there is nothing to check against the
+    // ranges, so the CF-Connecting-IP is unverifiable and untrusted.
+    const req = {
+      headers: { "cf-connecting-ip": "203.0.113.55" },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("203.0.113.1");
+  });
+
+  it("returns CF-Connecting-IP when the last XFF value is a Cloudflare IPv6 address", () => {
+    const req = {
+      headers: {
+        "x-forwarded-for": "1.2.3.4, 2400:cb00::1",
+        "cf-connecting-ip": "203.0.113.55",
+      },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("203.0.113.55");
+  });
+
+  it("ignores a junk CF-Connecting-IP even when the last XFF value is a Cloudflare IP", () => {
+    const req = {
+      headers: {
+        "x-forwarded-for": "1.2.3.4, 173.245.48.1",
+        "cf-connecting-ip": "not-an-ip",
+      },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("173.245.48.1");
   });
 });
