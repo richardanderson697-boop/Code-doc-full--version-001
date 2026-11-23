@@ -7,7 +7,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import express from "express";
 import request from "supertest";
-import authRouter from "../server/routes/auth";
+import authRouter, { clientIp } from "../server/routes/auth";
 import { initStore } from "../server/store";
 
 function buildApp() {
@@ -82,5 +82,61 @@ describe("auth throttles", () => {
     // before the token lookup, so the 31st is 429.
     expect(statuses.slice(0, 30)).toEqual(Array(30).fill(400));
     expect(statuses[30]).toBe(429);
+  });
+
+  it("reset-password: rotating the spoofed first XFF value does not defeat the IP limit", async () => {
+    // XFF throttle fix (finalread-xff-throttle-fix-spec.md): the throttle
+    // keys on the LAST X-Forwarded-For value — the one Railway appends —
+    // so requests that rotate a spoofed first value but share the last
+    // value land in one bucket. The old code keyed on the first value
+    // and would never have throttled these.
+    const statuses: number[] = [];
+    for (let i = 0; i < 31; i++) {
+      const res = await request(app)
+        .post("/api/auth/reset-password")
+        .set("X-Forwarded-For", `198.51.100.${i}, 203.0.113.7`)
+        .send({ token: "not-a-real-token", password: "supersecret1" });
+      statuses.push(res.status);
+    }
+    expect(statuses.slice(0, 30)).toEqual(Array(30).fill(400));
+    expect(statuses[30]).toBe(429);
+  });
+});
+
+// clientIp unit tests (finalread-xff-throttle-fix-spec.md): the helper
+// returns the last X-Forwarded-For value, falling back to req.ip.
+describe("clientIp", () => {
+  it("returns the last X-Forwarded-For value (the trusted proxy's)", () => {
+    const req = {
+      headers: { "x-forwarded-for": "1.2.3.4, 5.6.7.8, 9.10.11.12" },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("9.10.11.12");
+  });
+
+  it("returns the single value when there is only one", () => {
+    const req = {
+      headers: { "x-forwarded-for": "1.2.3.4" },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("1.2.3.4");
+  });
+
+  it("falls back to req.ip with no header", () => {
+    const req = { headers: {}, ip: "203.0.113.1" } as any;
+    expect(clientIp(req)).toBe("203.0.113.1");
+  });
+
+  it("falls back to req.ip with an empty header", () => {
+    const req = {
+      headers: { "x-forwarded-for": "   " },
+      ip: "203.0.113.1",
+    } as any;
+    expect(clientIp(req)).toBe("203.0.113.1");
+  });
+
+  it("falls back to 'unknown' with neither", () => {
+    const req = { headers: {} } as any;
+    expect(clientIp(req)).toBe("unknown");
   });
 });
