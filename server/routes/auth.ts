@@ -1,6 +1,7 @@
 // Email + password auth: signup, login, logout, me.
 import { Router } from "express";
 import crypto from "crypto";
+import { BlockList, isIP } from "node:net";
 import { getDb, type UserRow } from "../store";
 import {
   createPasswordHash,
@@ -48,20 +49,81 @@ export function _resetAuthThrottlesForTests(): void {
   authAttempts.clear();
 }
 
-// Client IP for the throttle keys (finalread-xff-throttle-fix-spec.md).
-// Reads the LAST X-Forwarded-For value — the one appended by Railway,
-// the trusted last hop — instead of the first, caller-controlled value.
-// The caller can invent every value before Railway's, but cannot remove
-// or alter the one Railway appends. The req.ip fallback covers direct
-// (non-proxied) requests. Do not "fix" this by trusting req.ip alone:
-// behind Railway the socket peer is Railway's proxy, so that would put
-// every user in one bucket. Exported for the unit test.
+// Client IP for the throttle keys (finalread-cf-connecting-ip-spec.md).
+// Trusts CF-Connecting-IP only when the LAST X-Forwarded-For value —
+// the one appended by Railway, which the caller cannot forge — falls
+// inside Cloudflare's published IP ranges. That proves the request
+// came through a Cloudflare edge (gradevibes.com); on the direct
+// Railway path (getfinalread.com) the last value is the visitor's own
+// IP, so a faked CF-Connecting-IP is ignored there. The req.ip fallback
+// covers direct (non-proxied) requests. Do not "fix" this by trusting
+// req.ip alone: behind Railway the socket peer is Railway's proxy, so
+// that would put every user in one bucket. Exported for the unit test.
+
+// Cloudflare's published ranges, fetched 2026-11-23 from
+// https://www.cloudflare.com/ips-v4 and /ips-v6. Static; refresh
+// if Cloudflare publishes new ranges (see the staleness note in the spec).
+const CLOUDFLARE_V4 = [
+  "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+  "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+  "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+  "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+  "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+];
+const CLOUDFLARE_V6 = [
+  "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
+  "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
+  "2c0f:f248::/32",
+];
+const cloudflareRanges = new BlockList();
+for (const cidr of CLOUDFLARE_V4) {
+  const [net, prefix] = cidr.split("/");
+  cloudflareRanges.addSubnet(net, Number(prefix), "ipv4");
+}
+for (const cidr of CLOUDFLARE_V6) {
+  const [net, prefix] = cidr.split("/");
+  cloudflareRanges.addSubnet(net, Number(prefix), "ipv6");
+}
+
+function isCloudflareIp(ip: string): boolean {
+  const family = isIP(ip);
+  if (family === 0) return false;
+  return cloudflareRanges.check(ip, family === 4 ? "ipv4" : "ipv6");
+}
+
+// Rate-limited observability for the stale-range failure (see the spec):
+// CF-Connecting-IP present but the last XFF value not in Cloudflare's
+// ranges. Fires on spoof attempts too, so at most once an hour.
+let lastCfRangeMismatchLogAt = 0;
+function logCfRangeMismatch(): void {
+  const now = Date.now();
+  if (now - lastCfRangeMismatchLogAt < 60 * 60 * 1000) return;
+  lastCfRangeMismatchLogAt = now;
+  log.warn("CF-Connecting-IP present but last XFF not in Cloudflare ranges");
+}
+
 export function clientIp(req: any): string {
   const forwarded = req.headers["x-forwarded-for"] as string | undefined;
+  let last: string | undefined;
   if (forwarded) {
     const parts = forwarded.split(",").map((p) => p.trim()).filter(Boolean);
-    if (parts.length) return parts[parts.length - 1];
+    if (parts.length) last = parts[parts.length - 1];
   }
+  // Behind Cloudflare (gradevibes.com), the real client IP is in
+  // CF-Connecting-IP. Cloudflare sets it and overwrites any
+  // client-supplied value — but only trust it when the last XFF
+  // value proves the request came through Cloudflare. The last
+  // value is appended by Railway, so the caller cannot forge it.
+  // Validate it is a real IP first, so junk never becomes a
+  // throttle key.
+  const cfIp = (req.headers["cf-connecting-ip"] as string | undefined)?.trim();
+  if (cfIp && isIP(cfIp) !== 0 && last && isCloudflareIp(last)) return cfIp;
+  if (cfIp && last && !isCloudflareIp(last)) logCfRangeMismatch();
+  // Direct to Railway (getfinalread.com): the last XFF value is
+  // Railway's append of the real client IP. A faked CF-Connecting-IP
+  // is ignored here, because the last value is the visitor's own IP,
+  // which is not in Cloudflare's ranges.
+  if (last) return last;
   return req.ip || "unknown";
 }
 
