@@ -870,6 +870,144 @@ export function findFabricatedStatus(code: string, filePath: string): Fabricated
   return out;
 }
 
+// --- Stub signals (2026-11-24 family rework, spec §3) ---
+// A stub flag requires a real stub signal. Identifier substrings alone
+// never flag. Signal A (lead-anchored TODO: implement) stays inline in
+// runDeterministicScan; signals B–D are defined here.
+
+// Signal B — placeholder literal. The literal CONTENT is the signal:
+// "TODO", "not implemented", "coming soon", "placeholder", "lorem
+// ipsum" (case-insensitive). A literal matches when its content equals
+// a phrase or starts with a phrase followed by a space or sentence
+// punctuation. Ambiguous literals ("xxx", "test") do NOT flag.
+// Known accepted edge: a Tailwind `placeholder:` variant as a sole
+// className literal would match (colon is a continuation char); no such
+// literal exists in the scanned repos.
+// Placeholder-literal content: the literal IS the phrase, or starts with
+// the phrase followed by sentence punctuation (`:`, `.`, `!`, `?`, `;`).
+// A bare space does NOT count for the meaningful-word phrases — a title
+// that merely starts with one ("Placeholder Operation Detected",
+// "TODO or FIXME with no ticket reference") is a label for a check, not
+// unfinished code; both were false flags in the 2026-11-24 acceptance
+// re-run and are excluded by this rule. "lorem ipsum" is the exception:
+// filler text stays filler whatever follows it, so a space continuation
+// counts there too ("Lorem ipsum dolor sit amet" still flags).
+const PLACEHOLDER_PHRASE_CONTENT =
+  /^(todo|not implemented|coming soon|placeholder)(?=$|[.,!?;:])/i;
+const LOREM_IPSUM_CONTENT = /^lorem ipsum(?=$|[\s.,!?;:])/i;
+const STRING_LITERAL_RE =
+  /"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`((?:[^`\\]|\\.)*)`/g;
+
+// Position: assigned value or return value only. The text immediately
+// before the literal must end with a single `=` (not `==`/`===`/`!=`/
+// `<=`/`>=`/`=>`), `return`, `=>`, `:`, `[`, `,` or `?`. A comparison
+// (`status === "coming soon"`) or a `throw` does not flag.
+function isPlaceholderValuePosition(before: string): boolean {
+  const b = before.trimEnd();
+  if (/\breturn$/.test(b)) return true;
+  if (/=>$/.test(b)) return true;
+  if (/[:\[,?]$/.test(b)) return true;
+  if (/(?<![=!<>])=$/.test(b)) return true;
+  return false;
+}
+
+function hasPlaceholderLiteral(line: string): boolean {
+  for (const m of line.matchAll(STRING_LITERAL_RE)) {
+    const content = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+    if (content.includes("${")) continue; // interpolated — computed, not a literal
+    if (!PLACEHOLDER_PHRASE_CONTENT.test(content) && !LOREM_IPSUM_CONTENT.test(content)) continue;
+    if (isPlaceholderValuePosition(line.slice(0, m.index))) return true;
+  }
+  return false;
+}
+
+// Signal C — constant return. A function/method/handler whose
+// single-line body is exactly one constant return. The six constants
+// (spec §3C): null, undefined, {}, [], "", false. `true` and `0` are
+// NOT in the list. Bare expression-body arrows (`() => null`) are NOT
+// covered — the spec's signal is the `return` form. Guards (spec §3C):
+// a lookup that searches and then returns null, and a default return
+// from real logic, are multi-line and can never match the single-line
+// patterns below.
+const CONSTANT_RETURN_VALUE =
+  "(?:null|undefined|false|\\{\\s*\\}|\\[\\s*\\]|\"\"|''|``)";
+const CONSTANT_RETURN_FUNCTION_RE = new RegExp(
+  "\\bfunction\\s*\\*?\\s*\\w*\\s*\\([^)]*\\)\\s*\\{\\s*return\\s+" +
+    CONSTANT_RETURN_VALUE +
+    "\\s*;?\\s*\\}"
+);
+const CONSTANT_RETURN_ARROW_RE = new RegExp(
+  "=>\\s*\\{\\s*return\\s+" + CONSTANT_RETURN_VALUE + "\\s*;?\\s*\\}"
+);
+const CONSTANT_RETURN_METHOD_RE = new RegExp(
+  "\\b(?!if\\b|for\\b|while\\b|switch\\b|catch\\b)\\w+\\s*\\([^)]*\\)\\s*\\{\\s*return\\s+" +
+    CONSTANT_RETURN_VALUE +
+    "\\s*;?\\s*\\}"
+);
+
+function isConstantReturnStub(line: string): boolean {
+  return (
+    CONSTANT_RETURN_FUNCTION_RE.test(line) ||
+    CONSTANT_RETURN_ARROW_RE.test(line) ||
+    CONSTANT_RETURN_METHOD_RE.test(line)
+  );
+}
+
+// Signal D — empty body. Any function / method / arrow function /
+// handler with an empty body. Exclusions (enumerated from probe runs,
+// spec §3D): test files, mock data files, control keywords
+// (if/for/while/switch/else), empty `catch {}` (block form and the
+// promise `.catch(() => {})` form — an empty catch is a different smell
+// and stays out of scope), empty constructors, and interface/abstract
+// declarations (no body; cannot match by construction). The old
+// `!line.includes("export")` exclusion is dropped: an exported empty
+// function is still an empty function. The old `handler` gate is
+// dropped per spec §3D.
+const EMPTY_FUNCTION_RE = /\bfunction\s*\*?\s*\w*\s*\([^)]*\)\s*\{\s*\}/;
+const EMPTY_METHOD_RE =
+  /\b(?!if\b|for\b|while\b|switch\b|catch\b|else\b|constructor\b)\w+\s*\([^)]*\)\s*\{\s*\}/;
+const CATCH_CALLBACK_RE =
+  /\.catch\s*\(\s*(?:async\s+)?(?:\(\)\s*=>|function\s*\w*\s*\(\s*\))\s*\{\s*\}/g;
+
+// An empty arrow counts as a stub only when it DEFINES a function in a
+// value position (assignment, object property, return, ternary) — not
+// when it is a callback argument nested inside a call's parentheses
+// (`new Promise(() => {})`, `setTimeout(() => {}, 0)`) or a collection
+// element (`[() => {}]`). A never-settling `new Promise(() => {})` is a
+// real smell, but it is a callback, not an unimplemented function
+// definition: flagging it docked the databaseLayer score of a minimal
+// IndexedDB fixture from 8 to 5 (detector-accuracy.test.ts), which is
+// the acceptance signal that the scope was too wide. Named `function`
+// expressions and methods are definition forms and still flag wherever
+// they appear.
+function hasEmptyArrowDefinition(line: string): boolean {
+  const re = /(?:\(([^()]*)\)|([A-Za-z_$][\w$]*))\s*=>\s*\{\s*\}/g;
+  for (const m of line.matchAll(re)) {
+    const prefix = line.slice(0, m.index ?? 0);
+    let parens = 0;
+    let brackets = 0;
+    for (const ch of prefix) {
+      if (ch === "(") parens++;
+      else if (ch === ")") parens--;
+      else if (ch === "[") brackets++;
+      else if (ch === "]") brackets--;
+    }
+    if (parens <= 0 && brackets <= 0) return true;
+  }
+  return false;
+}
+
+function isEmptyFunctionBody(line: string): boolean {
+  // Strip promise-catch callbacks first: `.catch(() => {})` is a
+  // deliberate error-ignore, not an unimplemented stub.
+  const stripped = line.replace(CATCH_CALLBACK_RE, "");
+  return (
+    hasEmptyArrowDefinition(stripped) ||
+    EMPTY_FUNCTION_RE.test(stripped) ||
+    EMPTY_METHOD_RE.test(stripped)
+  );
+}
+
 export function runDeterministicScan(code: string, filePath = ""): DeterministicAnalysis {
   // Truncate before splitting: past the byte cap the extra input adds no
   // useful evidence and only costs backtracking time.
@@ -937,34 +1075,31 @@ export function runDeterministicScan(code: string, filePath = ""): Deterministic
       commentedSchedulers.push({ lines: String(lineNum), code: line });
     }
 
-    // 5. Stubs / Mocks
-    // A file whose whole job is mock/fixture/seed data is not "unfinished"
-    // because it declares const MOCK_*: flagging it is pure noise.
-    // NOTE: bare keywords ("mock", "simulated", ...) in *comments* are not
-    // stubs — a comment describing simulated data is documentation, not
-    // unfinished code. Only an explicit TODO: implement marker in a comment
-    // counts as a stub signal, and the marker must lead the comment — a
-    // mid-sentence mention does not count.
-    // NOTE: mock declarations in *test* files are fixtures, not unfinished
-    // code — `const mockBlueprint = {...}` in orchestration.test.ts is the
-    // test doing its job.
+    // 5. Stubs — a flag requires a REAL stub signal (2026-11-24 family
+    // rework). Identifier substrings alone never flag — not `temp`, not
+    // `tmp`, not `mock`, not any named fixture list. The old
+    // isMockDeclaration rule (named fixture list + `const mock` /
+    // `const temp`) is deleted in full: a genuinely mocked dataset
+    // declared as `const mockUsers = [{ id: 1 }];` with real-looking data
+    // and no other signal no longer flags (accepted trade, spec §4).
+    // Exemptions kept: test files (isTestFile), whole mock/fixture/seed
+    // data files (isMockDataFile). Bare mock/simulated keywords in
+    // comments are documentation, not unfinished code.
     const isMockDataFile = /(^|\/)(mock|mocks|fixture|fixtures|seed|seeds|stub|stubs)[^/]*\.(ts|tsx|js|jsx)$/i.test(filePath);
-    // Trailing word boundary (Oct 28 stub-detector spec): `const tempDeck`,
-    // `const temperature`, and `const mocked` are real identifiers, not
-    // temporary placeholders — only the exact two-word declaration
-    // counts. (isTestFile is defined above section 3; reused here.)
-    // Disclosed extension, found during the build: the named fixture list
-    // below matched its own definition line (the line lists mockUsers and
-    // friends as regex source), so the list is anchored to a declaration
-    // keyword too — a bare use of a fixture name is not a declaration.
-    const isMockDeclaration = !isMockDataFile && !isTestFile && (/\b(const|let|var)\s+(mockData|mockUsers|mockTodos|mockEvents|tempData)\b/i.test(line) || /\bconst\s+mock\b/i.test(line) || /\bconst\s+temp\b/i.test(line));
-    const isEmptyFunction = /=>\s*\{\s*\}/.test(line) || /function\s*\w*\s*\(\s*\)\s*\{\s*\}/.test(line);
-    // Lead-anchor (Oct 28 stub-detector spec): the marker must lead the
-    // comment. A definitional comment that mentions the marker
-    // mid-sentence does not count.
+    // A. Lead-anchored TODO: implement comment — unchanged. The marker
+    // must lead the comment; a definitional comment that mentions the
+    // marker mid-sentence does not count.
     const isTodoImplement = /^TODO:\s*implement/i.test(commentText);
+    // B. Placeholder literal, C. constant return, D. empty body — see
+    // the helpers above runDeterministicScan. All three are gated on
+    // !isMockDataFile && !isTestFile && !isComment (a placeholder
+    // literal or empty body inside a comment is documentation, not code).
+    const stubSignals = !isMockDataFile && !isTestFile && !isComment;
+    const isPlaceholderLiteral = stubSignals && hasPlaceholderLiteral(line);
+    const isConstantReturn = stubSignals && isConstantReturnStub(line);
+    const isEmptyBody = stubSignals && isEmptyFunctionBody(line);
 
-    if ((isComment && isTodoImplement) || isMockDeclaration || (isEmptyFunction && !line.includes("export") && line.toLowerCase().includes("handler"))) {
+    if ((isComment && isTodoImplement) || isPlaceholderLiteral || isConstantReturn || isEmptyBody) {
       stubs.push({ lines: String(lineNum), code: line });
     }
 

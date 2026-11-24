@@ -48,9 +48,9 @@ describe("mock-declaration noise", () => {
     const s = runDeterministicScan("export const MOCK_TENANTS: Tenant[] = [];\n", "src/utils/mockData.ts");
     expect(s.stubs).toHaveLength(0);
   });
-  it("still flags mock declarations in ordinary files", () => {
+  it("does NOT flag mock declarations in ordinary files (family rework 2026-11-24: data, not unfinished code)", () => {
     const s = runDeterministicScan("const mockUsers = [];\n", "src/data.ts");
-    expect(s.stubs.length).toBeGreaterThan(0);
+    expect(s.stubs.length).toBe(0);
   });
   it("does not flag simulated/mock keywords in comments as stubs", () => {
     // A comment describing simulated data is documentation, not unfinished
