@@ -438,6 +438,21 @@ const GAP_PROBES: { name: string; fn: (files: ScanInputFile[]) => PreFlightFindi
 const GAP_PROBE_COUNT = GAP_PROBES.length;
 
 /**
+ * Count findings by severity — the single counting implementation shared
+ * by the raw scan and the calibrated recount (header-counts spec §7).
+ * The header the panel renders reads `report.counts` while the list reads
+ * `report.findings`, so any report built from a filtered findings list
+ * must recount from that list, never inherit counts from another list.
+ */
+export function countFindingsBySeverity(findings: PreFlightFinding[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const f of findings) {
+    counts[f.severity] = (counts[f.severity] || 0) + 1;
+  }
+  return counts;
+}
+
+/**
  * Main entry point for preflight scanning. Runs a 384KB+ repo in batches of
  * 2 files through the vendored engine (per-file findings, coverage-only risk),
  * with the cross-file pass (§4) and batch filter (§5, §6) so cross-file
@@ -615,10 +630,7 @@ export function runPreFlightScan(
     (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity)
   );
 
-  const counts: Record<string, number> = {};
-  for (const f of findings) {
-    counts[f.severity] = (counts[f.severity] || 0) + 1;
-  }
+  const counts = countFindingsBySeverity(findings);
 
   return {
     engine: "PreFlight",
