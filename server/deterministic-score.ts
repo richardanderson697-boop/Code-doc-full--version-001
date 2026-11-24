@@ -80,8 +80,11 @@ export interface CategoryResult {
 
 /** Scanner version: bump when a detector's behavior changes. Shown in the
  *  stakeholder report and the developer handoff packet so a later re-score
- *  is explainable. First versioned release. */
-export const SCANNER_VERSION = "1";
+ *  is explainable. v2 = the 2026-11-24 stub-detector family rework
+ *  (identifier-substring matching deleted; real-signal rule) + the
+ *  header-counts recompute (counts derived from calibrated findings).
+ *  Both shipped together on finalread/readiness-stub-header. */
+export const SCANNER_VERSION = "2";
 /** Core-logic metric version: v2 = the strengthened "contains real logic"
  *  test + fake-success cap + denominator floor (spec §§A1–A5). v1 was the
  *  40-line rule. */

@@ -180,9 +180,9 @@ export async function POST(request: NextRequest) {
     expect(s.stubCount).toBe(1);
   });
 
-  it("still flags mock data declarations in non-mock files", () => {
+  it("does not flag mock data declarations in non-mock files (family rework 2026-11-24: data, not unfinished code)", () => {
     const s = runDeterministicScan(`const mockUsers = [{ id: 1 }];`, "src/App.tsx");
-    expect(s.stubCount).toBe(1);
+    expect(s.stubCount).toBe(0);
   });
 
   it("does not flag mock declarations in test files (fixtures, not stubs)", () => {
