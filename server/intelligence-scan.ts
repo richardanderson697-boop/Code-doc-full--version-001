@@ -12,7 +12,7 @@
 // client the deterministic findings instead of a bare error (same
 // contract as the route's catch).
 import { generateWithFallback, extractUsage } from "./gemini";
-import { runPreFlightScan, formatFindingsForPrompt } from "./preflight-scan";
+import { runPreFlightScan, formatFindingsForPrompt, countFindingsBySeverity } from "./preflight-scan";
 import type { PreFlightReport } from "../shared/preflight-types";
 import {
   computeDeterministicAssessment,
@@ -286,7 +286,16 @@ export async function runIntelligenceScan(
     // identical input always yields identical numbers). The model explains
     // these facts; it does not invent or adjust them.
     const assessment = computeDeterministicAssessment(files, preflight);
-    calibratedPreflight = { ...preflight, findings: assessment.calibratedPreflightFindings };
+    calibratedPreflight = {
+      ...preflight,
+      findings: assessment.calibratedPreflightFindings,
+      // Header counts are recomputed from the calibrated findings
+      // (header-counts spec §7): the raw counts inherited from ...preflight
+      // describe the pre-calibration list, so the header ("1 critical")
+      // disagreed with the list (no critical). Same counting logic as the
+      // raw scan — one implementation, countFindingsBySeverity.
+      counts: countFindingsBySeverity(assessment.calibratedPreflightFindings),
+    };
 
     // Build workspace context string for Gemini
     let workspaceContext = `You are evaluating a React/TypeScript project with ${totalFiles} file(s) totaling ${totalLines} line(s) of code.\n\n`;
